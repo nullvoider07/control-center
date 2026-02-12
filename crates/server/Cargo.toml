@@ -44,6 +44,5 @@ version = "0.10"
 optional = true
 
 [features]
-default = ["vendored-protoc"]
 openssl-vendored = ["openssl/vendored"]
 vendored-protoc = ["protobuf-src"]
