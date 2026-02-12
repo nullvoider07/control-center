@@ -1,0 +1,29 @@
+# Cross-compilation configuration for Rust
+# Used for building binaries for different platforms
+
+[build]
+# Default target
+default-target = "x86_64-unknown-linux-gnu"
+
+[build.env]
+passthrough = [
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+]
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest"
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:latest"
+
+[target.x86_64-pc-windows-msvc]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-msvc:latest"
+
+[target.x86_64-apple-darwin]
+# macOS cross-compilation requires special setup
+image = "joseluisq/rust-linux-darwin-builder:latest"
+
+[target.aarch64-apple-darwin]
+# ARM64 macOS (M1/M2)
+image = "joseluisq/rust-linux-darwin-builder:latest"

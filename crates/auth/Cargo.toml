@@ -1,0 +1,31 @@
+[package]
+name = "control-center-auth"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "OAuth 2.0 and JWT authentication"
+license.workspace = true
+
+[dependencies]
+# OAuth 2.0
+oauth2 = "4.4"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# JWT
+jsonwebtoken = "9.2"
+
+# Async runtime
+tokio = { version = "1.40", features = ["sync"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+anyhow = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio-test = "0.4"

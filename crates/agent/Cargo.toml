@@ -1,0 +1,42 @@
+[package]
+name = "control-center-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Agent for executing OS-specific commands"
+license.workspace = true
+
+[dependencies]
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1.40", features = ["full", "macros"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+regex = "1.10"
+
+# OS-specific dependencies
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.52"
+winapi = { version = "0.3", features = ["sysinfoapi", "winnt"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS doesn't need special deps (uses ProcessCommand for sw_vers)
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux doesn't need special deps (uses /etc/os-release)
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

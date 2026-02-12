@@ -1,0 +1,384 @@
+# .github/workflows/release.yml
+# Control Center - Release Workflow
+# Builds Rust binaries (Server/Agent) + Python CLI package
+
+name: Release Control Center
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================================
+  # JOB 1: LINUX BUILD (x64)
+  # ============================================================================
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Setup Python
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      # Setup Rust
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      # System Dependencies (protobuf, SSL, pkg-config)
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+
+      # Build Rust Binaries
+      - name: Build Rust Binaries
+        run: cargo build --release --workspace
+
+      # Install Python Package
+      - name: Build Python Package
+        run: |
+          pip install build
+          python -m build
+
+      # Get Version
+      - name: Get Version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      # Package Release
+      - name: Create Package
+        run: |
+          mkdir -p package/bin
+          mkdir -p package/python
+          
+          # Copy Rust binaries
+          cp target/release/control-center-server package/bin/
+          cp target/release/control-center-agent package/bin/
+          chmod +x package/bin/*
+          
+          # Copy Python wheel
+          cp dist/*.whl package/python/
+          
+          # Create installation script
+          cat > package/install.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          echo "Installing Control Center v${{ steps.version.outputs.VERSION }}"
+          
+          # Install Rust binaries
+          echo "Installing Rust binaries..."
+          sudo cp bin/control-center-server /usr/local/bin/
+          sudo cp bin/control-center-agent /usr/local/bin/
+          sudo chmod +x /usr/local/bin/control-center-*
+          
+          # Install Python CLI
+          echo "Installing Python CLI..."
+          pip install python/*.whl
+          
+          echo "✓ Control Center installed successfully!"
+          echo "Run: control-center --help"
+          EOF
+          chmod +x package/install.sh
+          
+          # Create tarball
+          cd package
+          tar -czvf ../control-center-${{ steps.version.outputs.VERSION }}-linux-x64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-assets
+          path: control-center-*.tar.gz
+
+  # ============================================================================
+  # JOB 2: LINUX BUILD (ARM64)
+  # ============================================================================
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install Cross
+        run: cargo install cross
+
+      - name: Build Rust Binaries (ARM64)
+        run: cross build --release --target aarch64-unknown-linux-gnu --workspace
+
+      - name: Build Python Package
+        run: |
+          pip install build
+          python -m build
+
+      - name: Get Version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Create Package
+        run: |
+          mkdir -p package/bin
+          mkdir -p package/python
+          
+          cp target/aarch64-unknown-linux-gnu/release/control-center-server package/bin/
+          cp target/aarch64-unknown-linux-gnu/release/control-center-agent package/bin/
+          chmod +x package/bin/*
+          
+          cp dist/*.whl package/python/
+          
+          cat > package/install.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          echo "Installing Control Center v${{ steps.version.outputs.VERSION }} (ARM64)"
+          sudo cp bin/control-center-server /usr/local/bin/
+          sudo cp bin/control-center-agent /usr/local/bin/
+          sudo chmod +x /usr/local/bin/control-center-*
+          pip install python/*.whl
+          echo "✓ Control Center installed successfully!"
+          EOF
+          chmod +x package/install.sh
+          
+          cd package
+          tar -czvf ../control-center-${{ steps.version.outputs.VERSION }}-linux-arm64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-assets
+          path: control-center-*.tar.gz
+
+  # ============================================================================
+  # JOB 3: MACOS BUILD (Apple Silicon / ARM64)
+  # ============================================================================
+  build-macos-arm64:
+    runs-on: macos-14  # M1 runner
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      # Protobuf is needed on macOS
+      - name: Install Dependencies
+        run: brew install protobuf
+
+      - name: Build Rust Binaries
+        run: cargo build --release --workspace
+
+      - name: Build Python Package
+        run: |
+          pip install build
+          python -m build
+
+      - name: Get Version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Create Package
+        run: |
+          mkdir -p package/bin
+          mkdir -p package/python
+          
+          cp target/release/control-center-server package/bin/
+          cp target/release/control-center-agent package/bin/
+          chmod +x package/bin/*
+          
+          cp dist/*.whl package/python/
+          
+          cat > package/install.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          echo "Installing Control Center v${{ steps.version.outputs.VERSION }} (macOS ARM64)"
+          sudo cp bin/control-center-server /usr/local/bin/
+          sudo cp bin/control-center-agent /usr/local/bin/
+          sudo chmod +x /usr/local/bin/control-center-*
+          pip3 install python/*.whl
+          echo "✓ Control Center installed successfully!"
+          EOF
+          chmod +x package/install.sh
+          
+          cd package
+          tar -czvf ../control-center-${{ steps.version.outputs.VERSION }}-macos-arm64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-assets
+          path: control-center-*.tar.gz
+  
+  # ============================================================================
+  # JOB 4: MACOS BUILD (Intel / x64)
+  # ============================================================================
+  build-macos-x64:
+    runs-on: macos-13  # Intel runner
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Dependencies
+        run: brew install protobuf
+
+      - name: Build Rust Binaries
+        run: cargo build --release --workspace
+
+      - name: Build Python Package
+        run: |
+          pip install build
+          python -m build
+
+      - name: Get Version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Create Package
+        run: |
+          mkdir -p package/bin
+          mkdir -p package/python
+          
+          cp target/release/control-center-server package/bin/
+          cp target/release/control-center-agent package/bin/
+          chmod +x package/bin/*
+          
+          cp dist/*.whl package/python/
+          
+          cat > package/install.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          echo "Installing Control Center v${{ steps.version.outputs.VERSION }} (macOS x64)"
+          sudo cp bin/control-center-server /usr/local/bin/
+          sudo cp bin/control-center-agent /usr/local/bin/
+          sudo chmod +x /usr/local/bin/control-center-*
+          pip3 install python/*.whl
+          echo "✓ Control Center installed successfully!"
+          EOF
+          chmod +x package/install.sh
+          
+          cd package
+          tar -czvf ../control-center-${{ steps.version.outputs.VERSION }}-macos-x64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64-assets
+          path: control-center-*.tar.gz
+
+  # ============================================================================
+  # JOB 5: WINDOWS BUILD (x64)
+  # ============================================================================
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      # Install protobuf for Windows
+      - name: Install Protobuf
+        run: choco install protoc
+
+      - name: Build Rust Binaries
+        run: cargo build --release --workspace
+
+      - name: Build Python Package
+        run: |
+          pip install build
+          python -m build
+
+      - name: Get Version
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Create Package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path package\bin
+          New-Item -ItemType Directory -Force -Path package\python
+          
+          Copy-Item target\release\control-center-server.exe package\bin\
+          Copy-Item target\release\control-center-agent.exe package\bin\
+          Copy-Item dist\*.whl package\python\
+          
+          @'
+          @echo off
+          echo Installing Control Center v${{ steps.version.outputs.VERSION }} (Windows x64)
+          
+          echo Installing Rust binaries...
+          copy /Y bin\control-center-server.exe %PROGRAMFILES%\control-center\
+          copy /Y bin\control-center-agent.exe %PROGRAMFILES%\control-center\
+          
+          echo Installing Python CLI...
+          pip install python\*.whl
+          
+          echo ✓ Control Center installed successfully!
+          echo Add %PROGRAMFILES%\control-center to your PATH
+          pause
+          '@ | Out-File -FilePath package\install.bat -Encoding ASCII
+          
+          Compress-Archive -Path package\* -DestinationPath control-center-${{ steps.version.outputs.VERSION }}-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-assets
+          path: control-center-*.zip
+
+  # ============================================================================
+  # JOB 6: CREATE GITHUB RELEASE
+  # ============================================================================
+  release:
+    needs: 
+      - build-linux-x64
+      - build-linux-arm64
+      - build-macos-arm64
+      - build-macos-x64
+      - build-windows-x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List Release Assets
+        run: ls -lh release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          body: |
+            Control Center v${{ github.ref_name }}
+            
+            Multi-platform release for Windows, macOS, and Linux.
+            
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
