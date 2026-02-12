@@ -30,6 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+prost-build = { version = "0.12", features = ["vendored"] }
 
 [profile.release]
 opt-level = 3
