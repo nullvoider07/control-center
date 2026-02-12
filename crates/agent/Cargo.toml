@@ -40,3 +40,10 @@ tonic-build = "0.12"
 opt-level = 3
 lto = true
 strip = true
+
+[dependencies.openssl]
+version = "0.10"
+optional = true
+
+[features]
+openssl-vendored = ["openssl/vendored"]

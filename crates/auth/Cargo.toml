@@ -29,3 +29,10 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[dependencies.openssl]
+version = "0.10"
+optional = true
+
+[features]
+openssl-vendored = ["openssl/vendored"]
