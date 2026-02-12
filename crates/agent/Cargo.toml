@@ -35,7 +35,9 @@ winapi = { version = "0.3", features = ["sysinfoapi", "winnt"] }
 
 [build-dependencies]
 tonic-build = "0.12"
-prost-build = { version = "0.12", features = ["vendored"] }
+prost-build = "0.12.6"
+protobuf-src = { version = "2.1", optional = true }
+
 
 [profile.release]
 opt-level = 3
@@ -48,3 +50,4 @@ optional = true
 
 [features]
 openssl-vendored = ["openssl/vendored"]
+vendored-protoc = ["protobuf-src"]
