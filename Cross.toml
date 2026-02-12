@@ -18,7 +18,10 @@ image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest"
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:latest"
 pre-build = [
     "apt-get update",
-    "apt-get install -y --no-install-recommends protobuf-compiler pkg-config libssl-dev",
+    "apt-get install -y --no-install-recommends wget unzip ca-certificates pkg-config libssl-dev",
+    "wget https://github.com/protocolbuffers/protobuf/releases/download/v28.2/protoc-28.2-linux-aarch_64.zip",
+    "unzip -o protoc-28.2-linux-aarch_64.zip -d /usr/local",
+    "rm protoc-28.2-linux-aarch_64.zip",
 ]
 
 [target.x86_64-pc-windows-msvc]
