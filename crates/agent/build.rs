@@ -2,6 +2,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::env;
+use protoc_bin_vendored::protoc_bin_path;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
@@ -95,7 +96,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("cargo:warning=");
     println!("cargo:warning=Configuring tonic_build...");
-    
+    println!("cargo:warning=Using protoc-bin-vendored for reliable cross-compilation...");
+    let protoc_path = protoc_bin_path().expect("Failed to get protoc binary");
+    unsafe {
+        std::env::set_var("PROTOC", &protoc_path);
+    }
+    println!("cargo:warning=PROTOC set to: {:?}", protoc_path);
+    println!("cargo:warning=PROTOC set to: {:?}", protoc_bin_path().unwrap());
     println!("cargo:rerun-if-changed={}", proto_file.display());
     println!("cargo:rerun-if-changed={}", proto_dir.display());
 
