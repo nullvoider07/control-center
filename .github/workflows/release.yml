@@ -37,7 +37,20 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+
+      - name: Generate Protobuf Files
+        run: |
+          mkdir -p crates/controller/integrations/proto
+          python -m grpc_tools.protoc \
+            -IProto \
+            --python_out=crates/controller/integrations/proto \
+            --grpc_python_out=crates/controller/integrations/proto \
+            Proto/control_center.proto
+          cat > crates/controller/integrations/proto/__init__.py << 'EOF'
+          from .control_center_pb2 import *
+          from .control_center_pb2_grpc import *
+          EOF
 
       - name: Build Python CLI Binary
         run: |
@@ -45,8 +58,10 @@ jobs:
             --name control-center \
             --paths crates \
             --add-data "crates/controller:controller" \
+            --add-data "crates/controller/integrations/proto:controller/integrations/proto" \
             --hidden-import=click \
             --hidden-import=grpc \
+            --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
@@ -141,7 +156,20 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+
+      - name: Generate Protobuf Files
+        run: |
+          mkdir -p crates/controller/integrations/proto
+          python -m grpc_tools.protoc \
+            -IProto \
+            --python_out=crates/controller/integrations/proto \
+            --grpc_python_out=crates/controller/integrations/proto \
+            Proto/control_center.proto
+          cat > crates/controller/integrations/proto/__init__.py << 'EOF'
+          from .control_center_pb2 import *
+          from .control_center_pb2_grpc import *
+          EOF
 
       - name: Build Python CLI Binary
         run: |
@@ -149,8 +177,10 @@ jobs:
             --name control-center \
             --paths crates \
             --add-data "crates/controller:controller" \
+            --add-data "crates/controller/integrations/proto:controller/integrations/proto" \
             --hidden-import=click \
             --hidden-import=grpc \
+            --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
@@ -238,7 +268,20 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+
+      - name: Generate Protobuf Files
+        run: |
+          mkdir -p crates/controller/integrations/proto
+          python -m grpc_tools.protoc \
+            -IProto \
+            --python_out=crates/controller/integrations/proto \
+            --grpc_python_out=crates/controller/integrations/proto \
+            Proto/control_center.proto
+          cat > crates/controller/integrations/proto/__init__.py << 'EOF'
+          from .control_center_pb2 import *
+          from .control_center_pb2_grpc import *
+          EOF
 
       - name: Build Python CLI Binary
         run: |
@@ -246,8 +289,10 @@ jobs:
             --name control-center \
             --paths crates \
             --add-data "crates/controller:controller" \
+            --add-data "crates/controller/integrations/proto:controller/integrations/proto" \
             --hidden-import=click \
             --hidden-import=grpc \
+            --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
@@ -332,7 +377,20 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+
+      - name: Generate Protobuf Files
+        run: |
+          mkdir -p crates/controller/integrations/proto
+          python -m grpc_tools.protoc \
+            -IProto \
+            --python_out=crates/controller/integrations/proto \
+            --grpc_python_out=crates/controller/integrations/proto \
+            Proto/control_center.proto
+          cat > crates/controller/integrations/proto/__init__.py << 'EOF'
+          from .control_center_pb2 import *
+          from .control_center_pb2_grpc import *
+          EOF
 
       - name: Build Python CLI Binary
         run: |
@@ -340,8 +398,10 @@ jobs:
             --name control-center \
             --paths crates \
             --add-data "crates/controller:controller" \
+            --add-data "crates/controller/integrations/proto:controller/integrations/proto" \
             --hidden-import=click \
             --hidden-import=grpc \
+            --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
@@ -419,7 +479,21 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+
+      - name: Generate Protobuf Files
+        shell: bash
+        run: |
+          mkdir -p crates/controller/integrations/proto
+          python -m grpc_tools.protoc \
+            -IProto \
+            --python_out=crates/controller/integrations/proto \
+            --grpc_python_out=crates/controller/integrations/proto \
+            Proto/control_center.proto
+          cat > crates/controller/integrations/proto/__init__.py << 'EOF'
+          from .control_center_pb2 import *
+          from .control_center_pb2_grpc import *
+          EOF
 
       - name: Build Python CLI Binary
         run: |
@@ -427,8 +501,10 @@ jobs:
             --name control-center `
             --paths crates `
             --add-data "crates/controller;controller" `
+            --add-data "crates/controller/integrations/proto;controller/integrations/proto" `
             --hidden-import=click `
             --hidden-import=grpc `
+            --hidden-import=grpc._cython.cygrpc `
             --hidden-import=yaml `
             --hidden-import=google.protobuf `
             crates/controller/management/cli.py

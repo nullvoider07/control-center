@@ -1,7 +1,7 @@
 """gRPC client with token-based authentication"""
 
 import grpc
-from typing import Optional, Dict, Iterator
+from typing import Optional, Dict, Iterator, Any
 from uuid import uuid4
 import time
 import logging
@@ -17,18 +17,33 @@ from .exceptions import (
     TimeoutError,
 )
 
-# Setup path for protobuf imports
-current_dir = os.path.dirname(os.path.abspath(__file__))
-proto_dir = os.path.abspath(os.path.join(current_dir, "../../Proto"))
-sys.path.append(proto_dir)
+def _import_protobuf():
+    """Import protobuf modules with fallback for PyInstaller bundles."""
+    try:
+        # Try package import first (development/normal install)
+        from controller.integrations.proto import control_center_pb2
+        from controller.integrations.proto import control_center_pb2_grpc
+        return control_center_pb2, control_center_pb2_grpc
+    except ImportError:
+        # Fallback for PyInstaller bundle or direct import
+        if getattr(sys, 'frozen', False):
+            # Running in PyInstaller bundle
+            bundle_dir = sys._MEIPASS # type: ignore
+            proto_path = os.path.join(bundle_dir, 'controller', 'integrations', 'proto')
+        else:
+            # Running in development, try relative to this file
+            proto_path = os.path.join(os.path.dirname(__file__), 'proto')
+        
+        if proto_path not in sys.path:
+            sys.path.insert(0, proto_path)
+        
+        import control_center_pb2 # type: ignore
+        import control_center_pb2_grpc # type: ignore
+        
+        return control_center_pb2, control_center_pb2_grpc
 
-try:
-    import control_center_pb2 as control_center_pb2  # type: ignore
-    import control_center_pb2_grpc as control_center_pb2_grpc  # type: ignore
-except ImportError:
-    print(f"Error: Could not import protobuf files from {proto_dir}")
-    print("Make sure control_center_pb2.py and control_center_pb2_grpc.py exist.")
-    raise
+# Import protobuf modules
+control_center_pb2, control_center_pb2_grpc = _import_protobuf()
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +64,7 @@ class GRPCClient:
         self.use_ssl = use_ssl
         
         self.channel: Optional[grpc.Channel] = None
-        self.stub: Optional[control_center_pb2_grpc.ControlServiceStub] = None
+        self.stub: Optional[Any] = None  # Type: ControlServiceStub
         self.token: Optional[str] = None
         self.agent_info: Optional[Dict] = None
         
