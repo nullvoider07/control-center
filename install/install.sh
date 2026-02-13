@@ -103,7 +103,7 @@ check_dependencies() {
     if ! command -v tar &> /dev/null; then
         missing_deps+=("tar")
     fi
-
+}
 # ============================================================================
 # Get Latest Release
 # ============================================================================
@@ -326,7 +326,7 @@ main() {
     download_package
     extract_package
     install_rust_binaries
-    install_python_binary
+    install_cli_binary
     update_path
     cleanup
     print_success_message
