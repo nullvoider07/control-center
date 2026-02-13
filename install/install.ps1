@@ -80,26 +80,6 @@ function Get-Architecture {
 # ============================================================================
 function Test-Dependencies {
     Write-Info "Checking dependencies..."
-    
-    $missing = @()
-    
-    # Check Python
-    if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-        $missing += "Python 3"
-    }
-    
-    # Check pip
-    if (-not (Get-Command pip -ErrorAction SilentlyContinue)) {
-        $missing += "pip"
-    }
-    
-    if ($missing.Count -gt 0) {
-        Write-ErrorMsg "Missing dependencies: $($missing -join ', ')"
-        Write-Host ""
-        Write-Host "Please install Python 3.11+ from https://python.org"
-        exit 1
-    }
-    
     Write-Success "All dependencies found"
 }
 
@@ -179,16 +159,15 @@ function Expand-Package {
             exit 1
         }
         
-        $WHEEL_FILE = Get-ChildItem "$TMP_DIR\python\control_center-*.whl" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $WHEEL_FILE) {
-            Write-ErrorMsg "Python wheel not found in package"
+        if (-not (Test-Path "$TMP_DIR\bin\control-center.exe")) {
+            Write-ErrorMsg "CLI binary not found in package"
+            Get-ChildItem "$TMP_DIR\bin" -ErrorAction SilentlyContinue
             exit 1
         }
         
         Write-Success "Package extracted and verified"
         return @{
             Dir = $TMP_DIR
-            Wheel = $WHEEL_FILE.FullName
         }
     } catch {
         Write-ErrorMsg "Failed to extract package: $_"
@@ -218,23 +197,16 @@ function Install-RustBinaries {
     Write-Host "  • Agent:  $INSTALL_DIR\control-center-agent.exe"
 }
 
-function Install-PythonCLI {
-    param($WheelFile)
+function Install-CLIBinary {
+    param($SourceDir)
     
-    Write-Info "Installing Python CLI..."
+    Write-Info "Installing CLI binary..."
     
-    try {
-        # Install with pip
-        $output = pip install $WheelFile --force-reinstall --user 2>&1
-        
-        Write-Success "Python CLI installed"
-        Write-Host "  • Command: control-center"
-    } catch {
-        Write-ErrorMsg "Failed to install Python CLI: $_"
-        $output | Write-Host -ForegroundColor Gray
-        Write-Host "  Try manually: pip install $WheelFile"
-        exit 1
-    }
+    # Copy PyInstaller-built binary
+    Copy-Item "$SourceDir\bin\control-center.exe" $INSTALL_DIR -Force
+    
+    Write-Success "CLI binary installed"
+    Write-Host "  • CLI: $INSTALL_DIR\control-center.exe"
 }
 
 # ============================================================================
