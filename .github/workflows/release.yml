@@ -37,7 +37,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
 
       - name: Generate Protobuf Files
         run: |
@@ -63,6 +63,7 @@ jobs:
             --hidden-import=grpc \
             --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
+            --hidden-import=psutil \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
 
@@ -156,7 +157,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
 
       - name: Generate Protobuf Files
         run: |
@@ -182,6 +183,7 @@ jobs:
             --hidden-import=grpc \
             --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
+            --hidden-import=psutil \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
 
@@ -268,7 +270,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
 
       - name: Generate Protobuf Files
         run: |
@@ -294,6 +296,7 @@ jobs:
             --hidden-import=grpc \
             --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
+            --hidden-import=psutil \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
 
@@ -377,7 +380,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
 
       - name: Generate Protobuf Files
         run: |
@@ -403,6 +406,7 @@ jobs:
             --hidden-import=grpc \
             --hidden-import=grpc._cython.cygrpc \
             --hidden-import=yaml \
+            --hidden-import=psutil \
             --hidden-import=google.protobuf \
             crates/controller/management/cli.py
 
@@ -479,7 +483,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
 
       - name: Generate Protobuf Files
         shell: bash
@@ -506,6 +510,7 @@ jobs:
             --hidden-import=grpc `
             --hidden-import=grpc._cython.cygrpc `
             --hidden-import=yaml `
+            --hidden-import=psutil `
             --hidden-import=google.protobuf `
             crates/controller/management/cli.py
 
