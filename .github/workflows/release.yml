@@ -44,7 +44,7 @@ jobs:
           pyinstaller --onefile \
             --name control-center \
             --paths crates \
-            --add-data "crates/controller:controller" \
+            --add-data "crates/controller;controller" \
             --hidden-import=click \
             --hidden-import=grpc \
             --hidden-import=yaml \
@@ -424,13 +424,13 @@ jobs:
       - name: Build Python CLI Binary
         run: |
           pyinstaller --onefile \
-            --name control-center \
-            --paths crates \
-            --add-data "crates/controller:controller" \
-            --hidden-import=click \
-            --hidden-import=grpc \
-            --hidden-import=yaml \
-            --hidden-import=google.protobuf \
+            --name control-center `
+            --paths crates `
+            --add-data "crates/controller:controller" `
+            --hidden-import=click `
+            --hidden-import=grpc `
+            --hidden-import=yaml `
+            --hidden-import=google.protobuf `
             crates/controller/management/cli.py
 
       - name: Get Version
