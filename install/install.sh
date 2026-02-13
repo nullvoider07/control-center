@@ -10,6 +10,8 @@ set -e
 # ============================================================================
 REPO="nullvoider07/control-center"
 INSTALL_DIR="$HOME/.local/bin"
+SERVER_BINARY="control-center-server"
+AGENT_BINARY="control-center-agent"
 
 # Colors
 RED='\033[0;31m'
@@ -103,6 +105,13 @@ check_dependencies() {
     if ! command -v tar &> /dev/null; then
         missing_deps+=("tar")
     fi
+
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        print_error "Missing dependencies: ${missing_deps[*]}"
+        exit 1
+    fi
+
+    print_success "All dependencies found"
 }
 # ============================================================================
 # Get Latest Release
