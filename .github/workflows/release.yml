@@ -65,9 +65,6 @@ jobs:
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
-          # Copy Python wheel
-          cp dist/*.whl package/python/
-          
           # Create unified installation script
           cat > package/install.sh << 'EOF'
           #!/bin/bash
@@ -86,7 +83,7 @@ jobs:
           chmod +x "$HOME/.local/bin/control-center-"*
           echo "  ✓ Server: $HOME/.local/bin/control-center-server"
           echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo "  ✓ CLI: control-center"
+          echo "  ✓ CLI: $HOME/.local/bin/control-center"
           echo ""
           
           # Check PATH
@@ -172,9 +169,6 @@ jobs:
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
-          # Copy Python wheel
-          cp dist/*.whl package/python/
-          
           # Create installation script (same as x64)
           cat > package/install.sh << 'EOF'
           #!/bin/bash
@@ -192,7 +186,7 @@ jobs:
           chmod +x "$HOME/.local/bin/control-center-"*
           echo "  ✓ Server: $HOME/.local/bin/control-center-server"
           echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo "  ✓ CLI: control-center"
+          echo "  ✓ CLI: $HOME/.local/bin/control-center"
           echo ""
           
           if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
@@ -271,8 +265,6 @@ jobs:
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
-          cp dist/*.whl package/python/
-          
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
@@ -294,11 +286,7 @@ jobs:
           
           echo "  ✓ Server: $HOME/.local/bin/control-center-server"
           echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo ""
-          
-          echo "[2/2] Installing Python CLI..."
-          pip3 install --user python/*.whl
-          echo "  ✓ CLI: control-center"
+          echo "  ✓ CLI: $HOME/.local/bin/control-center"
           echo ""
           
           if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
@@ -371,8 +359,6 @@ jobs:
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
-          cp dist/*.whl package/python/
-          
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
@@ -393,11 +379,7 @@ jobs:
           
           echo "  ✓ Server: $HOME/.local/bin/control-center-server"
           echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo ""
-          
-          echo "[2/2] Installing Python CLI..."
-          pip3 install --user python/*.whl
-          echo "  ✓ CLI: control-center"
+          echo "  ✓ CLI: $HOME/.local/bin/control-center"
           echo ""
           
           echo "=========================================="
@@ -465,9 +447,6 @@ jobs:
           Copy-Item target\release\control-center-server.exe package\bin\
           Copy-Item target\release\control-center-agent.exe package\bin\
           Copy-Item dist\control-center.exe package\bin\
-          
-          # Copy Python wheel
-          Copy-Item dist\*.whl package\python\
           
           # Create installation script
           @'
