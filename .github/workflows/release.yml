@@ -35,10 +35,21 @@ jobs:
       - name: Build Rust Binaries
         run: cargo build --release --workspace
 
-      - name: Build Python Package
+      - name: Install PyInstaller and dependencies
         run: |
-          pip install build
-          python -m build
+          pip install pyinstaller click grpcio protobuf pyyaml requests
+
+      - name: Build Python CLI Binary
+        run: |
+          pyinstaller --onefile \
+            --name control-center \
+            --paths crates \
+            --add-data "crates/controller:controller" \
+            --hidden-import=click \
+            --hidden-import=grpc \
+            --hidden-import=yaml \
+            --hidden-import=google.protobuf \
+            crates/controller/management/cli.py
 
       - name: Get Version
         id: version
@@ -47,11 +58,11 @@ jobs:
       - name: Create Package
         run: |
           mkdir -p package/bin
-          mkdir -p package/python
           
           # Copy BOTH Rust binaries
           cp target/release/control-center-server package/bin/
           cp target/release/control-center-agent package/bin/
+          cp dist/control-center package/bin/
           chmod +x package/bin/*
           
           # Copy Python wheel
@@ -71,18 +82,10 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/control-center "$HOME/.local/bin/"
           chmod +x "$HOME/.local/bin/control-center-"*
           echo "  ✓ Server: $HOME/.local/bin/control-center-server"
           echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo ""
-          
-          # Install Python CLI
-          echo "[2/2] Installing Python CLI..."
-          if command -v pip3 &> /dev/null; then
-              pip3 install --user python/*.whl
-          else
-              python3 -m pip install --user python/*.whl
-          fi
           echo "  ✓ CLI: control-center"
           echo ""
           
@@ -139,10 +142,21 @@ jobs:
       - name: Build Rust Binaries (ARM64)
         run: cross build --release --target aarch64-unknown-linux-gnu --workspace --features openssl-vendored
 
-      - name: Build Python Package
+      - name: Install PyInstaller and dependencies
         run: |
-          pip install build
-          python -m build
+          pip install pyinstaller click grpcio protobuf pyyaml requests
+
+      - name: Build Python CLI Binary
+        run: |
+          pyinstaller --onefile \
+            --name control-center \
+            --paths crates \
+            --add-data "crates/controller:controller" \
+            --hidden-import=click \
+            --hidden-import=grpc \
+            --hidden-import=yaml \
+            --hidden-import=google.protobuf \
+            crates/controller/management/cli.py
 
       - name: Get Version
         id: version
@@ -151,11 +165,11 @@ jobs:
       - name: Create Package
         run: |
           mkdir -p package/bin
-          mkdir -p package/python
           
           # Copy ARM64 Rust binaries
           cp target/aarch64-unknown-linux-gnu/release/control-center-server package/bin/
           cp target/aarch64-unknown-linux-gnu/release/control-center-agent package/bin/
+          cp dist/control-center package/bin/
           chmod +x package/bin/*
           
           # Copy Python wheel
@@ -174,17 +188,10 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/control-center "$HOME/.local/bin/"
           chmod +x "$HOME/.local/bin/control-center-"*
           echo "  ✓ Server: $HOME/.local/bin/control-center-server"
           echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo ""
-          
-          echo "[2/2] Installing Python CLI..."
-          if command -v pip3 &> /dev/null; then
-              pip3 install --user python/*.whl
-          else
-              python3 -m pip install --user python/*.whl
-          fi
           echo "  ✓ CLI: control-center"
           echo ""
           
@@ -235,10 +242,21 @@ jobs:
       - name: Build Rust Binaries
         run: cargo build --release --workspace
 
-      - name: Build Python Package
+      - name: Install PyInstaller and dependencies
         run: |
-          pip install build
-          python -m build
+          pip install pyinstaller click grpcio protobuf pyyaml requests
+
+      - name: Build Python CLI Binary
+        run: |
+          pyinstaller --onefile \
+            --name control-center \
+            --paths crates \
+            --add-data "crates/controller:controller" \
+            --hidden-import=click \
+            --hidden-import=grpc \
+            --hidden-import=yaml \
+            --hidden-import=google.protobuf \
+            crates/controller/management/cli.py
 
       - name: Get Version
         id: version
@@ -247,10 +265,10 @@ jobs:
       - name: Create Package
         run: |
           mkdir -p package/bin
-          mkdir -p package/python
           
           cp target/release/control-center-server package/bin/
           cp target/release/control-center-agent package/bin/
+          cp dist/control-center package/bin/
           chmod +x package/bin/*
           
           cp dist/*.whl package/python/
@@ -267,6 +285,7 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/control-center "$HOME/.local/bin/"
           chmod +x "$HOME/.local/bin/control-center-"*
           
           # Remove quarantine on macOS
@@ -323,10 +342,21 @@ jobs:
       - name: Build Rust Binaries
         run: cargo build --release --workspace
 
-      - name: Build Python Package
+      - name: Install PyInstaller and dependencies
         run: |
-          pip install build
-          python -m build
+          pip install pyinstaller click grpcio protobuf pyyaml requests
+
+      - name: Build Python CLI Binary
+        run: |
+          pyinstaller --onefile \
+            --name control-center \
+            --paths crates \
+            --add-data "crates/controller:controller" \
+            --hidden-import=click \
+            --hidden-import=grpc \
+            --hidden-import=yaml \
+            --hidden-import=google.protobuf \
+            crates/controller/management/cli.py
 
       - name: Get Version
         id: version
@@ -335,10 +365,10 @@ jobs:
       - name: Create Package
         run: |
           mkdir -p package/bin
-          mkdir -p package/python
           
           cp target/release/control-center-server package/bin/
           cp target/release/control-center-agent package/bin/
+          cp dist/control-center package/bin/
           chmod +x package/bin/*
           
           cp dist/*.whl package/python/
@@ -355,6 +385,7 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/control-center "$HOME/.local/bin/"
           chmod +x "$HOME/.local/bin/control-center-"*
           
           xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-server" 2>/dev/null || true
@@ -404,10 +435,21 @@ jobs:
       - name: Build Rust Binaries
         run: cargo build --release --workspace
 
-      - name: Build Python Package
+      - name: Install PyInstaller and dependencies
         run: |
-          pip install build
-          python -m build
+          pip install pyinstaller click grpcio protobuf pyyaml requests
+
+      - name: Build Python CLI Binary
+        run: |
+          pyinstaller --onefile \
+            --name control-center \
+            --paths crates \
+            --add-data "crates/controller:controller" \
+            --hidden-import=click \
+            --hidden-import=grpc \
+            --hidden-import=yaml \
+            --hidden-import=google.protobuf \
+            crates/controller/management/cli.py
 
       - name: Get Version
         id: version
@@ -418,11 +460,11 @@ jobs:
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force -Path package\bin
-          New-Item -ItemType Directory -Force -Path package\python
           
           # Copy BOTH Rust binaries
           Copy-Item target\release\control-center-server.exe package\bin\
           Copy-Item target\release\control-center-agent.exe package\bin\
+          Copy-Item dist\control-center.exe package\bin\
           
           # Copy Python wheel
           Copy-Item dist\*.whl package\python\
@@ -441,10 +483,6 @@ jobs:
           copy /Y bin\control-center-agent.exe "%LOCALAPPDATA%\Programs\ControlCenter\"
           echo   + Server: %LOCALAPPDATA%\Programs\ControlCenter\control-center-server.exe
           echo   + Agent:  %LOCALAPPDATA%\Programs\ControlCenter\control-center-agent.exe
-          echo.
-          
-          echo [2/2] Installing Python CLI...
-          pip install python\*.whl
           echo   + CLI: control-center
           echo.
           

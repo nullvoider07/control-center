@@ -94,31 +94,15 @@ check_dependencies() {
     
     local missing_deps=()
     
-    # Essential tools
-    for dep in curl tar python3; do
-        if ! command -v $dep &> /dev/null; then
-            missing_deps+=("$dep")
-        fi
-    done
-    
-    # pip3 (can also use python3 -m pip)
-    if ! command -v pip3 &> /dev/null && ! python3 -m pip --version &> /dev/null 2>&1; then
-        missing_deps+=("python3-pip")
+    # Check for curl
+    if ! command -v curl &> /dev/null; then
+        missing_deps+=("curl")
     fi
     
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        print_error "Missing dependencies: ${missing_deps[*]}"
-        echo ""
-        if [[ "$OS_TYPE" == "linux" ]]; then
-            echo "Install with: sudo apt-get install ${missing_deps[*]}"
-        else
-            echo "Install with: brew install ${missing_deps[*]}"
-        fi
-        exit 1
+    # Check for tar
+    if ! command -v tar &> /dev/null; then
+        missing_deps+=("tar")
     fi
-    
-    print_success "All dependencies found"
-}
 
 # ============================================================================
 # Get Latest Release
@@ -172,21 +156,20 @@ extract_package() {
         exit 1
     fi
 
-    # Verify contents
-    if [ ! -f "$TMP_DIR/bin/control-center-server" ]; then
-        print_error "Server binary not found in package"
-        ls -la "$TMP_DIR/bin" 2>/dev/null || ls -la "$TMP_DIR"
+    # Verify binaries exist
+    if [ ! -f "$TMP_DIR/bin/$SERVER_BINARY" ]; then
+        print_error "$SERVER_BINARY not found in package"
         exit 1
     fi
 
-    if [ ! -f "$TMP_DIR/bin/control-center-agent" ]; then
-        print_error "Agent binary not found in package"
+    if [ ! -f "$TMP_DIR/bin/$AGENT_BINARY" ]; then
+        print_error "$AGENT_BINARY not found in package"
         exit 1
     fi
 
-    WHEEL_FILE=$(find "$TMP_DIR/python" -name "control_center-*.whl" 2>/dev/null | head -1)
-    if [ -z "$WHEEL_FILE" ]; then
-        print_error "Python wheel not found in package"
+    if [ ! -f "$TMP_DIR/bin/control-center" ]; then
+        print_error "CLI binary not found in package"
+        ls -la "$TMP_DIR/bin" 2>/dev/null
         exit 1
     fi
 
@@ -219,27 +202,14 @@ install_rust_binaries() {
     echo "  • Agent:  $INSTALL_DIR/control-center-agent"
 }
 
-install_python_cli() {
-    print_info "Installing Python CLI..."
+install_cli_binary() {
+    print_info "Installing CLI binary..."
     
-    # Determine pip command
-    PIP_CMD="pip3"
-    if ! command -v pip3 &> /dev/null; then
-        PIP_CMD="python3 -m pip"
-    fi
+    # Copy the PyInstaller-built binary
+    cp "$TMP_DIR/bin/control-center" "$INSTALL_DIR/"
+    chmod +x "$INSTALL_DIR/control-center"
     
-    # Install wheel
-    if ! $PIP_CMD install --user "$WHEEL_FILE" --force-reinstall --no-deps 2>/dev/null; then
-        # Try without --no-deps if it fails
-        if ! $PIP_CMD install --user "$WHEEL_FILE" --force-reinstall; then
-            print_error "Failed to install Python CLI"
-            echo "  Try manually: $PIP_CMD install $WHEEL_FILE"
-            exit 1
-        fi
-    fi
-    
-    print_success "Python CLI installed"
-    echo "  • Command: control-center"
+    print_success "CLI binary installed"
 }
 
 # ============================================================================
@@ -256,7 +226,7 @@ update_path() {
 
     # Check if PATH already includes install dir
     if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        print_info "Adding $INSTALL_DIR to PATH..."
+        print_info "Adding $INSTALL_DIR to PATH in $SHELL_CONFIG..."
         echo "" >> "$SHELL_CONFIG"
         echo "# Control Center" >> "$SHELL_CONFIG"
         echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_CONFIG"
@@ -286,7 +256,7 @@ print_success_message() {
     echo "Installed components:"
     echo "  • Server:  $INSTALL_DIR/control-center-server"
     echo "  • Agent:   $INSTALL_DIR/control-center-agent"
-    echo "  • CLI:     control-center (Python)"
+    echo "  • CLI:     $INSTALL_DIR/control-center"
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Quick Start"
@@ -356,7 +326,7 @@ main() {
     download_package
     extract_package
     install_rust_binaries
-    install_python_cli
+    install_python_binary
     update_path
     cleanup
     print_success_message
