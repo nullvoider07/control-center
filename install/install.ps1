@@ -260,7 +260,7 @@ function Write-SuccessMessage {
     Write-Host "Installed components:"
     Write-Host "  • Server:  $INSTALL_DIR\control-center-server.exe"
     Write-Host "  • Agent:   $INSTALL_DIR\control-center-agent.exe"
-    Write-Host "  • CLI:     control-center (Python)"
+    Write-Host "  • CLI:     $INSTALL_DIR\control-center.exe"
     Write-Host ""
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host "  Quick Start" -ForegroundColor Cyan
@@ -319,7 +319,7 @@ function Main {
     $extracted = Expand-Package -ZipFile $zipFile
     
     Install-RustBinaries -SourceDir $extracted.Dir
-    Install-PythonCLI -WheelFile $extracted.Wheel
+    Install-CLIBinary -SourceDir $extracted.Dir
     
     Update-Path
     
