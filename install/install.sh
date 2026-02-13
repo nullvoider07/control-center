@@ -1,6 +1,7 @@
 #!/bin/bash
-# Control Center - Installation Script for macOS and Linux
-# Installs: control-center-server, control-center-agent, control-center CLI
+# Control Center - Unified Installation Script
+# Installs: Rust binaries (server + agent) + Python CLI
+# Following the-eye pattern: One package, one command
 
 set -e
 
@@ -9,16 +10,13 @@ set -e
 # ============================================================================
 REPO="nullvoider07/control-center"
 INSTALL_DIR="$HOME/.local/bin"
-SERVER_BINARY="control-center-server"
-AGENT_BINARY="control-center-agent"
-CLI_PACKAGE="control-center"
 
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # ============================================================================
 # Helper Functions
@@ -26,7 +24,7 @@ NC='\033[0m' # No Color
 print_header() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${BLUE}   Control Center Installation${NC}"
+    echo -e "${BLUE}   Control Center - Unified Installation${NC}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 }
@@ -53,7 +51,7 @@ print_info() {
 check_existing_installation() {
     if command -v control-center &> /dev/null; then
         print_warning "Control Center is already installed."
-        CURRENT_VERSION=$(control-center --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+        CURRENT_VERSION=$(control-center version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
         echo "  Current version: $CURRENT_VERSION"
         echo ""
         read -p "Do you want to reinstall/upgrade? [y/N] " -n 1 -r
@@ -67,22 +65,16 @@ check_existing_installation() {
 }
 
 # ============================================================================
-# Detect OS
+# Detect OS and Architecture
 # ============================================================================
-detect_os() {
+detect_platform() {
     OS="$(uname -s)"
     case "${OS}" in
         Linux*)     OS_TYPE="linux";;
         Darwin*)    OS_TYPE="macos";;
         *)          print_error "Unsupported OS: ${OS}"; exit 1;;
     esac
-    print_success "Detected OS: ${OS_TYPE}"
-}
-
-# ============================================================================
-# Detect Architecture
-# ============================================================================
-detect_arch() {
+    
     ARCH="$(uname -m)"
     case "${ARCH}" in
         x86_64)    ARCH_TYPE="x64";;
@@ -90,7 +82,8 @@ detect_arch() {
         aarch64)   ARCH_TYPE="arm64";;
         *)         print_error "Unsupported Architecture: ${ARCH}"; exit 1;;
     esac
-    print_success "Detected Architecture: ${ARCH_TYPE}"
+    
+    print_success "Detected: ${OS_TYPE}-${ARCH_TYPE}"
 }
 
 # ============================================================================
@@ -101,28 +94,20 @@ check_dependencies() {
     
     local missing_deps=()
     
-    # Check for curl
-    if ! command -v curl &> /dev/null; then
-        missing_deps+=("curl")
-    fi
+    # Essential tools
+    for dep in curl tar python3; do
+        if ! command -v $dep &> /dev/null; then
+            missing_deps+=("$dep")
+        fi
+    done
     
-    # Check for tar
-    if ! command -v tar &> /dev/null; then
-        missing_deps+=("tar")
-    fi
-    
-    # Check for Python 3
-    if ! command -v python3 &> /dev/null; then
-        missing_deps+=("python3")
-    fi
-    
-    # Check for pip
+    # pip3 (can also use python3 -m pip)
     if ! command -v pip3 &> /dev/null && ! python3 -m pip --version &> /dev/null 2>&1; then
         missing_deps+=("python3-pip")
     fi
     
     if [ ${#missing_deps[@]} -ne 0 ]; then
-        print_error "Missing required dependencies: ${missing_deps[*]}"
+        print_error "Missing dependencies: ${missing_deps[*]}"
         echo ""
         if [[ "$OS_TYPE" == "linux" ]]; then
             echo "Install with: sudo apt-get install ${missing_deps[*]}"
@@ -132,36 +117,7 @@ check_dependencies() {
         exit 1
     fi
     
-    # OS-specific dependencies
-    if [[ "$OS_TYPE" == "linux" ]]; then
-        if ! command -v xdotool &> /dev/null; then
-            print_warning "xdotool not found (required for agent)"
-            echo "  Install: sudo apt-get install xdotool"
-            echo ""
-            read -p "Continue without xdotool? [y/N] " -n 1 -r
-            echo ""
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                exit 1
-            fi
-        else
-            print_success "xdotool found"
-        fi
-    elif [[ "$OS_TYPE" == "macos" ]]; then
-        if ! command -v cliclick &> /dev/null; then
-            print_warning "cliclick not found (required for agent)"
-            echo "  Install: brew install cliclick"
-            echo ""
-            read -p "Continue without cliclick? [y/N] " -n 1 -r
-            echo ""
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                exit 1
-            fi
-        else
-            print_success "cliclick found"
-        fi
-    fi
-    
-    print_success "All required dependencies found"
+    print_success "All dependencies found"
 }
 
 # ============================================================================
@@ -177,15 +133,14 @@ get_latest_release() {
         exit 1
     fi
 
-    # Extract version (remove 'v' prefix if present)
     VERSION=${LATEST_TAG#v}
     print_success "Latest version: v${VERSION}"
 }
 
 # ============================================================================
-# Download Release Package
+# Download and Extract Package
 # ============================================================================
-download_release() {
+download_package() {
     FILE_NAME="control-center-${VERSION}-${OS_TYPE}-${ARCH_TYPE}.tar.gz"
     DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$FILE_NAME"
 
@@ -207,9 +162,6 @@ download_release() {
     print_success "Downloaded successfully"
 }
 
-# ============================================================================
-# Extract and Verify Package
-# ============================================================================
 extract_package() {
     print_info "Extracting package..."
     TMP_DIR="/tmp/control-center-extract-$$"
@@ -220,24 +172,21 @@ extract_package() {
         exit 1
     fi
 
-    # Verify binaries exist
-    if [ ! -f "$TMP_DIR/bin/$SERVER_BINARY" ]; then
-        print_error "$SERVER_BINARY not found in package"
+    # Verify contents
+    if [ ! -f "$TMP_DIR/bin/control-center-server" ]; then
+        print_error "Server binary not found in package"
         ls -la "$TMP_DIR/bin" 2>/dev/null || ls -la "$TMP_DIR"
         exit 1
     fi
 
-    if [ ! -f "$TMP_DIR/bin/$AGENT_BINARY" ]; then
-        print_error "$AGENT_BINARY not found in package"
-        ls -la "$TMP_DIR/bin" 2>/dev/null || ls -la "$TMP_DIR"
+    if [ ! -f "$TMP_DIR/bin/control-center-agent" ]; then
+        print_error "Agent binary not found in package"
         exit 1
     fi
 
-    # Check for Python wheel
     WHEEL_FILE=$(find "$TMP_DIR/python" -name "control_center-*.whl" 2>/dev/null | head -1)
     if [ -z "$WHEEL_FILE" ]; then
         print_error "Python wheel not found in package"
-        ls -la "$TMP_DIR/python" 2>/dev/null || echo "  python/ directory not found"
         exit 1
     fi
 
@@ -245,32 +194,31 @@ extract_package() {
 }
 
 # ============================================================================
-# Install Binaries
+# Install Components
 # ============================================================================
-install_binaries() {
-    print_info "Installing binaries to $INSTALL_DIR..."
+install_rust_binaries() {
+    print_info "Installing Rust binaries..."
     mkdir -p "$INSTALL_DIR"
 
     # Copy binaries
-    cp "$TMP_DIR/bin/$SERVER_BINARY" "$INSTALL_DIR/"
-    cp "$TMP_DIR/bin/$AGENT_BINARY" "$INSTALL_DIR/"
+    cp "$TMP_DIR/bin/control-center-server" "$INSTALL_DIR/"
+    cp "$TMP_DIR/bin/control-center-agent" "$INSTALL_DIR/"
 
     # Make executable
-    chmod +x "$INSTALL_DIR/$SERVER_BINARY"
-    chmod +x "$INSTALL_DIR/$AGENT_BINARY"
+    chmod +x "$INSTALL_DIR/control-center-server"
+    chmod +x "$INSTALL_DIR/control-center-agent"
 
     # macOS: Remove quarantine
     if [[ "$OS_TYPE" == "macos" ]]; then
-        xattr -d com.apple.quarantine "$INSTALL_DIR/$SERVER_BINARY" 2>/dev/null || true
-        xattr -d com.apple.quarantine "$INSTALL_DIR/$AGENT_BINARY" 2>/dev/null || true
+        xattr -d com.apple.quarantine "$INSTALL_DIR/control-center-server" 2>/dev/null || true
+        xattr -d com.apple.quarantine "$INSTALL_DIR/control-center-agent" 2>/dev/null || true
     fi
 
-    print_success "Binaries installed"
+    print_success "Rust binaries installed"
+    echo "  • Server: $INSTALL_DIR/control-center-server"
+    echo "  • Agent:  $INSTALL_DIR/control-center-agent"
 }
 
-# ============================================================================
-# Install Python CLI
-# ============================================================================
 install_python_cli() {
     print_info "Installing Python CLI..."
     
@@ -281,13 +229,17 @@ install_python_cli() {
     fi
     
     # Install wheel
-    if ! $PIP_CMD install --user "$WHEEL_FILE" --force-reinstall; then
-        print_error "Failed to install Python CLI"
-        echo "  Try manually: $PIP_CMD install $WHEEL_FILE"
-        exit 1
+    if ! $PIP_CMD install --user "$WHEEL_FILE" --force-reinstall --no-deps 2>/dev/null; then
+        # Try without --no-deps if it fails
+        if ! $PIP_CMD install --user "$WHEEL_FILE" --force-reinstall; then
+            print_error "Failed to install Python CLI"
+            echo "  Try manually: $PIP_CMD install $WHEEL_FILE"
+            exit 1
+        fi
     fi
     
     print_success "Python CLI installed"
+    echo "  • Command: control-center"
 }
 
 # ============================================================================
@@ -304,7 +256,7 @@ update_path() {
 
     # Check if PATH already includes install dir
     if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        print_info "Adding $INSTALL_DIR to PATH in $SHELL_CONFIG..."
+        print_info "Adding $INSTALL_DIR to PATH..."
         echo "" >> "$SHELL_CONFIG"
         echo "# Control Center" >> "$SHELL_CONFIG"
         echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_CONFIG"
@@ -312,24 +264,13 @@ update_path() {
     else
         PATH_UPDATED=false
     fi
-    
-    # Python user bin directory
-    PYTHON_USER_BIN="$HOME/.local/bin"
-    if [[ ":$PATH:" != *":$PYTHON_USER_BIN:"* ]]; then
-        if [ "$PATH_UPDATED" = false ]; then
-            echo "" >> "$SHELL_CONFIG"
-            echo "# Control Center" >> "$SHELL_CONFIG"
-        fi
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_CONFIG"
-        PATH_UPDATED=true
-    fi
 }
 
 # ============================================================================
 # Clean Up
 # ============================================================================
 cleanup() {
-    print_info "Cleaning up temporary files..."
+    print_info "Cleaning up..."
     rm -rf "$TMP_FILE" "$TMP_DIR"
 }
 
@@ -343,35 +284,44 @@ print_success_message() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "Installed components:"
-    echo "  • Server:  $INSTALL_DIR/$SERVER_BINARY"
-    echo "  • Agent:   $INSTALL_DIR/$AGENT_BINARY"
+    echo "  • Server:  $INSTALL_DIR/control-center-server"
+    echo "  • Agent:   $INSTALL_DIR/control-center-agent"
     echo "  • CLI:     control-center (Python)"
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Quick Start Guide"
+    echo "Quick Start"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "1. Start the server:"
-    echo "   control-center-server"
+    echo "   control-center server start"
     echo ""
-    echo "2. Start the agent (in VM/container):"
-    echo "   control-center-agent"
+    echo "2. Start the agent (on VM/container):"
+    echo "   control-center agent start"
     echo ""
     echo "3. Connect with CLI:"
-    echo "   control-center connect --host <server-host> --token <your-token>"
+    echo "   control-center connect --host <server-ip> --token <your-token>"
     echo ""
-    echo "4. Execute commands:"
+    echo "4. Configuration:"
+    echo "   control-center config set-token <token>"
+    echo "   control-center config set-server <host> <port>"
+    echo "   control-center config show"
+    echo ""
+    echo "5. Execute commands:"
+    echo "   # Interactive mode"
     echo "   control-center> 960 540 left"
     echo "   control-center> type Hello World"
     echo ""
+    echo "   # Single command"
+    echo "   control-center execute -c \"960 540 left\" --host X --token Y"
+    echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Documentation & Help"
+    echo "Help & Documentation"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    echo "  • Full docs:    https://github.com/$REPO"
     echo "  • CLI help:     control-center --help"
-    echo "  • Server help:  control-center-server --help"
-    echo "  • Agent help:   control-center-agent --help"
+    echo "  • Version:      control-center version"
+    echo "  • System check: control-center doctor"
+    echo "  • Docs:         https://github.com/$REPO"
     echo ""
     
     if [ "$PATH_UPDATED" = true ]; then
@@ -400,13 +350,12 @@ main() {
     print_header
     
     check_existing_installation
-    detect_os
-    detect_arch
+    detect_platform
     check_dependencies
     get_latest_release
-    download_release
+    download_package
     extract_package
-    install_binaries
+    install_rust_binaries
     install_python_cli
     update_path
     cleanup

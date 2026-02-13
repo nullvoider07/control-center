@@ -1,6 +1,5 @@
 # .github/workflows/release.yml
 # Control Center - Release Workflow
-# Builds Rust binaries (Server/Agent) + Python CLI package
 
 name: Release Control Center
 
@@ -21,43 +20,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # Setup Python
       - uses: actions/setup-python@v4
         with:
           python-version: '3.12'
       
-      # Setup Rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
-      # System Dependencies (protobuf, SSL, pkg-config)
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
 
-      # Build Rust Binaries
       - name: Build Rust Binaries
         run: cargo build --release --workspace
 
-      # Install Python Package
       - name: Build Python Package
         run: |
           pip install build
           python -m build
 
-      # Get Version
       - name: Get Version
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      # Package Release
       - name: Create Package
         run: |
           mkdir -p package/bin
           mkdir -p package/python
           
-          # Copy Rust binaries
+          # Copy BOTH Rust binaries
           cp target/release/control-center-server package/bin/
           cp target/release/control-center-agent package/bin/
           chmod +x package/bin/*
@@ -65,24 +57,53 @@ jobs:
           # Copy Python wheel
           cp dist/*.whl package/python/
           
-          # Create installation script
+          # Create unified installation script
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
-          echo "Installing Control Center v${{ steps.version.outputs.VERSION }}"
+          echo "=========================================="
+          echo "  Control Center v${{ steps.version.outputs.VERSION }}"
+          echo "=========================================="
+          echo ""
           
           # Install Rust binaries
-          echo "Installing Rust binaries..."
-          sudo cp bin/control-center-server /usr/local/bin/
-          sudo cp bin/control-center-agent /usr/local/bin/
-          sudo chmod +x /usr/local/bin/control-center-*
+          echo "[1/2] Installing Rust binaries..."
+          mkdir -p "$HOME/.local/bin"
+          cp bin/control-center-server "$HOME/.local/bin/"
+          cp bin/control-center-agent "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/control-center-"*
+          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
+          echo ""
           
           # Install Python CLI
-          echo "Installing Python CLI..."
-          pip install python/*.whl
+          echo "[2/2] Installing Python CLI..."
+          if command -v pip3 &> /dev/null; then
+              pip3 install --user python/*.whl
+          else
+              python3 -m pip install --user python/*.whl
+          fi
+          echo "  ✓ CLI: control-center"
+          echo ""
           
-          echo "✓ Control Center installed successfully!"
-          echo "Run: control-center --help"
+          # Check PATH
+          if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+              echo "⚠ Add to your PATH:"
+              echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+              echo ""
+              echo "  Add this to your ~/.bashrc or ~/.zshrc"
+          fi
+          
+          echo "=========================================="
+          echo "✓ Installation complete!"
+          echo "=========================================="
+          echo ""
+          echo "Usage:"
+          echo "  control-center server start    # Start server"
+          echo "  control-center agent start     # Start agent"
+          echo "  control-center connect --host X --token Y"
+          echo "  control-center --help"
+          echo ""
           EOF
           chmod +x package/install.sh
           
@@ -113,9 +134,9 @@ jobs:
           targets: aarch64-unknown-linux-gnu
 
       - name: Install Cross
-        run: cargo install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build Rust Binaries (ARM64 with vendored OpenSSL)
+      - name: Build Rust Binaries (ARM64)
         run: cross build --release --target aarch64-unknown-linux-gnu --workspace --features openssl-vendored
 
       - name: Build Python Package
@@ -132,21 +153,56 @@ jobs:
           mkdir -p package/bin
           mkdir -p package/python
           
+          # Copy ARM64 Rust binaries
           cp target/aarch64-unknown-linux-gnu/release/control-center-server package/bin/
           cp target/aarch64-unknown-linux-gnu/release/control-center-agent package/bin/
           chmod +x package/bin/*
           
+          # Copy Python wheel
           cp dist/*.whl package/python/
           
+          # Create installation script (same as x64)
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
-          echo "Installing Control Center v${{ steps.version.outputs.VERSION }} (ARM64)"
-          sudo cp bin/control-center-server /usr/local/bin/
-          sudo cp bin/control-center-agent /usr/local/bin/
-          sudo chmod +x /usr/local/bin/control-center-*
-          pip install python/*.whl
-          echo "✓ Control Center installed successfully!"
+          echo "=========================================="
+          echo "  Control Center v${{ steps.version.outputs.VERSION }} (ARM64)"
+          echo "=========================================="
+          echo ""
+          
+          echo "[1/2] Installing Rust binaries..."
+          mkdir -p "$HOME/.local/bin"
+          cp bin/control-center-server "$HOME/.local/bin/"
+          cp bin/control-center-agent "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/control-center-"*
+          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
+          echo ""
+          
+          echo "[2/2] Installing Python CLI..."
+          if command -v pip3 &> /dev/null; then
+              pip3 install --user python/*.whl
+          else
+              python3 -m pip install --user python/*.whl
+          fi
+          echo "  ✓ CLI: control-center"
+          echo ""
+          
+          if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+              echo "⚠ Add to your PATH:"
+              echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+              echo ""
+          fi
+          
+          echo "=========================================="
+          echo "✓ Installation complete!"
+          echo "=========================================="
+          echo ""
+          echo "Usage:"
+          echo "  control-center server start"
+          echo "  control-center agent start"
+          echo "  control-center connect --host X --token Y"
+          echo ""
           EOF
           chmod +x package/install.sh
           
@@ -162,7 +218,7 @@ jobs:
   # JOB 3: MACOS BUILD (Apple Silicon / ARM64)
   # ============================================================================
   build-macos-arm64:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       
@@ -173,7 +229,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
-      # Protobuf is needed on macOS
       - name: Install Dependencies
         run: brew install protobuf
 
@@ -203,12 +258,39 @@ jobs:
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
-          echo "Installing Control Center v${{ steps.version.outputs.VERSION }} (macOS ARM64)"
-          sudo cp bin/control-center-server /usr/local/bin/
-          sudo cp bin/control-center-agent /usr/local/bin/
-          sudo chmod +x /usr/local/bin/control-center-*
-          pip3 install python/*.whl
-          echo "✓ Control Center installed successfully!"
+          echo "=========================================="
+          echo "  Control Center v${{ steps.version.outputs.VERSION }} (macOS ARM64)"
+          echo "=========================================="
+          echo ""
+          
+          echo "[1/2] Installing Rust binaries..."
+          mkdir -p "$HOME/.local/bin"
+          cp bin/control-center-server "$HOME/.local/bin/"
+          cp bin/control-center-agent "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/control-center-"*
+          
+          # Remove quarantine on macOS
+          xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-server" 2>/dev/null || true
+          xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-agent" 2>/dev/null || true
+          
+          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
+          echo ""
+          
+          echo "[2/2] Installing Python CLI..."
+          pip3 install --user python/*.whl
+          echo "  ✓ CLI: control-center"
+          echo ""
+          
+          if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+              echo "⚠ Add to your PATH:"
+              echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+              echo ""
+          fi
+          
+          echo "=========================================="
+          echo "✓ Installation complete!"
+          echo "=========================================="
           EOF
           chmod +x package/install.sh
           
@@ -224,7 +306,7 @@ jobs:
   # JOB 4: MACOS BUILD (Intel / x64)
   # ============================================================================
   build-macos-x64:
-    runs-on: macos-15-intel
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       
@@ -264,12 +346,32 @@ jobs:
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
-          echo "Installing Control Center v${{ steps.version.outputs.VERSION }} (macOS x64)"
-          sudo cp bin/control-center-server /usr/local/bin/
-          sudo cp bin/control-center-agent /usr/local/bin/
-          sudo chmod +x /usr/local/bin/control-center-*
-          pip3 install python/*.whl
-          echo "✓ Control Center installed successfully!"
+          echo "=========================================="
+          echo "  Control Center v${{ steps.version.outputs.VERSION }} (macOS x64)"
+          echo "=========================================="
+          echo ""
+          
+          echo "[1/2] Installing Rust binaries..."
+          mkdir -p "$HOME/.local/bin"
+          cp bin/control-center-server "$HOME/.local/bin/"
+          cp bin/control-center-agent "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/control-center-"*
+          
+          xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-server" 2>/dev/null || true
+          xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-agent" 2>/dev/null || true
+          
+          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
+          echo ""
+          
+          echo "[2/2] Installing Python CLI..."
+          pip3 install --user python/*.whl
+          echo "  ✓ CLI: control-center"
+          echo ""
+          
+          echo "=========================================="
+          echo "✓ Installation complete!"
+          echo "=========================================="
           EOF
           chmod +x package/install.sh
           
@@ -296,7 +398,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       
-      # Install protobuf for Windows
       - name: Install Protobuf
         run: choco install protoc
 
@@ -319,23 +420,46 @@ jobs:
           New-Item -ItemType Directory -Force -Path package\bin
           New-Item -ItemType Directory -Force -Path package\python
           
+          # Copy BOTH Rust binaries
           Copy-Item target\release\control-center-server.exe package\bin\
           Copy-Item target\release\control-center-agent.exe package\bin\
+          
+          # Copy Python wheel
           Copy-Item dist\*.whl package\python\
           
+          # Create installation script
           @'
           @echo off
-          echo Installing Control Center v${{ steps.version.outputs.VERSION }} (Windows x64)
+          echo ==========================================
+          echo   Control Center v${{ steps.version.outputs.VERSION }} (Windows x64)
+          echo ==========================================
+          echo.
           
-          echo Installing Rust binaries...
-          copy /Y bin\control-center-server.exe %PROGRAMFILES%\control-center\
-          copy /Y bin\control-center-agent.exe %PROGRAMFILES%\control-center\
+          echo [1/2] Installing Rust binaries...
+          if not exist "%LOCALAPPDATA%\Programs\ControlCenter" mkdir "%LOCALAPPDATA%\Programs\ControlCenter"
+          copy /Y bin\control-center-server.exe "%LOCALAPPDATA%\Programs\ControlCenter\"
+          copy /Y bin\control-center-agent.exe "%LOCALAPPDATA%\Programs\ControlCenter\"
+          echo   + Server: %LOCALAPPDATA%\Programs\ControlCenter\control-center-server.exe
+          echo   + Agent:  %LOCALAPPDATA%\Programs\ControlCenter\control-center-agent.exe
+          echo.
           
-          echo Installing Python CLI...
+          echo [2/2] Installing Python CLI...
           pip install python\*.whl
+          echo   + CLI: control-center
+          echo.
           
-          echo ✓ Control Center installed successfully!
-          echo Add %PROGRAMFILES%\control-center to your PATH
+          echo ==========================================
+          echo Installation complete!
+          echo ==========================================
+          echo.
+          echo Add to PATH:
+          echo   %LOCALAPPDATA%\Programs\ControlCenter
+          echo.
+          echo Usage:
+          echo   control-center server start
+          echo   control-center agent start
+          echo   control-center connect --host X --token Y
+          echo.
           pause
           '@ | Out-File -FilePath package\install.bat -Encoding ASCII
           
@@ -375,10 +499,76 @@ jobs:
           files: release-assets/*
           draft: false
           prerelease: false
+          generate_release_notes: true
           body: |
-            Control Center v${{ github.ref_name }}
+            # Control Center ${{ github.ref_name }}
             
-            Multi-platform release for Windows, macOS, and Linux.
+            **Unified package: Rust binaries + Python CLI in one download**
+            
+            ## 📦 What's Included
+            
+            Each platform package contains:
+            - ✅ **control-center-server** (Rust gRPC server)
+            - ✅ **control-center-agent** (Rust OS actuation agent)
+            - ✅ **control-center CLI** (Python orchestrator)
+            - ✅ **install.sh / install.bat** (One-command installer)
+            
+            ## 🚀 Quick Install
+            
+            ### Linux / macOS
+            ```bash
+            # Download and extract
+            tar -xzf control-center-*-linux-x64.tar.gz
+            cd package
+            
+            # Install everything
+            ./install.sh
+            ```
+            
+            ### Windows
+            ```powershell
+            # Extract the ZIP file
+            # Run install.bat
+            ```
+            
+            ## 📖 Usage
+            
+            ```bash
+            # Start server
+            control-center server start
+            
+            # Start agent (on VM/container)
+            control-center agent start
+            
+            # Connect with CLI
+            control-center connect --host <server-ip> --token <token>
+            
+            # Execute single command
+            control-center execute -c "960 540 left" --host <server-ip> --token <token>
+            
+            # Configuration
+            control-center config set-token <token>
+            control-center config set-server <host> <port>
+            control-center config show
+            
+            # Info
+            control-center version
+            control-center doctor
+            control-center --help
+            ```
+            
+            ## ✨ Features
+            
+            - ✅ Multi-OS support (Windows, macOS, Linux)
+            - ✅ OAuth 2.0 + JWT authentication
+            - ✅ Mouse position tracking
+            - ✅ Interactive REPL mode
+            - ✅ Single command execution
+            - ✅ Configuration management
+            
+            ## 📚 Documentation
+            
+            Full documentation: https://github.com/${{ github.repository }}
             
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

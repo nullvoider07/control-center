@@ -5,6 +5,7 @@ import sys
 import os
 import uuid
 import signal
+import shutil
 import subprocess
 from typing import Optional, Union
 from pathlib import Path
@@ -681,42 +682,186 @@ def config_init():
 def version():
     """Show version information"""
     click.echo(f"Control Center v{__version__}")
-    click.echo("Multi-OS actuation tool")
+    click.echo("")
+    click.echo("Components:")
+    
+    # Check for server binary
+    server_bin = _find_binary('control-center-server')
+    if server_bin:
+        click.echo(f"  Server: {server_bin}")
+    else:
+        click.echo("  Server: Not found")
+    
+    # Check for agent binary
+    agent_bin = _find_binary('control-center-agent')
+    if agent_bin:
+        click.echo(f"  Agent:  {agent_bin}")
+    else:
+        click.echo("  Agent:  Not found")
+    
+    click.echo(f"  CLI:    Python v{__version__}")
 
 # Diagnostics command
 @cli.command()
 def doctor():
-    """Run diagnostics and check system health"""
-    click.echo("=== Control Center Diagnostics ===\n")
+    """Check system configuration and dependencies"""
+    click.echo("=== Control Center System Check ===\n")
     
-    # Python version
-    click.echo(f"Python: {sys.version.split()[0]}")
+    # Check Python version
+    import sys
+    click.echo(f"Python: {sys.version.split()[0]} ✓")
     
-    # Dependencies
-    deps = ['grpcio', 'click', 'protobuf', 'psutil']
-    click.echo("\nDependencies:")
-    for pkg in deps:
-        try:
-            __import__(pkg)
-            click.echo(f"  ✓ {pkg}")
-        except ImportError:
-            click.echo(f"  ✗ {pkg} - NOT INSTALLED", err=True)
-    
-    # Configuration
-    click.echo("\nConfiguration:")
-    if ConfigManager.config_exists():
-        click.echo(f"  ✓ Config file exists: {ConfigManager.get_config_location()}")
-        is_valid, errors = ctx.config_manager.validate()
-        if is_valid:
-            click.echo("  ✓ Configuration is valid")
-        else:
-            click.echo("  ✗ Configuration has errors:")
-            for error in errors:
-                click.echo(f"    - {error}")
+    # Check for server binary
+    server_bin = _find_binary('control-center-server')
+    if server_bin:
+        click.echo(f"Server binary: {server_bin} ✓")
     else:
-        click.echo(f"  ! No config file (run: control-center config init)")
+        click.echo("Server binary: Not found ✗")
     
-    click.echo("\n✓ Diagnostics complete")
+    # Check for agent binary
+    agent_bin = _find_binary('control-center-agent')
+    if agent_bin:
+        click.echo(f"Agent binary: {agent_bin} ✓")
+    else:
+        click.echo("Agent binary: Not found ✗")
+    
+    # Check config file
+    if ctx.config_manager.CONFIG_FILE.exists():
+        click.echo(f"Config file: {ctx.config_manager.CONFIG_FILE} ✓")
+    else:
+        click.echo(f"Config file: Not found (run 'control-center config init')")
+    
+    # Check gRPC
+    try:
+        import grpc
+        click.echo("gRPC: Installed ✓")
+    except ImportError:
+        click.echo("gRPC: Not installed ✗")
+    
+    click.echo("\n=== System Check Complete ===")
+
+# Helper Functions - Binary Discovery
+def _find_binary(binary_name: str) -> Optional[str]:
+    """Find binary in common locations (following the-eye pattern)"""
+    possible_locations = [
+        # Current directory
+        f"./{binary_name}",
+        f"./bin/{binary_name}",
+        
+        # Build output
+        f"./target/release/{binary_name}",
+        
+        # User local
+        str(Path.home() / ".local" / "bin" / binary_name),
+        
+        # System
+        f"/usr/local/bin/{binary_name}",
+        
+        # In PATH
+        binary_name,
+    ]
+    
+    for location in possible_locations:
+        if os.path.exists(location):
+            return location
+    
+    # Try to find in PATH
+    path_binary = shutil.which(binary_name)
+    if path_binary:
+        return path_binary
+    
+    return None
+
+# Server commands - Calls Rust Binary
+@cli.group()
+def server():
+    """Manage Control Center server (Rust binary)"""
+    pass
+
+@server.command(name='start')
+@click.option('--host', default='0.0.0.0', help='Server host')
+@click.option('--port', default=50051, help='gRPC port')
+@click.option('--auth-url', help='OAuth2 authorization URL')
+@click.option('--token-url', help='OAuth2 token URL')
+@click.option('--client-id', help='OAuth2 client ID')
+def server_start(host, port, auth_url, token_url, client_id):
+    """Start the Rust gRPC server"""
+    click.echo(f"[START] Starting Control Center Server (Rust) on {host}:{port}")
+    
+    # Build environment variables
+    env = os.environ.copy()
+    env['GRPC_HOST'] = host
+    env['GRPC_PORT'] = str(port)
+    
+    if auth_url:
+        env['OAUTH_AUTH_URL'] = auth_url
+    if token_url:
+        env['OAUTH_TOKEN_URL'] = token_url
+    if client_id:
+        env['OAUTH_CLIENT_ID'] = client_id
+    
+    # Find server binary
+    server_bin = _find_binary('control-center-server')
+    
+    if not server_bin:
+        click.echo("[ERROR] 'control-center-server' binary not found!", err=True)
+        click.echo("", err=True)
+        click.echo("The server binary should be installed alongside this CLI.", err=True)
+        click.echo("Please reinstall Control Center or build from source:", err=True)
+        click.echo("  cargo build --release -p control-center-server", err=True)
+        sys.exit(1)
+    
+    try:
+        click.echo(f"[INFO] Starting server: {server_bin}")
+        subprocess.run([server_bin], env=env, check=True)
+    except KeyboardInterrupt:
+        click.echo("\n[INFO] Server stopped")
+    except Exception as e:
+        click.echo(f"[ERROR] Failed to start server: {e}", err=True)
+        sys.exit(1)
+
+# Agent commands - Calls Rust Binary (the-eye pattern)
+@cli.group()
+def agent():
+    """Manage Control Center agent (Rust binary)"""
+    pass
+
+@agent.command(name='start')
+@click.option('--server-host', default='127.0.0.1', help='Server host to connect to')
+@click.option('--server-port', default=50051, help='Server gRPC port')
+@click.option('--token', envvar='CONTROL_CENTER_TOKEN', help='Authentication token')
+def agent_start(server_host, server_port, token):
+    """Start the Rust agent on this machine"""
+    click.echo(f"[START] Starting Control Center Agent (Rust)")
+    click.echo(f"   Connecting to: {server_host}:{server_port}")
+    
+    # Build environment variables
+    env = os.environ.copy()
+    env['AGENT_SERVER_HOST'] = server_host
+    env['AGENT_SERVER_PORT'] = str(server_port)
+    
+    if token:
+        env['CONTROL_CENTER_TOKEN'] = token
+    
+    # Find agent binary
+    agent_bin = _find_binary('control-center-agent')
+    
+    if not agent_bin:
+        click.echo("[ERROR] 'control-center-agent' binary not found!", err=True)
+        click.echo("", err=True)
+        click.echo("The agent binary should be installed alongside this CLI.", err=True)
+        click.echo("Please reinstall Control Center or build from source:", err=True)
+        click.echo("  cargo build --release -p control-center-agent", err=True)
+        sys.exit(1)
+    
+    try:
+        click.echo(f"[INFO] Starting agent: {agent_bin}")
+        subprocess.run([agent_bin], env=env, check=True)
+    except KeyboardInterrupt:
+        click.echo("\n[INFO] Agent stopped")
+    except Exception as e:
+        click.echo(f"[ERROR] Failed to start agent: {e}", err=True)
+        sys.exit(1)
 
 # Main entry point
 def main():
