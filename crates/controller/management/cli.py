@@ -10,17 +10,17 @@ import subprocess
 from typing import Optional, Union
 from pathlib import Path
 
-from .config_manager import ConfigManager, ConfigurationError
-from ..integrations.gRPC import GRPCClient, AuthenticationError, ConnectionError, RateLimitError
-from ..integrations.exceptions import VMShutdownError
-from ..integrations.status import StatusReporter
-from ..core.session import Session
-from ..core.metrics import MetricsCollector
-from ..os_specific.windows_actuation import WindowsActuation
-from ..os_specific.macos_actuation import MacOSActuation
-from ..os_specific.linux_actuation import LinuxActuation
-from ..utils.logger import setup_logger
-from ..utils.validation import require_valid_host, require_valid_port, ValidationError
+from controller.management.config_manager import ConfigManager, ConfigurationError
+from controller.integrations.gRPC import GRPCClient, AuthenticationError, ConnectionError, RateLimitError
+from controller.integrations.exceptions import VMShutdownError
+from controller.integrations.status import StatusReporter
+from controller.core.session import Session
+from controller.core.metrics import MetricsCollector
+from controller.os_specific.windows_actuation import WindowsActuation
+from controller.os_specific.macos_actuation import MacOSActuation
+from controller.os_specific.linux_actuation import LinuxActuation
+from controller.utils.logger import setup_logger
+from controller.utils.validation import require_valid_host, require_valid_port, ValidationError
 
 __version__ = "1.0.0"
 
@@ -589,6 +589,10 @@ def config_show():
             click.echo(f"{key}: {value}")
         
         click.echo()
+    
+    except ConfigurationError as e:
+        click.echo(f"Configuration error: {e}", err=True)
+        sys.exit(1)
         
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
@@ -602,6 +606,9 @@ def config_set_token(token: str):
     try:
         ctx.config_manager.set_token(token)
         click.echo("✓ API token saved to config")
+    except ConfigurationError as e:
+        click.echo(f"Configuration error: {e}", err=True)
+        sys.exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -617,6 +624,9 @@ def config_set_server(host: str, port: int):
         require_valid_port(port)
         ctx.config_manager.set_server(host, port)
         click.echo(f"✓ Default server set to {host}:{port}")
+    except ConfigurationError as e:
+        click.echo(f"Configuration error: {e}", err=True)
+        sys.exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -628,6 +638,9 @@ def config_clear_token():
     try:
         ctx.config_manager.clear_token()
         click.echo("✓ API token cleared from config")
+    except ConfigurationError as e:
+        click.echo(f"Configuration error: {e}", err=True)
+        sys.exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -647,6 +660,10 @@ def config_validate():
                 click.echo(f"  - {error}", err=True)
             sys.exit(1)
             
+    except ConfigurationError as e:
+        click.echo(f"Configuration error: {e}", err=True)
+        sys.exit(1)
+
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -668,8 +685,11 @@ def config_reset():
 def config_init():
     """Create default configuration file"""
     try:
-        from .config_manager import create_default_config
+        from controller.management.config_manager import create_default_config
         create_default_config()
+    except ConfigurationError as e:
+        click.echo(f"Configuration error: {e}", err=True)
+        sys.exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)

@@ -12,6 +12,7 @@ REPO="nullvoider07/control-center"
 INSTALL_DIR="$HOME/.local/bin"
 SERVER_BINARY="control-center-server"
 AGENT_BINARY="control-center-agent"
+CLI_BINARY="control-center"
 
 # Colors
 RED='\033[0;31m'
@@ -176,8 +177,8 @@ extract_package() {
         exit 1
     fi
 
-    if [ ! -f "$TMP_DIR/bin/control-center" ]; then
-        print_error "CLI binary not found in package"
+    if [ ! -f "$TMP_DIR/bin/$CLI_BINARY" ]; then
+    print_error "$CLI_BINARY not found in package"
         ls -la "$TMP_DIR/bin" 2>/dev/null
         exit 1
     fi
@@ -202,8 +203,8 @@ install_rust_binaries() {
 
     # macOS: Remove quarantine
     if [[ "$OS_TYPE" == "macos" ]]; then
-        xattr -d com.apple.quarantine "$INSTALL_DIR/control-center-server" 2>/dev/null || true
-        xattr -d com.apple.quarantine "$INSTALL_DIR/control-center-agent" 2>/dev/null || true
+        xattr -d com.apple.quarantine "$INSTALL_DIR/$SERVER_BINARY" 2>/dev/null || true
+        xattr -d com.apple.quarantine "$INSTALL_DIR/$AGENT_BINARY" 2>/dev/null || true
     fi
 
     print_success "Rust binaries installed"
@@ -215,8 +216,12 @@ install_cli_binary() {
     print_info "Installing CLI binary..."
     
     # Copy the PyInstaller-built binary
-    cp "$TMP_DIR/bin/control-center" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/control-center"
+    cp "$TMP_DIR/bin/$CLI_BINARY" "$INSTALL_DIR/"
+    chmod +x "$INSTALL_DIR/$CLI_BINARY"
+    
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        xattr -d com.apple.quarantine "$INSTALL_DIR/$CLI_BINARY" 2>/dev/null || true
+    fi
     
     print_success "CLI binary installed"
 }
@@ -263,9 +268,9 @@ print_success_message() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "Installed components:"
-    echo "  • Server:  $INSTALL_DIR/control-center-server"
-    echo "  • Agent:   $INSTALL_DIR/control-center-agent"
-    echo "  • CLI:     $INSTALL_DIR/control-center"
+    echo "  • Server:  $INSTALL_DIR/$SERVER_BINARY"
+    echo "  • Agent:   $INSTALL_DIR/$AGENT_BINARY"
+    echo "  • CLI:     $INSTALL_DIR/$CLI_BINARY"
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Quick Start"

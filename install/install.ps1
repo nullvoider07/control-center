@@ -8,6 +8,9 @@ $ErrorActionPreference = "Stop"
 # ============================================================================
 $REPO = "nullvoider07/control-center"
 $INSTALL_DIR = "$env:LOCALAPPDATA\Programs\ControlCenter"
+$SERVER_BINARY = "control-center-server.exe"
+$AGENT_BINARY = "control-center-agent.exe"
+$CLI_BINARY = "control-center.exe"
 
 # ============================================================================
 # Helper Functions
@@ -80,6 +83,24 @@ function Get-Architecture {
 # ============================================================================
 function Test-Dependencies {
     Write-Info "Checking dependencies..."
+    
+    $missing = @()
+    
+    $requiredCmdlets = @('Expand-Archive', 'Invoke-RestMethod', 'Invoke-WebRequest')
+    
+    foreach ($cmdlet in $requiredCmdlets) {
+        if (-not (Get-Command $cmdlet -ErrorAction SilentlyContinue)) {
+            $missing += $cmdlet
+        }
+    }
+    
+    if ($missing.Count -gt 0) {
+        Write-ErrorMsg "Missing PowerShell cmdlets: $($missing -join ', ')"
+        Write-Host ""
+        Write-Host "Please ensure you're running PowerShell 5.1 or later"
+        exit 1
+    }
+    
     Write-Success "All dependencies found"
 }
 
@@ -148,19 +169,19 @@ function Expand-Package {
         Expand-Archive -Path $ZipFile -DestinationPath $TMP_DIR -Force
         
         # Verify contents
-        if (-not (Test-Path "$TMP_DIR\bin\control-center-server.exe")) {
-            Write-ErrorMsg "Server binary not found in package"
+        if (-not (Test-Path "$TMP_DIR\bin\$SERVER_BINARY")) {
+            Write-ErrorMsg "$SERVER_BINARY not found in package"
             Get-ChildItem "$TMP_DIR\bin" -ErrorAction SilentlyContinue
             exit 1
         }
         
-        if (-not (Test-Path "$TMP_DIR\bin\control-center-agent.exe")) {
-            Write-ErrorMsg "Agent binary not found in package"
+        if (-not (Test-Path "$TMP_DIR\bin\$AGENT_BINARY")) {
+            Write-ErrorMsg "$AGENT_BINARY not found in package"
             exit 1
         }
         
-        if (-not (Test-Path "$TMP_DIR\bin\control-center.exe")) {
-            Write-ErrorMsg "CLI binary not found in package"
+        if (-not (Test-Path "$TMP_DIR\bin\$CLI_BINARY")) {
+            Write-ErrorMsg "$CLI_BINARY not found in package"
             Get-ChildItem "$TMP_DIR\bin" -ErrorAction SilentlyContinue
             exit 1
         }
@@ -189,12 +210,12 @@ function Install-RustBinaries {
     }
     
     # Copy binaries
-    Copy-Item "$SourceDir\bin\control-center-server.exe" $INSTALL_DIR -Force
-    Copy-Item "$SourceDir\bin\control-center-agent.exe" $INSTALL_DIR -Force
+    Copy-Item "$SourceDir\bin\$SERVER_BINARY" $INSTALL_DIR -Force
+    Copy-Item "$SourceDir\bin\$AGENT_BINARY" $INSTALL_DIR -Force
     
     Write-Success "Rust binaries installed"
-    Write-Host "  • Server: $INSTALL_DIR\control-center-server.exe"
-    Write-Host "  • Agent:  $INSTALL_DIR\control-center-agent.exe"
+    Copy-Item "$SourceDir\bin\$SERVER_BINARY" $INSTALL_DIR -Force
+    Copy-Item "$SourceDir\bin\$AGENT_BINARY" $INSTALL_DIR -Force
 }
 
 function Install-CLIBinary {
@@ -203,10 +224,10 @@ function Install-CLIBinary {
     Write-Info "Installing CLI binary..."
     
     # Copy PyInstaller-built binary
-    Copy-Item "$SourceDir\bin\control-center.exe" $INSTALL_DIR -Force
+    Copy-Item "$SourceDir\bin\$CLI_BINARY" $INSTALL_DIR -Force
     
     Write-Success "CLI binary installed"
-    Write-Host "  • CLI: $INSTALL_DIR\control-center.exe"
+    Write-Host "  • CLI: $INSTALL_DIR\$CLI_BINARY"
 }
 
 # ============================================================================
@@ -258,9 +279,9 @@ function Write-SuccessMessage {
     Write-Host "==========================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "Installed components:"
-    Write-Host "  • Server:  $INSTALL_DIR\control-center-server.exe"
-    Write-Host "  • Agent:   $INSTALL_DIR\control-center-agent.exe"
-    Write-Host "  • CLI:     $INSTALL_DIR\control-center.exe"
+    Write-Host "  • Server:  $INSTALL_DIR\$SERVER_BINARY"
+    Write-Host "  • Agent:   $INSTALL_DIR\$AGENT_BINARY"
+    Write-Host "  • CLI:     $INSTALL_DIR\$CLI_BINARY"
     Write-Host ""
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host "  Quick Start" -ForegroundColor Cyan
