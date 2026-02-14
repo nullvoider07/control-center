@@ -119,20 +119,20 @@ class ConfigManager:
             Token string or None
         """
         # 1. CLI flag (highest priority)
-        if cli_token:
+        if cli_token and cli_token.strip():
             logger.debug("Using token from CLI flag")
-            return cli_token
+            return cli_token.strip()
         
         # 2. Environment variable
-        env_token = os.getenv(env_var)
+        env_token = os.getenv(env_var, '').strip()
         if env_token:
             logger.debug(f"Using token from {env_var} environment variable")
             return env_token
         
         # 3. Config file
         config = self.load()
-        file_token = config.get('api_token')
-        if file_token:
+        file_token = config.get('api_token', '').strip()
+        if file_token and file_token != 'your-api-token-here':
             logger.debug("Using token from config file")
             return file_token
         
@@ -212,7 +212,15 @@ class ConfigManager:
         config = self.load()
         
         # Check for token
-        if not config.get('api_token') and not os.getenv('CONTROL_CENTER_TOKEN'):
+        token = config.get('api_token', '').strip()
+        env_token = os.getenv('CONTROL_CENTER_TOKEN', '').strip()
+        if not token or token == 'your-api-token-here':
+            token = None
+
+        if not env_token:
+            env_token = None
+
+        if not token and not env_token:
             errors.append(
                 "No API token configured. Set via:\n"
                 "  1. --token flag\n"
