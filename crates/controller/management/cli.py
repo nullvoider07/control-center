@@ -1083,7 +1083,7 @@ def uninstall(purge, yes):
     
     click.echo("")
     click.echo("Thank you for using Control Center!")
-    click.echo("We'd appreciate your feedback: https://github.com/your-username/control-center/issues")
+    click.echo("I'd appreciate your feedback: https://github.com/nullvoider07/control-center/issues")
 
 # Config Commands
 @cli.group()
