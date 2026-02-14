@@ -83,17 +83,12 @@ class ConfigManager:
     def save(self, config: Dict[str, Any]):
         """Save configuration to file"""
         try:
-            # Merge with existing config
-            existing = self.load()
-            existing.update(config)
-            
             with open(self.CONFIG_FILE, 'w') as f:
-                json.dump(existing, f, indent=2)
+                json.dump(config, f, indent=2)
             
-            # Set restrictive permissions (owner only)
             if os.name != 'nt':
                 os.chmod(self.CONFIG_FILE, 0o600)
-            
+
             logger.info(f"Saved config to {self.CONFIG_FILE}")
             
         except Exception as e:
