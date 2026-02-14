@@ -6,6 +6,7 @@ import os
 import uuid
 import signal
 import shutil
+import platform
 import subprocess
 from typing import Optional, Union
 from pathlib import Path
@@ -85,7 +86,7 @@ def cli(debug):
 @cli.command()
 @click.option('--host', help='Server host IP/hostname')
 @click.option('--port', type=int, help='Server gRPC port (default: 50051)')
-@click.option('--token', envvar='CONTROL_CENTER_TOKEN', help='API token (or set CONTROL_CENTER_TOKEN)')
+@click.option('--token', envvar='CONTROL_CENTER_TOKEN', help='API token')
 @click.option('--ssl', is_flag=True, help='Use SSL/TLS connection')
 def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl: bool):
     """Connect to server with PERSISTENT connection and enter interactive mode
@@ -130,17 +131,42 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
         require_valid_port(server_config['port'])
         
         logger.info(f"Connecting to {server_config['host']}:{server_config['port']}...")
+
+        connection_timeout = min(server_config['timeout'], 5)
         
         # Create gRPC client with token
         ctx.client = GRPCClient(
             host=server_config['host'],
             port=server_config['port'],
-            timeout=server_config['timeout'],
+            timeout=connection_timeout,
             use_ssl=server_config['use_ssl']
         )
         
         # Set token for authentication
         ctx.client.set_token(api_token)
+
+        import signal
+
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Connection timed out")
+        
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(connection_timeout)
+
+        try:
+            if not ctx.client.connect():
+                logger.error("Connection failed")
+                sys.exit(1)
+        except TimeoutError:
+            click.echo(f"\nError: Connection timed out after {connection_timeout}s", err=True)
+            click.echo("\nTroubleshooting:", err=True)
+            click.echo("  1. Check if server is running: control-center server start", err=True)
+            click.echo(f"  2. Verify host/port: {server_config['host']}:{server_config['port']}", err=True)
+            click.echo("  3. Check network connectivity", err=True)
+            sys.exit(1)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
         
         # Connect and get agent info
         try:
@@ -414,7 +440,7 @@ def execute(host: Optional[str], port: Optional[int], token: Optional[str], comm
         ctx.client = GRPCClient(
             host=server_config['host'],
             port=server_config['port'],
-            timeout=server_config['timeout'],
+            timeout=5,
             use_ssl=server_config['use_ssl']
         )
         ctx.client.set_token(api_token)
@@ -481,93 +507,583 @@ def execute(host: Optional[str], port: Optional[int], token: Optional[str], comm
 # Update and Uninstall Commands
 # ============================================================================
 @cli.command()
-def update():
-    """Update Control Center to latest version
+@click.option('--check-only', is_flag=True, help='Only check for updates without installing')
+def update(check_only):
+    """Check for updates and install the latest version
     
-    Pulls latest changes from git and reinstalls the package.
+    Options:
+        --check-only: Only check for updates without installing
+    
+    Examples:
+        control-center update              # Check and install updates
+        control-center update --check-only # Just check for updates
     """
+    
+    import platform
+    import tempfile
+    import stat
+    import json
+    
+    click.echo("Checking for updates...")
+    click.echo(f"Current version: v{__version__}")
+    
+    # GitHub repository info - defined here to be accessible in except blocks
+    GITHUB_REPO = "nullvoider07/control-center"  # TODO: Update this!
+    API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    
     try:
-        click.echo("Updating Control Center...")
-        
-        # Get the package root directory
-        pkg_dir = Path(__file__).parent.parent.parent
-        
-        # Pull latest changes
-        click.echo("\n1. Pulling latest changes from git...")
-        result = subprocess.run(
-            ['git', 'pull', 'origin', 'main'],
-            cwd=pkg_dir,
-            capture_output=True,
-            text=True
-        )
-        
-        if result.returncode != 0:
-            click.echo(f"Git pull failed: {result.stderr}", err=True)
+        # Get latest release info
+        try:
+            # Try using requests if available (better), fallback to urllib
+            try:
+                import requests
+                response = requests.get(API_URL, timeout=10)
+                response.raise_for_status()
+                release_data = response.json()
+            except ImportError:
+                import urllib.request
+                with urllib.request.urlopen(API_URL) as response:
+                    release_data = json.loads(response.read().decode())
+        except Exception as e:
+            click.echo(click.style(f"[ERROR] Failed to check for updates: {e}", fg='red'), err=True)
+            click.echo("Please check your internet connection and try again.", err=True)
+            click.echo(f"You can manually check: https://github.com/{GITHUB_REPO}/releases")
             sys.exit(1)
         
-        click.echo(result.stdout)
+        # Parse version info
+        latest_tag = release_data['tag_name']
+        latest_version = latest_tag.lstrip('v')
         
-        # Reinstall package
-        click.echo("\n2. Reinstalling package...")
-        result = subprocess.run(
-            [sys.executable, '-m', 'pip', 'install', '-e', '.', '--upgrade'],
-            cwd=pkg_dir,
-            capture_output=True,
-            text=True
-        )
+        click.echo(f"Latest version: v{latest_version}")
         
-        if result.returncode != 0:
-            click.echo(f"Installation failed: {result.stderr}", err=True)
+        # Compare versions
+        current_version = __version__
+        if latest_version == current_version:
+            click.echo(click.style("✓ You already have the latest version!", fg='green'))
+            return
+        
+        click.echo(click.style(f"→ New version available: v{latest_version}", fg='yellow'))
+        
+        if check_only:
+            click.echo("\nTo install the update, run:")
+            click.echo("  control-center update")
+            return
+        
+        # Confirm update
+        if not click.confirm('\nDo you want to update now?'):
+            click.echo("Update cancelled.")
+            return
+        
+        # Detect platform and architecture
+        os_type = platform.system().lower()
+        machine = platform.machine().lower()
+        
+        # Map platform names
+        if os_type == 'darwin':
+            os_name = 'macos'
+        elif os_type == 'linux':
+            os_name = 'linux'
+        elif os_type == 'windows':
+            os_name = 'windows'
+        else:
+            click.echo(click.style(f"[ERROR] Unsupported OS: {os_type}", fg='red'), err=True)
+            click.echo("Supported platforms: Linux, macOS, Windows")
             sys.exit(1)
         
-        click.echo(result.stdout)
-        click.echo("\n✓ Update complete!")
+        # Map architecture
+        if machine in ['x86_64', 'amd64']:
+            arch = 'x64'
+        elif machine in ['arm64', 'aarch64']:
+            arch = 'arm64'
+        elif machine in ['i386', 'i686']:
+            arch = 'x86'
+        else:
+            click.echo(click.style(f"[ERROR] Unsupported architecture: {machine}", fg='red'), err=True)
+            click.echo(f"Supported architectures: x64, arm64, x86")
+            sys.exit(1)
         
+        # Construct download filename
+        platform_suffix = f"{os_name}-{arch}"
+        
+        # Find the download URL
+        download_url = None
+        asset_name = None
+        for asset in release_data['assets']:
+            if platform_suffix in asset['name']:
+                download_url = asset['browser_download_url']
+                asset_name = asset['name']
+                break
+        
+        if not download_url or not asset_name:
+            click.echo(click.style(f"[ERROR] No release found for {os_name} {arch}", fg='red'), err=True)
+            click.echo(f"Available assets:")
+            for asset in release_data['assets']:
+                click.echo(f"  - {asset['name']}")
+            sys.exit(1)
+        
+        click.echo(f"\nDownloading {asset_name}...")
+        
+        # Create temp directory
+        temp_dir = tempfile.mkdtemp()
+        temp_file = os.path.join(temp_dir, asset_name)
+        
+        try:
+            # Download the release
+            try:
+                import requests
+                download_response = requests.get(download_url, stream=True, timeout=30)
+                download_response.raise_for_status()
+                
+                # Save with progress
+                with open(temp_file, 'wb') as f:
+                    for chunk in download_response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            except ImportError:
+                import urllib.request
+                urllib.request.urlretrieve(download_url, temp_file)
+            
+            click.echo(click.style("✓ Download complete", fg='green'))
+            
+            # Extract archive
+            click.echo("Extracting archive...")
+            
+            if os_name == 'windows':
+                import zipfile
+                with zipfile.ZipFile(temp_file, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+            else:
+                import tarfile
+                with tarfile.open(temp_file, 'r:gz') as tar:
+                    tar.extractall(temp_dir)
+            
+            # Determine installation directory
+            if os_name == 'windows':
+                install_dir = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'ControlCenter' / 'bin'
+            else:
+                # Check where current binary is installed
+                current_binary_path = shutil.which('control-center')
+                if current_binary_path:
+                    install_dir = Path(current_binary_path).parent
+                else:
+                    install_dir = Path.home() / '.local' / 'bin'
+            
+            # Find the extracted binaries
+            # Try multiple possible locations
+            possible_bin_dirs = [
+                Path(temp_dir) / 'bin',
+                Path(temp_dir) / 'package' / 'bin',
+                Path(temp_dir),
+            ]
+            
+            extracted_bin_dir = None
+            for bin_dir in possible_bin_dirs:
+                if bin_dir.exists():
+                    extracted_bin_dir = bin_dir
+                    break
+            
+            if not extracted_bin_dir:
+                click.echo(click.style("[ERROR] Binary directory not found in archive", fg='red'), err=True)
+                click.echo("Archive contents:")
+                for item in Path(temp_dir).rglob('*'):
+                    click.echo(f"  {item.relative_to(temp_dir)}")
+                shutil.rmtree(temp_dir)
+                sys.exit(1)
+            
+            # Install binaries
+            click.echo(f"Installing to {install_dir}...")
+            install_dir.mkdir(parents=True, exist_ok=True)
+            
+            if os_name == 'windows':
+                binaries = ['control-center.exe', 'control-center-server.exe', 'control-center-agent.exe']
+            else:
+                binaries = ['control-center', 'control-center-server', 'control-center-agent']
+            
+            installed_count = 0
+            for binary in binaries:
+                src = extracted_bin_dir / binary
+                dst = install_dir / binary
+                
+                if src.exists():
+                    # Handle Windows file-in-use issues
+                    if os_name == 'windows' and dst.exists():
+                        try:
+                            # Rename old binary
+                            old_binary = install_dir / f"{binary}.old"
+                            if old_binary.exists():
+                                try:
+                                    old_binary.unlink()
+                                except:
+                                    pass
+                            dst.rename(old_binary)
+                        except Exception as e:
+                            click.echo(click.style(f"[WARNING] Could not replace {binary}: {e}", fg='yellow'), err=True)
+                            click.echo("The binary might be in use. Please close all Control Center processes and try again.", err=True)
+                            continue
+                    
+                    # Copy new binary
+                    shutil.copy2(src, dst)
+                    
+                    # Make executable on Unix-like systems
+                    if os_name != 'windows':
+                        os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                    
+                    click.echo(click.style(f"  ✓ Updated {binary}", fg='green'))
+                    installed_count += 1
+                else:
+                    click.echo(click.style(f"  - {binary} not found in archive (optional)", fg='yellow'))
+            
+            # Clean up
+            shutil.rmtree(temp_dir)
+            
+            # Remove old binaries on Windows
+            if os_name == 'windows':
+                for binary in binaries:
+                    old_binary = install_dir / f"{binary}.old"
+                    if old_binary.exists():
+                        try:
+                            old_binary.unlink()
+                        except:
+                            pass
+            
+            if installed_count == 0:
+                click.echo(click.style("\n[ERROR] No binaries were installed", fg='red'), err=True)
+                sys.exit(1)
+            
+            click.echo("\n" + "="*60)
+            click.echo(click.style(f"✓ Successfully updated to v{latest_version}!", fg='green', bold=True))
+            click.echo("="*60)
+            click.echo("\nRestart any running Control Center processes to use the new version.")
+            click.echo("Run 'control-center version' to verify the update.")
+            
+        except Exception as e:
+            # Clean up on error
+            if Path(temp_dir).exists():
+                shutil.rmtree(temp_dir)
+            raise
+    
     except Exception as e:
         logger.error(f"Update failed: {e}")
-        click.echo(f"Error: {e}", err=True)
+        click.echo(click.style(f"\n[ERROR] Update failed: {e}", fg='red'), err=True)
+        click.echo("\nIf the problem persists, you can:")
+        click.echo(f"1. Manually download from: https://github.com/{GITHUB_REPO}/releases/latest")
+        click.echo("2. Report the issue: https://github.com/{GITHUB_REPO}/issues")
         sys.exit(1)
-
 
 # Uninstall command with confirmation
 @cli.command()
-@click.confirmation_option(prompt='Are you sure you want to uninstall Control Center?')
-def uninstall():
-    """Uninstall Control Center
+@click.option('--purge', is_flag=True, help='Also remove configuration files and data')
+@click.option('--yes', '-y', is_flag=True, help='Skip confirmation prompts')
+def uninstall(purge, yes):
+    """Uninstall Control Center from your system
     
-    Removes the package and cleans up configuration files.
+    Options:
+        --purge: Also remove configuration files and logs
+        --yes, -y: Skip confirmation prompts
+    
+    Examples:
+        control-center uninstall           # Remove binaries only
+        control-center uninstall --purge   # Remove everything
+        control-center uninstall -y        # Skip confirmation
     """
-    try:
-        click.echo("Uninstalling Control Center...")
-        
-        # Remove config directory
+    
+    click.echo("="*60)
+    click.echo("Control Center - Uninstall")
+    click.echo("="*60)
+    click.echo("")
+    
+    # Detect OS
+    os_type = platform.system().lower()
+    
+    # Track what will be removed
+    paths_to_remove = []
+    config_paths = []
+    
+    # 1. Find installed binaries
+    click.echo("Scanning for installed components...")
+    
+    if os_type == 'windows':
+        binary_locations = [
+            Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'ControlCenter' / 'bin',
+            Path.home() / '.local' / 'bin',
+        ]
+        binary_names = ['control-center.exe', 'control-center-server.exe', 'control-center-agent.exe']
+    else:
+        binary_locations = [
+            Path('/usr/local/bin'),
+            Path.home() / '.local' / 'bin',
+        ]
+        binary_names = ['control-center', 'control-center-server', 'control-center-agent']
+    
+    # Find installed binaries
+    found_binaries = []
+    for location in binary_locations:
+        if location.exists():
+            for binary in binary_names:
+                binary_path = location / binary
+                if binary_path.exists():
+                    found_binaries.append(binary_path)
+                    paths_to_remove.append(binary_path)
+                
+                # Also check for .old versions
+                old_binary = location / f"{binary}.old"
+                if old_binary.exists():
+                    paths_to_remove.append(old_binary)
+    
+    # 2. Configuration files (only if --purge)
+    if purge:
         config_dir = ConfigManager.CONFIG_DIR
         if config_dir.exists():
-            click.echo(f"\n1. Removing configuration directory: {config_dir}")
-            import shutil
-            shutil.rmtree(config_dir)
-            click.echo("✓ Configuration removed")
+            config_paths.append(config_dir)
         
-        # Uninstall package
-        click.echo("\n2. Uninstalling package...")
-        result = subprocess.run(
-            [sys.executable, '-m', 'pip', 'uninstall', 'control-center', '-y'],
-            capture_output=True,
-            text=True
-        )
+        # Also check for logs
+        log_locations = [
+            Path.home() / '.local' / 'share' / 'control-center' / 'logs',
+            Path.home() / '.control-center' / 'logs',
+            Path('/var/log/control-center') if os_type != 'windows' else None,
+        ]
         
-        if result.returncode != 0:
-            click.echo(f"Uninstall failed: {result.stderr}", err=True)
-            sys.exit(1)
-        
-        click.echo(result.stdout)
-        click.echo("\n✓ Uninstall complete!")
-        click.echo("Goodbye! 👋")
-        
-    except Exception as e:
-        logger.error(f"Uninstall failed: {e}")
-        click.echo(f"Error: {e}", err=True)
+        for log_dir in [l for l in log_locations if l]:
+            if log_dir and log_dir.exists():
+                config_paths.append(log_dir)
+    
+    # Display what will be removed
+    click.echo("")
+    click.echo("The following components will be removed:")
+    click.echo("")
+    
+    if found_binaries:
+        click.echo(click.style("Binaries:", fg='yellow', bold=True))
+        for binary in found_binaries:
+            click.echo(f"  - {binary}")
+        click.echo("")
+    else:
+        click.echo(click.style("Binaries:", fg='yellow', bold=True))
+        click.echo("  - None found")
+        click.echo("")
+    
+    if config_paths:
+        click.echo(click.style("Configuration & Data:", fg='yellow', bold=True))
+        for path in config_paths:
+            click.echo(f"  - {path}")
+        click.echo("")
+    elif purge:
+        click.echo(click.style("Configuration & Data:", fg='yellow', bold=True))
+        click.echo("  - None found")
+        click.echo("")
+    
+    # Calculate total size
+    total_size = 0
+    for path in paths_to_remove + config_paths:
+        if path.exists():
+            if path.is_file():
+                total_size += path.stat().st_size
+            elif path.is_dir():
+                total_size += sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+    
+    if total_size > 0:
+        size_mb = total_size / (1024 * 1024)
+        click.echo(f"Total disk space to be freed: {size_mb:.2f} MB")
+        click.echo("")
+    
+    # Nothing to remove
+    if not found_binaries and not config_paths:
+        click.echo(click.style("✓ Control Center is not installed on this system", fg='green'))
+        return
+    
+    # Confirm removal
+    if not yes:
+        click.echo(click.style("⚠ This action cannot be undone!", fg='red', bold=True))
+        if not click.confirm('Do you want to continue?'):
+            click.echo("\nUninstall cancelled.")
+            return
+    
+    click.echo("")
+    click.echo("Uninstalling...")
+    click.echo("")
+    
+    # Track results
+    removed = []
+    failed = []
+    
+    # 1. Remove binaries
+    for binary_path in paths_to_remove:
+        try:
+            if binary_path.exists():
+                binary_path.unlink()
+                removed.append(str(binary_path))
+                click.echo(click.style(f"  ✓ Removed: {binary_path}", fg='green'))
+        except PermissionError:
+            # Handle Windows file-in-use
+            if os_type == 'windows':
+                try:
+                    # Rename and schedule for deletion
+                    temp_path = binary_path.with_suffix('.delete_me')
+                    if temp_path.exists():
+                        try:
+                            temp_path.unlink()
+                        except:
+                            pass
+                    
+                    binary_path.rename(temp_path)
+                    
+                    # Schedule deletion after reboot
+                    import subprocess
+                    cmd = f'cmd /c ping 127.0.0.1 -n 3 > nul & del "{temp_path}"'
+                    subprocess.Popen(
+                        cmd,
+                        shell=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    )
+                    
+                    removed.append(str(binary_path))
+                    click.echo(click.style(f"  ✓ Scheduled for deletion: {binary_path}", fg='green'))
+                    continue
+                except Exception:
+                    pass
+            
+            failed.append((str(binary_path), "Permission denied (File in use)"))
+            click.echo(click.style(f"  ✗ Failed: {binary_path} (File in use)", fg='red'))
+            
+        except Exception as e:
+            failed.append((str(binary_path), str(e)))
+            click.echo(click.style(f"  ✗ Failed: {binary_path} ({e})", fg='red'))
+    
+    # 2. Remove configuration (if --purge)
+    if config_paths:
+        click.echo("")
+        for config_path in config_paths:
+            try:
+                if config_path.exists():
+                    if config_path.is_dir():
+                        shutil.rmtree(config_path)
+                    else:
+                        config_path.unlink()
+                    removed.append(str(config_path))
+                    click.echo(click.style(f"  ✓ Removed: {config_path}", fg='green'))
+            except Exception as e:
+                failed.append((str(config_path), str(e)))
+                click.echo(click.style(f"  ✗ Failed: {config_path} ({e})", fg='red'))
+    
+    # 3. Remove empty parent directories
+    if os_type == 'windows':
+        parent_dir = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'ControlCenter'
+        try:
+            if parent_dir.exists() and not any(parent_dir.iterdir()):
+                parent_dir.rmdir()
+                click.echo(click.style(f"  ✓ Removed empty directory: {parent_dir}", fg='green'))
+        except Exception:
+            pass
+    else:
+        parent_dirs = [
+            Path.home() / '.local' / 'share' / 'control-center',
+            Path.home() / '.control-center',
+        ]
+        for parent_dir in parent_dirs:
+            try:
+                if parent_dir.exists() and not any(parent_dir.iterdir()):
+                    parent_dir.rmdir()
+                    click.echo(click.style(f"  ✓ Removed empty directory: {parent_dir}", fg='green'))
+            except Exception:
+                pass
+    
+    # 4. Clean up PATH environment variable (Windows Only)
+    if os_type == 'windows':
+        try:
+            import winreg
+            
+            # Open the User Environment Key
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                'Environment',
+                0,
+                winreg.KEY_ALL_ACCESS
+            )
+            
+            # Read the current PATH
+            try:
+                path_value, _ = winreg.QueryValueEx(key, 'Path')
+            except FileNotFoundError:
+                path_value = ""
+            
+            # Define the path fragment to look for
+            control_center_fragment = str(Path('Programs/ControlCenter/bin')).lower()
+            
+            # Filter the paths
+            new_paths = []
+            changed = False
+            
+            if path_value:
+                for part in path_value.split(';'):
+                    if control_center_fragment in part.lower().replace('/', '\\'):
+                        click.echo(click.style(f"  ✓ Removing from PATH: {part}", fg='green'))
+                        changed = True
+                    elif part.strip():
+                        new_paths.append(part)
+            
+            # Save back if changed
+            if changed:
+                new_path_str = ';'.join(new_paths)
+                winreg.SetValueEx(key, 'Path', 0, winreg.REG_EXPAND_SZ, new_path_str)
+                click.echo(click.style("  ✓ Updated Windows PATH variable", fg='green'))
+                
+                # Notify the system about the environment variable change
+                try:
+                    import ctypes
+                    HWND_BROADCAST = 0xFFFF
+                    WM_SETTINGCHANGE = 0x001A
+                    SMTO_ABORTIFHUNG = 0x0002
+                    result = ctypes.c_long()
+                    ctypes.windll.user32.SendMessageTimeoutW(
+                        HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment',
+                        SMTO_ABORTIFHUNG, 5000, ctypes.byref(result)
+                    )
+                except:
+                    pass
+            
+            winreg.CloseKey(key)
+            
+        except Exception as e:
+            click.echo(click.style(f"  ! Warning: Could not remove from PATH: {e}", fg='yellow'))
+    
+    # Summary
+    click.echo("")
+    click.echo("="*60)
+    
+    if removed and not failed:
+        click.echo(click.style("✓ Uninstall completed successfully!", fg='green', bold=True))
+        click.echo("")
+        click.echo(f"Removed {len(removed)} item(s):")
+        # Show first 5, truncate if more
+        for item in removed[:5]:
+            click.echo(f"  - {item}")
+        if len(removed) > 5:
+            click.echo(f"  ... and {len(removed) - 5} more")
+    
+    elif removed and failed:
+        click.echo(click.style("⚠ Uninstall partially completed", fg='yellow', bold=True))
+        click.echo("")
+        click.echo(f"Successfully removed: {len(removed)} item(s)")
+        click.echo(f"Failed to remove: {len(failed)} item(s)")
+        click.echo("")
+        click.echo("Failed items:")
+        for path, error in failed:
+            click.echo(f"  - {path}: {error}")
+        click.echo("")
+        if os_type != 'windows':
+            click.echo("Tip: Try running with sudo for system-wide installations:")
+            click.echo("  sudo control-center uninstall -y")
+    
+    elif not removed and failed:
+        click.echo(click.style("✗ Uninstall failed", fg='red', bold=True))
+        click.echo("")
+        click.echo("Failed to remove:")
+        for path, error in failed:
+            click.echo(f"  - {path}: {error}")
         sys.exit(1)
+    
+    click.echo("")
+    click.echo("Thank you for using Control Center!")
+    click.echo("We'd appreciate your feedback: https://github.com/your-username/control-center/issues")
 
 # Config Commands
 @cli.group()
@@ -655,7 +1171,7 @@ def config_validate():
         if is_valid:
             click.echo("✓ Configuration is valid")
         else:
-            click.echo("✗ Configuration errors found:\n", err=True)
+            click.echo("✗ Configuration is invalid", err=True)
             for error in errors:
                 click.echo(f"  - {error}", err=True)
             sys.exit(1)
