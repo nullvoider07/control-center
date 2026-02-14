@@ -116,6 +116,50 @@ class WindowsActuation:
         
         return None
     
+    # NEW: Process keyboard command to handle standalone modifier keys
+    def _process_keyboard_command(self, command: str) -> str:
+        """
+        Process keyboard command, handling standalone modifier keys
+        
+        In AutoHotkey:
+        - # is a modifier (Win key) that must be followed by another key
+        - To press Win key alone, use {LWin} or {RWin}
+        - Same for ^, +, ! when used standalone
+        
+        Args:
+            command: Keyboard command (e.g., "press #", "press ^c")
+            
+        Returns:
+            Processed command ready for AutoHotkey
+        """
+        parts = command.strip().split(maxsplit=1)
+        
+        if len(parts) < 2:
+            return command
+        
+        action = parts[0]
+        keys = parts[1] if len(parts) > 1 else ""
+        
+        if action != 'press':
+            return command
+        
+        # Handle standalone modifier keys
+        # These need to be converted to their actual key names
+        standalone_modifiers = {
+            '#': '{LWin}',      # Windows key
+            '^': '{LCtrl}',     # Ctrl key  
+            '+': '{LShift}',    # Shift key
+            '!': '{LAlt}',      # Alt key
+        }
+        
+        # Check if it's ONLY a modifier (no other keys)
+        if keys in standalone_modifiers:
+            return f"press {standalone_modifiers[keys]}"
+        
+        # If it starts with modifiers but has other keys, keep as-is
+        # e.g., "#r" (Win+R) stays as "#r"
+        return command
+    
     # Method to detect command type (mouse/keyboard) with smart parsing
     def detect_command_type(self, command: str) -> Tuple[str, str]:
         """
@@ -200,8 +244,11 @@ class WindowsActuation:
                 print("[✗] Failed to get mouse position")
                 return False
         
-        # For keyboard commands, escape carets
+        # For keyboard commands, process standalone modifiers and escape carets
         if cmd_type == 'keyboard':
+            # Process standalone modifiers (# → {LWin}, etc.)
+            processed_cmd = self._process_keyboard_command(processed_cmd)
+            
             # The agent will write this to the file, so we need to escape carets
             processed_cmd = processed_cmd.replace('^', '^^')
         
@@ -257,6 +304,7 @@ class WindowsActuation:
             ui_opening_commands = [
                 'press #r',
                 'press #',
+                'press {LWin}',  # Added this
                 'press !{Tab}',
                 'press ^+{Esc}',
             ]
@@ -296,8 +344,9 @@ class WindowsActuation:
             for i, command in enumerate(commands, 1):
                 cmd_type, formatted_cmd = self.detect_command_type(command)
                 if cmd_type != 'invalid':
-                    # Escape carets for keyboard commands
+                    # Escape carets and process standalone modifiers for keyboard commands
                     if cmd_type == 'keyboard':
+                        formatted_cmd = self._process_keyboard_command(formatted_cmd)
                         formatted_cmd = formatted_cmd.replace('^', '^^')
                     yield formatted_cmd, i, len(commands), command
         
@@ -346,6 +395,8 @@ class WindowsActuation:
 ║ press <keys>           → Press keys/shortcuts            ║
 ║ {Enter}                → Press Enter (auto-detected)     ║
 ║ ^c                     → Ctrl+C (auto-detected)          ║
+║ #                      → Windows key (opens Start)       ║
+║ #r                     → Win+R (Run dialog)              ║
 ║                                                          ║
 ║ Modifiers: ^ (Ctrl), + (Shift), ! (Alt), # (Win)         ║
 ║ Special: {Enter}, {Esc}, {Tab}, {F1}-{F12}, etc.         ║
@@ -357,7 +408,8 @@ class WindowsActuation:
 ║ type Hello World       → Type text                       ║
 ║ press ^v               → Paste (Ctrl+V)                  ║
 ║ {Enter}                → Press Enter                     ║
-║ {LWin}                 → Press Windows key (opens Start) ║
+║ #                      → Press Windows key (Start menu)  ║
+║ {LWin}                 → Press Windows key (alternative) ║
 ║ 200 200 drag 800 600   → Drag operation                  ║
 ║ position               → Get mouse coordinates           ║
 ╠══════════════════════════════════════════════════════════╣

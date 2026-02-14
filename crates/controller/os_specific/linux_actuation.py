@@ -91,9 +91,24 @@ class LinuxActuation:
     
     # Translate AutoHotkey modifier syntax to xdotool syntax
     def _translate_modifier_keys(self, text: str) -> str:
-        """Translate AutoHotkey modifier syntax to xdotool syntax"""
+        """
+        Translate AutoHotkey modifier syntax to xdotool syntax
+        
+        Handles:
+        - Modifier prefixes: ^ (Ctrl), + (Shift), ! (Alt), # (Super)
+        - Standalone modifiers: just ^ or # alone
+        - Special keys in braces: {Enter}, {Tab}, etc.
+        
+        Examples:
+            "#r" → "super+r"
+            "#" → "super"  (standalone Super key)
+            "^c" → "ctrl+c"
+            "^" → "ctrl"  (standalone Ctrl key)
+        """
         modifiers = []
         i = 0
+        
+        # Extract modifier symbols from the beginning
         while i < len(text) and text[i] in '^+!#':
             if text[i] == '^':
                 modifiers.append('ctrl')
@@ -108,17 +123,25 @@ class LinuxActuation:
         # Get the key part (after modifiers)
         key_part = text[i:]
         
-        # Translate special keys
+        # Translate special keys in braces
         for ahk_key, xdo_key in self.SPECIAL_KEYS_MAP.items():
             key_part = key_part.replace(ahk_key, xdo_key)
         
         # Build the xdotool key combination
         if modifiers and key_part:
+            # Modifiers + key: e.g., "ctrl+c", "super+r"
             return '+'.join(modifiers + [key_part])
         elif key_part:
+            # Just the key, no modifiers
             return key_part
-        else:
+        elif modifiers:
+            # STANDALONE MODIFIER: Just the modifier key(s)
+            # e.g., "#" becomes "super"
+            # This is the fix for standalone Super/Win key!
             return '+'.join(modifiers)
+        else:
+            # Empty string fallback
+            return text
     
     # Smart command type detection
     def detect_command_type(self, command: str) -> Tuple[str, str]:
@@ -248,23 +271,41 @@ class LinuxActuation:
         return None
     
     def _build_keyboard_command(self, command: str) -> Optional[str]:
-        """Build xdotool keyboard command"""
+        """
+        Build xdotool keyboard command
+        
+        Handles:
+        - type: Types literal text
+        - press: Presses key combinations (including standalone modifiers)
+        """
         parts = command.strip().split(maxsplit=1)
         
-        if len(parts) < 2:
+        if len(parts) < 1:
             return None
         
         action = parts[0]
-        text = parts[1]
         
+        # Handle "type" action
         if action == 'type':
+            if len(parts) < 2:
+                return None
+            text = parts[1]
             # Escape special characters for typing
             escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
             return f'DISPLAY={self.display} xdotool type "{escaped_text}"'
         
+        # Handle "press" action
         elif action == 'press':
-            # Translate the key combination
+            if len(parts) < 2:
+                # "press" with no arguments is invalid
+                return None
+            
+            text = parts[1]
+            
+            # Translate the key combination (handles standalone modifiers!)
             translated = self._translate_modifier_keys(text)
+            
+            # Return xdotool key command
             return f'DISPLAY={self.display} xdotool key {translated}'
         
         return None
@@ -447,6 +488,8 @@ class LinuxActuation:
 ║ press <keys>           → Press keys/shortcuts            ║
 ║ {Enter}                → Press Enter (auto-detected)     ║
 ║ ^c                     → Ctrl+C (auto-detected)          ║
+║ #                      → Super key (opens menu)          ║
+║ #r                     → Super+R (Run dialog)            ║
 ║                                                          ║
 ║ Modifiers: ^ (Ctrl), + (Shift), ! (Alt), # (Super/Win)   ║
 ║ Special: {Enter}, {Tab}, {F1}-{F12}, {Up}, {Down}, etc.  ║
@@ -458,6 +501,7 @@ class LinuxActuation:
 ║ type Hello World       → Type text                       ║
 ║ press ^v               → Paste (Ctrl+V)                  ║
 ║ {Enter}                → Press Enter                     ║
+║ #                      → Press Super key (app menu)      ║
 ║ press ^!{Delete}       → Ctrl+Alt+Delete                 ║
 ║ 200 200 drag 800 600   → Drag operation                  ║
 ║ here scroll_down 5     → Scroll down 5 notches           ║

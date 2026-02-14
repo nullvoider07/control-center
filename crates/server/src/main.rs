@@ -121,13 +121,17 @@ impl ControlServiceImpl {
 
     // Connect to the agent with retries and exponential backoff
     async fn connect_to_agent(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Attempting to connect to agent at 127.0.0.1:50052...");
+        let agent_host = std::env::var("AGENT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let agent_port = std::env::var("AGENT_PORT").unwrap_or_else(|_| "50052".to_string());
+        let agent_url = format!("http://{}:{}", agent_host, agent_port);
+
+        info!("Attempting to connect to agent at {}...", agent_url);
 
         let max_retries = 5;
         let mut retry_count = 0;
 
         while retry_count < max_retries {
-            match AgentServiceClient::connect("http://127.0.0.1:50052").await {
+            match AgentServiceClient::connect(agent_url.clone()).await {
                 Ok(client) => {
                     info!("Successfully connected to agent");
                     
@@ -154,13 +158,12 @@ impl ControlServiceImpl {
                 }
                 Err(e) => {
                     retry_count += 1;
-                    warn!(
-                        "Failed to connect to agent (attempt {}/{}): {}",
-                        retry_count, max_retries, e
-                    );
-
+                    warn!("Failed to connect to agent (attempt {}/{}): {}", retry_count, max_retries, e);
+                    
                     if retry_count < max_retries {
-                        tokio::time::sleep(Duration::from_secs(2_u64.pow(retry_count))).await;
+                        // Exponential backoff: 2^retry_count seconds
+                        let wait_time = 2_u64.pow(retry_count);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(wait_time)).await;
                     }
                 }
             }
