@@ -27,13 +27,10 @@ if _version_not_supported:
 
 class ControlServiceStub(object):
     """============================================================================
-    Service Definitions
+    SERVICE DEFINITIONS
     ============================================================================
 
-    / Control Service - Main API for CLI clients
-    /
-    / All methods require JWT token authentication via gRPC metadata.
-    / Token should be passed as: metadata[('authorization', 'Bearer <token>')]
+    Main control service (server-side)
     """
 
     def __init__(self, channel):
@@ -42,18 +39,18 @@ class ControlServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.GetAgentInfo = channel.unary_unary(
-                '/control_center.ControlService/GetAgentInfo',
-                request_serializer=control__center__pb2.AgentInfoRequest.SerializeToString,
-                response_deserializer=control__center__pb2.AgentInfo.FromString,
+        self.RegisterAgent = channel.unary_unary(
+                '/control_center.ControlService/RegisterAgent',
+                request_serializer=control__center__pb2.RegistrationRequest.SerializeToString,
+                response_deserializer=control__center__pb2.RegistrationResponse.FromString,
+                _registered_method=True)
+        self.AgentStream = channel.stream_stream(
+                '/control_center.ControlService/AgentStream',
+                request_serializer=control__center__pb2.AgentMessage.SerializeToString,
+                response_deserializer=control__center__pb2.ServerMessage.FromString,
                 _registered_method=True)
         self.ExecuteCommand = channel.unary_unary(
                 '/control_center.ControlService/ExecuteCommand',
-                request_serializer=control__center__pb2.CommandRequest.SerializeToString,
-                response_deserializer=control__center__pb2.CommandResponse.FromString,
-                _registered_method=True)
-        self.ExecuteCommandStream = channel.stream_stream(
-                '/control_center.ControlService/ExecuteCommandStream',
                 request_serializer=control__center__pb2.CommandRequest.SerializeToString,
                 response_deserializer=control__center__pb2.CommandResponse.FromString,
                 _registered_method=True)
@@ -62,54 +59,121 @@ class ControlServiceStub(object):
                 request_serializer=control__center__pb2.MonitorRequest.SerializeToString,
                 response_deserializer=control__center__pb2.ConnectionStatus.FromString,
                 _registered_method=True)
+        self.QueryConnections = channel.unary_unary(
+                '/control_center.ControlService/QueryConnections',
+                request_serializer=control__center__pb2.ConnectionQuery.SerializeToString,
+                response_deserializer=control__center__pb2.ConnectionStatusResponse.FromString,
+                _registered_method=True)
+        self.QueryServers = channel.unary_unary(
+                '/control_center.ControlService/QueryServers',
+                request_serializer=control__center__pb2.ServerStatusQuery.SerializeToString,
+                response_deserializer=control__center__pb2.ServerStatusResponse.FromString,
+                _registered_method=True)
+        self.GetServerIdentity = channel.unary_unary(
+                '/control_center.ControlService/GetServerIdentity',
+                request_serializer=control__center__pb2.InfoRequest.SerializeToString,
+                response_deserializer=control__center__pb2.ServerIdentity.FromString,
+                _registered_method=True)
+        self.GetAgentInfo = channel.unary_unary(
+                '/control_center.ControlService/GetAgentInfo',
+                request_serializer=control__center__pb2.AgentInfoRequest.SerializeToString,
+                response_deserializer=control__center__pb2.AgentInfo.FromString,
+                _registered_method=True)
+        self.Execute = channel.unary_unary(
+                '/control_center.ControlService/Execute',
+                request_serializer=control__center__pb2.ExecuteRequest.SerializeToString,
+                response_deserializer=control__center__pb2.ExecuteResponse.FromString,
+                _registered_method=True)
+        self.Ping = channel.unary_unary(
+                '/control_center.ControlService/Ping',
+                request_serializer=control__center__pb2.PingRequest.SerializeToString,
+                response_deserializer=control__center__pb2.PongResponse.FromString,
+                _registered_method=True)
+        self.GetMetrics = channel.unary_unary(
+                '/control_center.ControlService/GetMetrics',
+                request_serializer=control__center__pb2.MetricsRequest.SerializeToString,
+                response_deserializer=control__center__pb2.MetricsResponse.FromString,
+                _registered_method=True)
 
 
 class ControlServiceServicer(object):
     """============================================================================
-    Service Definitions
+    SERVICE DEFINITIONS
     ============================================================================
 
-    / Control Service - Main API for CLI clients
-    /
-    / All methods require JWT token authentication via gRPC metadata.
-    / Token should be passed as: metadata[('authorization', 'Bearer <token>')]
+    Main control service (server-side)
     """
 
-    def GetAgentInfo(self, request, context):
-        """Get information about the connected agent
+    def RegisterAgent(self, request, context):
+        """Agent registration (agent calls this when connecting)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
-        Requires: Valid JWT token in metadata
-        Returns: OS type, version, and available capabilities
+    def AgentStream(self, request_iterator, context):
+        """Bidirectional stream between agent and server
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def ExecuteCommand(self, request, context):
-        """Execute a single command on the agent
-
-        Requires: Valid JWT token in metadata
-        Rate limited to 100 requests per minute per user
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ExecuteCommandStream(self, request_iterator, context):
-        """Execute multiple commands via bidirectional streaming
-
-        Requires: Valid JWT token in metadata
-        Responses are returned in the same order as requests
+        """Execute command (CLI to server)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def MonitorConnection(self, request, context):
-        """Monitor connection status to the agent
+        """Monitor connection (CLI to server)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
-        Requires: Valid JWT token in metadata
-        Updates sent every 5 seconds
+    def QueryConnections(self, request, context):
+        """Query connection status (for monitoring)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def QueryServers(self, request, context):
+        """Query server status (for monitoring)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetServerIdentity(self, request, context):
+        """Get server identity
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetAgentInfo(self, request, context):
+        """Legacy compatibility
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Execute(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Ping(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMetrics(self, request, context):
+        """Get server metrics (Prometheus format)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -118,18 +182,18 @@ class ControlServiceServicer(object):
 
 def add_ControlServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'GetAgentInfo': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetAgentInfo,
-                    request_deserializer=control__center__pb2.AgentInfoRequest.FromString,
-                    response_serializer=control__center__pb2.AgentInfo.SerializeToString,
+            'RegisterAgent': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterAgent,
+                    request_deserializer=control__center__pb2.RegistrationRequest.FromString,
+                    response_serializer=control__center__pb2.RegistrationResponse.SerializeToString,
+            ),
+            'AgentStream': grpc.stream_stream_rpc_method_handler(
+                    servicer.AgentStream,
+                    request_deserializer=control__center__pb2.AgentMessage.FromString,
+                    response_serializer=control__center__pb2.ServerMessage.SerializeToString,
             ),
             'ExecuteCommand': grpc.unary_unary_rpc_method_handler(
                     servicer.ExecuteCommand,
-                    request_deserializer=control__center__pb2.CommandRequest.FromString,
-                    response_serializer=control__center__pb2.CommandResponse.SerializeToString,
-            ),
-            'ExecuteCommandStream': grpc.stream_stream_rpc_method_handler(
-                    servicer.ExecuteCommandStream,
                     request_deserializer=control__center__pb2.CommandRequest.FromString,
                     response_serializer=control__center__pb2.CommandResponse.SerializeToString,
             ),
@@ -137,6 +201,41 @@ def add_ControlServiceServicer_to_server(servicer, server):
                     servicer.MonitorConnection,
                     request_deserializer=control__center__pb2.MonitorRequest.FromString,
                     response_serializer=control__center__pb2.ConnectionStatus.SerializeToString,
+            ),
+            'QueryConnections': grpc.unary_unary_rpc_method_handler(
+                    servicer.QueryConnections,
+                    request_deserializer=control__center__pb2.ConnectionQuery.FromString,
+                    response_serializer=control__center__pb2.ConnectionStatusResponse.SerializeToString,
+            ),
+            'QueryServers': grpc.unary_unary_rpc_method_handler(
+                    servicer.QueryServers,
+                    request_deserializer=control__center__pb2.ServerStatusQuery.FromString,
+                    response_serializer=control__center__pb2.ServerStatusResponse.SerializeToString,
+            ),
+            'GetServerIdentity': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetServerIdentity,
+                    request_deserializer=control__center__pb2.InfoRequest.FromString,
+                    response_serializer=control__center__pb2.ServerIdentity.SerializeToString,
+            ),
+            'GetAgentInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetAgentInfo,
+                    request_deserializer=control__center__pb2.AgentInfoRequest.FromString,
+                    response_serializer=control__center__pb2.AgentInfo.SerializeToString,
+            ),
+            'Execute': grpc.unary_unary_rpc_method_handler(
+                    servicer.Execute,
+                    request_deserializer=control__center__pb2.ExecuteRequest.FromString,
+                    response_serializer=control__center__pb2.ExecuteResponse.SerializeToString,
+            ),
+            'Ping': grpc.unary_unary_rpc_method_handler(
+                    servicer.Ping,
+                    request_deserializer=control__center__pb2.PingRequest.FromString,
+                    response_serializer=control__center__pb2.PongResponse.SerializeToString,
+            ),
+            'GetMetrics': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMetrics,
+                    request_deserializer=control__center__pb2.MetricsRequest.FromString,
+                    response_serializer=control__center__pb2.MetricsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -148,17 +247,14 @@ def add_ControlServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class ControlService(object):
     """============================================================================
-    Service Definitions
+    SERVICE DEFINITIONS
     ============================================================================
 
-    / Control Service - Main API for CLI clients
-    /
-    / All methods require JWT token authentication via gRPC metadata.
-    / Token should be passed as: metadata[('authorization', 'Bearer <token>')]
+    Main control service (server-side)
     """
 
     @staticmethod
-    def GetAgentInfo(request,
+    def RegisterAgent(request,
             target,
             options=(),
             channel_credentials=None,
@@ -171,9 +267,36 @@ class ControlService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/control_center.ControlService/GetAgentInfo',
-            control__center__pb2.AgentInfoRequest.SerializeToString,
-            control__center__pb2.AgentInfo.FromString,
+            '/control_center.ControlService/RegisterAgent',
+            control__center__pb2.RegistrationRequest.SerializeToString,
+            control__center__pb2.RegistrationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AgentStream(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/control_center.ControlService/AgentStream',
+            control__center__pb2.AgentMessage.SerializeToString,
+            control__center__pb2.ServerMessage.FromString,
             options,
             channel_credentials,
             insecure,
@@ -199,33 +322,6 @@ class ControlService(object):
             request,
             target,
             '/control_center.ControlService/ExecuteCommand',
-            control__center__pb2.CommandRequest.SerializeToString,
-            control__center__pb2.CommandResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ExecuteCommandStream(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_stream(
-            request_iterator,
-            target,
-            '/control_center.ControlService/ExecuteCommandStream',
             control__center__pb2.CommandRequest.SerializeToString,
             control__center__pb2.CommandResponse.FromString,
             options,
@@ -265,12 +361,198 @@ class ControlService(object):
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def QueryConnections(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/QueryConnections',
+            control__center__pb2.ConnectionQuery.SerializeToString,
+            control__center__pb2.ConnectionStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def QueryServers(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/QueryServers',
+            control__center__pb2.ServerStatusQuery.SerializeToString,
+            control__center__pb2.ServerStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetServerIdentity(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/GetServerIdentity',
+            control__center__pb2.InfoRequest.SerializeToString,
+            control__center__pb2.ServerIdentity.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetAgentInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/GetAgentInfo',
+            control__center__pb2.AgentInfoRequest.SerializeToString,
+            control__center__pb2.AgentInfo.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Execute(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/Execute',
+            control__center__pb2.ExecuteRequest.SerializeToString,
+            control__center__pb2.ExecuteResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Ping(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/Ping',
+            control__center__pb2.PingRequest.SerializeToString,
+            control__center__pb2.PongResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMetrics(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/GetMetrics',
+            control__center__pb2.MetricsRequest.SerializeToString,
+            control__center__pb2.MetricsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class AgentServiceStub(object):
-    """/ Agent Service - Internal API for server-to-agent communication
-    /
-    / This service runs on the agent (inside container) and is only
-    / accessible from localhost. It trusts the server's validation.
+    """Agent service (agent-side) - kept for backwards compatibility if needed
     """
 
     def __init__(self, channel):
@@ -297,34 +579,23 @@ class AgentServiceStub(object):
 
 
 class AgentServiceServicer(object):
-    """/ Agent Service - Internal API for server-to-agent communication
-    /
-    / This service runs on the agent (inside container) and is only
-    / accessible from localhost. It trusts the server's validation.
+    """Agent service (agent-side) - kept for backwards compatibility if needed
     """
 
     def GetInfo(self, request, context):
-        """Get agent information (OS, version, capabilities)
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Execute(self, request, context):
-        """Execute a command on the local system
-
-        Commands are executed based on OS type:
-        - Windows: Write to C:\mouse_cmd.txt or C:\keyboard_cmd.txt
-        - macOS: Execute via cliclick
-        - Linux: Execute via xdotool
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Ping(self, request, context):
-        """Health check ping
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -356,10 +627,7 @@ def add_AgentServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class AgentService(object):
-    """/ Agent Service - Internal API for server-to-agent communication
-    /
-    / This service runs on the agent (inside container) and is only
-    / accessible from localhost. It trusts the server's validation.
+    """Agent service (agent-side) - kept for backwards compatibility if needed
     """
 
     @staticmethod

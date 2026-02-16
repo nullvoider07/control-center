@@ -11,16 +11,23 @@ license.workspace = true
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1.40", features = ["full", "macros"] }
+tokio-stream = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+get_if_addrs = "0.5"
+hostname = "0.3"
+chrono = "0.4"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 
 # Utilities
-uuid = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 regex = "1.10"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
 
 # OS-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]

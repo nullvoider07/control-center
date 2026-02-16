@@ -3,7 +3,7 @@ name = "control-center-server"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "gRPC server"
+description = "gRPC server for Control Center"
 license.workspace = true
 
 [dependencies]
@@ -11,22 +11,26 @@ license.workspace = true
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 tokio = { version = "1.40", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["net"] }
-jsonwebtoken = "9.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = "0.4"
+hostname = "0.3"
 
-# Auth
-control-center-auth = { path = "../auth" }
+# JWT Authentication
+jsonwebtoken = "9.3"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utilities
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 anyhow = { workspace = true }
-uuid = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
+
+[dependencies.openssl]
+version = "0.10"
+optional = true
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -39,9 +43,6 @@ lto = true
 codegen-units = 1
 strip = true
 
-[dependencies.openssl]
-version = "0.10"
-optional = true
-
 [features]
 openssl-vendored = ["openssl/vendored"]
+prometheus = []

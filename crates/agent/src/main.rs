@@ -1,7 +1,7 @@
 // crates/agent/src/main.rs
 
-use tonic::{transport::Server, Request, Response, Status};
-use tracing::{info, warn, error};
+use tonic::{Request, Response, Status};
+use tracing::{info, warn, error, debug};
 use std::process::Command as ProcessCommand;
 #[cfg(target_os = "windows")]
 use std::fs;
@@ -14,9 +14,12 @@ mod proto {
     tonic::include_proto!("control_center");
 }
 
+mod identity;
+mod connection;
+
 // Re-exporting for easier access
 use proto::{
-    agent_service_server::{AgentService, AgentServiceServer},
+    agent_service_server::AgentService,
 };
 
 // For cross-platform OS detection
@@ -652,35 +655,314 @@ impl AgentService for AgentServiceImpl {
     }
 }
 
-// Main function to start the gRPC server
+// Main function to start the agent
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_level(true)
-        .init();
+    tracing_subscriber::fmt::init();
     
-    info!("Control Center Agent v{} (WITH POSITION TRACKING)", env!("CARGO_PKG_VERSION"));
+    info!("Control Center Agent v1.0.0 (WITH POSITION TRACKING)");
     info!("Starting Agent...");
     
+    // Create agent service (keeps all execution logic)
     let service = AgentServiceImpl::new();
+    let os_type = service.os_type;
+    let os_version = service.os_version.clone();
+    let capabilities = service.capabilities.clone();
     
-    // Bind to localhost only for security
-    let addr = std::env::var("AGENT_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:50052".to_string())
-        .parse()?;
+    // Read server connection info from environment
+    let server_host = std::env::var("AGENT_SERVER_HOST")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let server_port = std::env::var("AGENT_SERVER_PORT")
+        .unwrap_or_else(|_| "50051".to_string())
+        .parse()
+        .unwrap_or(50051);
     
-    info!("Agent listening on {} (localhost only)", addr);
-    info!("Ready to accept commands from server");
-    info!("✓ Position tracking enabled - captures coordinates for all mouse actions");
-    info!("✓ Detailed messages - reports action type (left/right/double click, etc.)");
+    info!("Connecting to server at {}:{}...", server_host, server_port);
     
-    Server::builder()
-        .add_service(AgentServiceServer::new(service))
-        .serve(addr)
-        .await?;
+    // Build agent identity
+    let agent_identity = identity::build_agent_identity(
+        os_type,
+        os_version,
+        capabilities,
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
+    
+    // Validate identity
+    if let Err(e) = identity::validate_agent_identity(&agent_identity) {
+        error!("Invalid agent identity: {}", e);
+        return Err(e.into());
+    }
+    
+    // Create connection manager
+    let auth_token = std::env::var("CONTROL_CENTER_TOKEN").ok();
+    let connection_manager = connection::ConnectionManager::new(
+        server_host,
+        server_port,
+        agent_identity,
+        auth_token,
+    );
+    
+    // Connect and register
+        match connection_manager.connect_and_register().await {
+        Ok(mut client) => {
+            info!("✓ Ready to accept commands");
+            
+            let agent_start_time = std::time::Instant::now();
+            let commands_executed = std::sync::Arc::new(tokio::sync::RwLock::new(0u64));
+            let commands_failed = std::sync::Arc::new(tokio::sync::RwLock::new(0u64));
+            let (agent_tx, agent_rx) = tokio::sync::mpsc::channel(100);
+            
+            // Start bidirectional stream with server
+            info!("Starting bidirectional stream with server...");
+            let request_stream = tokio_stream::wrappers::ReceiverStream::new(agent_rx);
+            
+            let response = match client.agent_stream(Request::new(request_stream)).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Failed to start agent stream: {}", e);
+                    return Err(e.into());
+                }
+            };
+            
+            let mut server_stream = response.into_inner();
+            info!("✓ Bidirectional stream established");
+            
+            // Get connection ID for heartbeats
+            let connection_id = connection_manager.get_connection_id().await
+                .ok_or_else(|| {
+                    error!("No connection ID available");
+                    "No connection ID"
+                })?;
+            
+            // Spawn heartbeat sender with REAL metrics
+            let heartbeat_tx = agent_tx.clone();
+            let heartbeat_conn_id = connection_id.clone();
+            let heartbeat_start_time = agent_start_time;
+            let heartbeat_executed = commands_executed.clone();
+            let heartbeat_failed = commands_failed.clone();
+            
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    
+                    // Calculate REAL uptime
+                    let uptime_seconds = heartbeat_start_time.elapsed().as_secs();
+                    
+                    // Get REAL command counts
+                    let executed = *heartbeat_executed.read().await;
+                    let failed = *heartbeat_failed.read().await;
+                    
+                    let heartbeat = proto::AgentHeartbeat {
+                        connection_id: heartbeat_conn_id.clone(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                        status: Some(proto::AgentStatus {
+                            ready: true,
+                            commands_executed: executed,
+                            commands_failed: failed,
+                            uptime_seconds: uptime_seconds as i64,
+                            system_info: std::collections::HashMap::new(),
+                        }),
+                        current_command_id: None,
+                    };
+                    
+                    let agent_msg = proto::AgentMessage {
+                        connection_id: heartbeat_conn_id.clone(),
+                        payload: Some(proto::agent_message::Payload::Heartbeat(heartbeat)),
+                    };
+                    
+                    if heartbeat_tx.send(agent_msg).await.is_err() {
+                        warn!("Failed to send heartbeat, stream may be closed");
+                        break;
+                    }
+                    
+                    debug!(
+                        "Sent heartbeat - uptime: {}s, executed: {}, failed: {}",
+                        uptime_seconds, executed, failed
+                    );
+                }
+            });
+            
+            info!("Agent running. Press Ctrl+C to stop.");
+            info!("Listening for commands from server...");
+            info!("Full tracking enabled (commands, uptime, execution times)");
+            
+            // Main command loop - listen for messages from server
+            loop {
+                tokio::select! {
+                    // Handle Ctrl+C
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received Ctrl+C, shutting down...");
+                        
+                        // Send disconnect message
+                        let disconnect = proto::DisconnectNotice {
+                            reason: "User requested shutdown".to_string(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            graceful: true,
+                        };
+                        
+                        let agent_msg = proto::AgentMessage {
+                            connection_id: connection_id.clone(),
+                            payload: Some(proto::agent_message::Payload::Disconnect(disconnect)),
+                        };
+                        
+                        let _ = agent_tx.send(agent_msg).await;
+                        
+                        break;
+                    }
+                    
+                    // Handle incoming messages from server
+                    server_msg = server_stream.message() => {
+                        match server_msg {
+                            Ok(Some(msg)) => {
+                                match msg.payload {
+                                    Some(proto::server_message::Payload::CommandRequest(cmd_req)) => {
+                                        let command_id = cmd_req.id.clone();
+                                        let command = cmd_req.command.clone();
+                                        
+                                        // Track command execution time
+                                        let cmd_start_time = std::time::Instant::now();
+                                        
+                                        info!("Received command: {} (ID: {})", command, command_id);
+                                        
+                                        // Execute command using AgentServiceImpl
+                                        let execute_request = proto::ExecuteRequest {
+                                            id: command_id.clone(),
+                                            command: command.clone(),
+                                            user_id: cmd_req.user_id.clone(),
+                                        };
+                                        
+                                        let result = service.execute(Request::new(execute_request)).await;
+                                        
+                                        // Calculate execution time
+                                        let execution_time = cmd_start_time.elapsed();
+                                        
+                                        // Build response and update counters
+                                        let response = match result {
+                                            Ok(resp) => {
+                                                let exec_resp = resp.into_inner();
+                                                
+                                                // Increment success counter
+                                                *commands_executed.write().await += 1;
+                                                
+                                                info!(
+                                                    "Command {} executed successfully (time: {:?})",
+                                                    command_id,
+                                                    execution_time
+                                                );
+                                                
+                                                proto::CommandResponse {
+                                                    id: command_id.clone(),
+                                                    success: exec_resp.success,
+                                                    message: exec_resp.message,
+                                                    execution_time_ms: exec_resp.execution_time_ms,
+                                                    mouse_x: exec_resp.mouse_x,
+                                                    mouse_y: exec_resp.mouse_y,
+                                                    position_captured: exec_resp.position_captured,
+                                                    metadata: std::collections::HashMap::new(),
+                                                }
+                                            }
+                                            Err(e) => {
+                                                // Increment failure counter
+                                                *commands_failed.write().await += 1;
+                                                
+                                                error!(
+                                                    "Command {} failed: {} (time: {:?})",
+                                                    command_id,
+                                                    e,
+                                                    execution_time
+                                                );
+                                                
+                                                proto::CommandResponse {
+                                                    id: command_id.clone(),
+                                                    success: false,
+                                                    message: format!("Execution error: {}", e),
+                                                    execution_time_ms: execution_time.as_millis() as i64,
+                                                    mouse_x: None,
+                                                    mouse_y: None,
+                                                    position_captured: None,
+                                                    metadata: std::collections::HashMap::new(),
+                                                }
+                                            }
+                                        };
+                                        
+                                        // Send response back to server
+                                        let agent_msg = proto::AgentMessage {
+                                            connection_id: connection_id.clone(),
+                                            payload: Some(proto::agent_message::Payload::CommandResponse(response)),
+                                        };
+                                        
+                                        if agent_tx.send(agent_msg).await.is_err() {
+                                            error!("Failed to send command response, stream closed");
+                                            break;
+                                        }
+                                        
+                                        debug!("Sent command response for {}", command_id);
+                                    }
+                                    
+                                    Some(proto::server_message::Payload::Heartbeat(_heartbeat)) => {
+                                        debug!("Received heartbeat from server");
+                                        // Server is alive, no action needed
+                                    }
+                                    
+                                    Some(proto::server_message::Payload::Disconnect(notice)) => {
+                                        warn!("Server requested disconnect: {}", notice.reason);
+                                        break;
+                                    }
+                                    
+                                    Some(proto::server_message::Payload::ConfigUpdate(config)) => {
+                                        debug!("Received config update from server");
+                                        // Log the settings being updated
+                                        for (key, value) in config.settings.iter() {
+                                            debug!("Config update: {} = {}", key, value);
+                                        }
+                                        // Config updates can be implemented in the future if needed
+                                    }
+                                    
+                                    None => {
+                                        warn!("Received message with no payload");
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                info!("Server closed stream");
+                                break;
+                            }
+                            Err(e) => {
+                                error!("Stream error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Print final statistics on shutdown
+            let final_executed = *commands_executed.read().await;
+            let final_failed = *commands_failed.read().await;
+            let final_uptime = agent_start_time.elapsed();
+            
+            info!("═══════════════════════════════════════");
+            info!("Agent Shutdown Statistics");
+            info!("═══════════════════════════════════════");
+            info!("  Uptime: {:.2}h ({:.0}s)", 
+                final_uptime.as_secs_f64() / 3600.0,
+                final_uptime.as_secs_f64());
+            info!("  Commands executed: {}", final_executed);
+            info!("  Commands failed: {}", final_failed);
+            info!("  Success rate: {:.2}%", 
+                if final_executed + final_failed > 0 {
+                    (final_executed as f64 / (final_executed + final_failed) as f64) * 100.0
+                } else {
+                    0.0
+                });
+            info!("═══════════════════════════════════════");
+        }
+        Err(e) => {
+            error!("Failed to connect: {}", e);
+            return Err(e);
+        }
+    }
     
     Ok(())
 }

@@ -20,6 +20,7 @@ from controller.core.metrics import MetricsCollector
 from controller.os_specific.windows_actuation import WindowsActuation
 from controller.os_specific.macos_actuation import MacOSActuation
 from controller.os_specific.linux_actuation import LinuxActuation
+from controller.management.monitoring import monitoring
 from controller.utils.logger import setup_logger
 from controller.utils.validation import require_valid_host, require_valid_port, ValidationError
 
@@ -1317,36 +1318,44 @@ def server():
 @server.command(name='start')
 @click.option('--host', default='0.0.0.0', help='Host to bind to')
 @click.option('--port', default=50051, help='gRPC port')
-@click.option('--agent-host', default='127.0.0.1', help='Agent host address (IP of machine running agent)')
-@click.option('--agent-port', default=50052, type=int, help='Agent port (default: 50052)')
+@click.option('--single-agent/--multi-agent', default=True, help='Only allow one agent connection (default: single-agent)')
+@click.option('--network', help='Network identifier for this server')
 @click.option('--auth-url', help='OAuth2 authorization URL')
 @click.option('--token-url', help='OAuth2 token URL')
 @click.option('--client-id', help='OAuth2 client ID')
-def server_start(host, port, agent_host, agent_port, auth_url, token_url, client_id):
+def server_start(host, port, single_agent, network, auth_url, token_url, client_id):
     """Start the Rust gRPC server
     
-    The server listens for CLI connections on --host:--port and connects
-    to the agent at --agent-host:--agent-port.
+    The server listens for agent connections on --host:--port.
+    In single-agent mode (default), only one agent can connect at a time.
     
     Examples:
-        # Local agent (same machine)
+        # Start server (single-agent mode, default)
         control-center server start
         
-        # Remote agent (e.g., Windows VM)
-        control-center server start --agent-host 192.168.1.100
+        # Start server on specific network
+        control-center server start --network datacenter-east
         
-        # Custom ports
-        control-center server start --port 8080 --agent-host 192.168.1.100 --agent-port 9090
+        # Start server allowing multiple agents
+        control-center server start --multi-agent
+        
+        # Custom host and port
+        control-center server start --host 0.0.0.0 --port 8080
     """
     click.echo(f"[START] Starting Control Center Server (Rust) on {host}:{port}")
-    click.echo(f"[INFO] Will connect to agent at {agent_host}:{agent_port}")
+    click.echo(f"[INFO] Single-agent mode: {single_agent}")
+    
+    if network:
+        click.echo(f"[INFO] Network: {network}")
+    click.echo(f"[INFO] Ready to accept agent connections")
     
     # Build environment variables
     env = os.environ.copy()
     env['GRPC_HOST'] = host
     env['GRPC_PORT'] = str(port)
-    env['AGENT_HOST'] = agent_host
-    env['AGENT_PORT'] = str(agent_port)
+    env['SINGLE_AGENT_MODE'] = 'true' if single_agent else 'false'
+    if network:
+        env['CONTROL_CENTER_NETWORK'] = network
     
     if auth_url:
         env['OAUTH_AUTH_URL'] = auth_url
@@ -1417,6 +1426,8 @@ def agent_start(server_host, server_port, token):
     except Exception as e:
         click.echo(f"[ERROR] Failed to start agent: {e}", err=True)
         sys.exit(1)
+
+cli.add_command(monitoring, name='monitor')
 
 # Main entry point
 def main():

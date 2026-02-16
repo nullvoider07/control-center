@@ -1,14 +1,17 @@
 // crates/server/src/main.rs
 // gRPC Server with JWT Token Validation
 
-use tonic::{transport::Server, Request, Response, Status, Code, metadata::MetadataMap};
+use tonic::{transport::Server, Request, Response, Status, metadata::MetadataMap};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use std::collections::HashMap;
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use serde::{Deserialize, Serialize};
+mod identity;
+mod registry;
+mod monitoring;
+mod stream_handler;
 
 // Protobuf generated code
 mod proto {
@@ -18,8 +21,6 @@ mod proto {
 // Re-exporting for easier access
 use proto::{
     control_service_server::{ControlService, ControlServiceServer},
-    agent_service_client::AgentServiceClient,
-    *,
 };
 
 /// JWT Claims structure
@@ -71,6 +72,7 @@ impl RateLimiter {
     }
 
     // Cleanup old entries to prevent memory bloat
+    #[allow(dead_code)]
     fn cleanup_old_entries(&mut self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -85,18 +87,21 @@ impl RateLimiter {
 }
 
 /// Main service implementation
-pub struct ControlServiceImpl {
+pub struct ControlCenterService {
     jwt_secret: String,
     jwt_audience: String,
     jwt_issuer: String,
-    agent_client: Arc<RwLock<Option<AgentServiceClient<tonic::transport::Channel>>>>,
-    agent_info_cache: Arc<RwLock<Option<AgentInfo>>>,
-    rate_limiter: Arc<RwLock<RateLimiter>>,
-    metrics: Arc<RwLock<ServerMetrics>>,
+    registry: Arc<registry::ConnectionRegistry>,
+    server_identity: identity::ServerIdentityConfig,
+    monitoring: Arc<monitoring::MonitoringHandler>,
+    stream_handler: Arc<stream_handler::StreamHandler>,
+    listen_address: String,
+    rate_limiter: Arc<tokio::sync::RwLock<RateLimiter>>,
+    metrics: Arc<tokio::sync::RwLock<ServerMetrics>>,
 }
 
 // Metrics structure for monitoring server performance and security
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ServerMetrics {
     total_requests: u64,
     successful_requests: u64,
@@ -105,74 +110,33 @@ struct ServerMetrics {
     rate_limit_hits: u64,
 }
 
-// Implementation of the ControlService
-impl ControlServiceImpl {
-    pub fn new(jwt_secret: String, jwt_audience: String, jwt_issuer: String) -> Self {
+// Associated functions for ControlCenterService
+impl ControlCenterService {
+    pub fn new(
+        jwt_secret: String,
+        jwt_audience: String,
+        jwt_issuer: String,
+        registry: Arc<registry::ConnectionRegistry>,
+        server_identity: identity::ServerIdentityConfig,
+        monitoring: Arc<monitoring::MonitoringHandler>,
+        stream_handler: Arc<stream_handler::StreamHandler>,
+        listen_address: String,
+    ) -> Self {
         Self {
             jwt_secret,
             jwt_audience,
             jwt_issuer,
-            agent_client: Arc::new(RwLock::new(None)),
-            agent_info_cache: Arc::new(RwLock::new(None)),
-            rate_limiter: Arc::new(RwLock::new(RateLimiter::new(100, 60))), // 100 req/min
-            metrics: Arc::new(RwLock::new(ServerMetrics::default())),
+            registry,
+            server_identity,
+            monitoring,
+            stream_handler,
+            listen_address,
+            rate_limiter: Arc::new(tokio::sync::RwLock::new(RateLimiter::new(100, 60))),
+            metrics: Arc::new(tokio::sync::RwLock::new(ServerMetrics::default())),
         }
     }
-
-    // Connect to the agent with retries and exponential backoff
-    async fn connect_to_agent(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let agent_host = std::env::var("AGENT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let agent_port = std::env::var("AGENT_PORT").unwrap_or_else(|_| "50052".to_string());
-        let agent_url = format!("http://{}:{}", agent_host, agent_port);
-
-        info!("Attempting to connect to agent at {}...", agent_url);
-
-        let max_retries = 5;
-        let mut retry_count = 0;
-
-        while retry_count < max_retries {
-            match AgentServiceClient::connect(agent_url.clone()).await {
-                Ok(client) => {
-                    info!("Successfully connected to agent");
-                    
-                    // Get agent info
-                    let mut client_clone = client.clone();
-                    match client_clone.get_info(InfoRequest {}).await {
-                        Ok(response) => {
-                            let agent_info = response.into_inner();
-                            info!(
-                                "Agent info: OS={:?}, Version={}",
-                                OsType::try_from(agent_info.os).ok(),
-                                agent_info.os_version
-                            );
-
-                            *self.agent_client.write().await = Some(client);
-                            *self.agent_info_cache.write().await = Some(agent_info);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            error!("Failed to get agent info: {}", e);
-                            return Err(Box::new(e));
-                        }
-                    }
-                }
-                Err(e) => {
-                    retry_count += 1;
-                    warn!("Failed to connect to agent (attempt {}/{}): {}", retry_count, max_retries, e);
-                    
-                    if retry_count < max_retries {
-                        // Exponential backoff: 2^retry_count seconds
-                        let wait_time = 2_u64.pow(retry_count);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(wait_time)).await;
-                    }
-                }
-            }
-        }
-
-        Err("Failed to connect to agent after maximum retries".into())
-    }
-
-    /// Extract and validate JWT token from metadata
+    
+    /// Validate JWT token from metadata
     async fn validate_token(&self, metadata: &MetadataMap) -> Result<Claims, Status> {
         // Extract Authorization header
         let auth_header = metadata
@@ -207,21 +171,14 @@ impl ControlServiceImpl {
         ) {
             Ok(data) => data,
             Err(e) => {
-                // Track authentication failure
-                let mut metrics = self.metrics.write().await;
-                metrics.auth_failures += 1;
-                
                 warn!("JWT validation failed: {}", e);
                 return Err(Status::unauthenticated(format!("Invalid token: {}", e)));
             }
         };
-        
 
         info!("Token validated for user: {}", token_data.claims.sub);
         Ok(token_data.claims)
     }
-
-    // Check rate limit for the user and record metrics
     async fn check_rate_limit(&self, user_id: &str) -> Result<(), Status> {
         let mut limiter = self.rate_limiter.write().await;
         
@@ -231,7 +188,7 @@ impl ControlServiceImpl {
             
             warn!("Rate limit exceeded for user: {}", user_id);
             return Err(Status::new(
-                Code::ResourceExhausted,
+                tonic::Code::ResourceExhausted,
                 "Rate limit exceeded. Please try again later.",
             ));
         }
@@ -240,207 +197,349 @@ impl ControlServiceImpl {
     }
 }
 
-// Implementing the gRPC service methods
+// Implementation of the ControlService trait
 #[tonic::async_trait]
-impl ControlService for ControlServiceImpl {
-    async fn get_agent_info(
+impl ControlService for ControlCenterService {
+    async fn register_agent(
         &self,
-        request: Request<AgentInfoRequest>,
-    ) -> Result<Response<AgentInfo>, Status> {
-        // Validate token from metadata
-        let claims = self.validate_token(request.metadata()).await?;
+        request: Request<proto::RegistrationRequest>,
+    ) -> Result<Response<proto::RegistrationResponse>, Status> {
+        let registration_req = request.into_inner();
         
-        // Check rate limit
-        self.check_rate_limit(&claims.sub).await?;
-
-        let info = self.agent_info_cache.read().await.clone()
-            .ok_or_else(|| Status::internal("Agent info not available"))?;
-
-        let mut metrics = self.metrics.write().await;
-        metrics.total_requests += 1;
-        metrics.successful_requests += 1;
-
-        info!("Agent info requested by user: {}", claims.sub);
-
-        Ok(Response::new(info))
-    }
-
-    // Execute command with validation, rate limiting, and metrics
-    async fn execute_command(
-        &self,
-        request: Request<CommandRequest>,
-    ) -> Result<Response<CommandResponse>, Status> {
-        // Validate token from metadata
-        let claims = self.validate_token(request.metadata()).await?;
+        let agent_identity = registration_req.agent_identity
+            .ok_or_else(|| Status::invalid_argument("Agent identity required"))?;
         
-        // Check rate limit
-        self.check_rate_limit(&claims.sub).await?;
-
-        let req = request.into_inner();
-
-        // Validate command
-        if req.command.is_empty() {
-            return Err(Status::invalid_argument("Command cannot be empty"));
-        }
-
-        if req.command.len() > 10000 {
-            return Err(Status::invalid_argument("Command too long"));
-        }
-
-        // Record metrics
-        let mut metrics = self.metrics.write().await;
-        metrics.total_requests += 1;
-
-        // Forward to agent
-        let mut client = self.agent_client.write().await;
-        let agent_client = client.as_mut()
-            .ok_or_else(|| Status::internal("Agent not connected"))?;
-
-        let execute_req = ExecuteRequest {
-            id: req.id.clone(),
-            command: req.command.clone(),
-            user_id: Some(claims.sub.clone()),  // Pass user ID for auditing
-        };
-
-        match agent_client.execute(execute_req).await {
-            Ok(response) => {
-                let exec_response = response.into_inner();
-                metrics.successful_requests += 1;
-
-                info!(
-                    "Command executed: user={}, id={}, time={}ms",
-                    claims.sub, exec_response.id, exec_response.execution_time_ms
+        info!(
+            "Agent registration request: {} (Hostname: {}, IP: {})",
+            agent_identity.agent_id,
+            agent_identity.hostname,
+            agent_identity.ip_address
+        );
+        
+        // Generate connection ID
+        let connection_id = format!("conn-{}", uuid::Uuid::new_v4());
+        
+        // Register in registry (1:1 enforcement here)
+        match self.registry.register_agent(
+            &agent_identity,
+            connection_id.clone(),
+            agent_identity.ip_address.clone()
+        ).await {
+            Ok(_) => {
+                let server_identity = identity::build_server_identity(
+                    &self.server_identity,
+                    self.listen_address.clone(),
+                    env!("CARGO_PKG_VERSION").to_string(),
                 );
-
-                Ok(Response::new(CommandResponse {
-                    id: exec_response.id,
-                    success: exec_response.success,
-                    message: exec_response.message,
-                    execution_time_ms: exec_response.execution_time_ms,
-                    mouse_x: exec_response.mouse_x,
-                    mouse_y: exec_response.mouse_y,
-                    position_captured: exec_response.position_captured,
+                
+                Ok(Response::new(proto::RegistrationResponse {
+                    success: true,
+                    message: "Agent registered successfully".to_string(),
+                    connection_id,
+                    server_identity: Some(server_identity),
+                    connection_metadata: None,
                 }))
             }
             Err(e) => {
-                metrics.failed_requests += 1;
-                error!("Command execution failed for user {}: {}", claims.sub, e);
-                Err(Status::internal(format!("Command execution failed: {}", e)))
+                Err(Status::resource_exhausted(e))
             }
         }
     }
-
-    // Stream command execution results with validation, rate limiting, and metrics
-    type ExecuteCommandStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<CommandResponse, Status>
-    >;
-
-    // This method allows clients to send a stream of commands and receive a stream of responses
-    async fn execute_command_stream(
+    
+    /// Agent stream (bidirectional)
+    type AgentStreamStream = tokio_stream::wrappers::ReceiverStream<Result<proto::ServerMessage, Status>>;
+    
+    async fn agent_stream(
         &self,
-        request: Request<tonic::Streaming<CommandRequest>>,
-    ) -> Result<Response<Self::ExecuteCommandStreamStream>, Status> {
-        // Validate token from metadata
-        let claims = self.validate_token(request.metadata()).await?;
+        request: Request<tonic::Streaming<proto::AgentMessage>>,
+    ) -> Result<Response<Self::AgentStreamStream>, Status> {
+        info!("Agent stream connection received");
         
-        let user_id = claims.sub.clone();
-        let mut stream = request.into_inner();
-        let agent_client = self.agent_client.clone();
-        let rate_limiter = self.rate_limiter.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-        tokio::spawn(async move {
-            while let Some(result) = stream.message().await.transpose() {
-                match result {
-                    Ok(req) => {
-                        // Check rate limit
-                        let mut limiter = rate_limiter.write().await;
-                        if !limiter.check_rate_limit(&user_id) {
-                            let _ = tx.send(Err(Status::resource_exhausted("Rate limit exceeded"))).await;
-                            break;
-                        }
-                        drop(limiter);
-
-                        let mut client = agent_client.write().await;
-                        if let Some(agent) = client.as_mut() {
-                            let exec_req = ExecuteRequest {
-                                id: req.id.clone(),
-                                command: req.command,
-                                user_id: Some(user_id.clone()),
-                            };
-
-                            match agent.execute(exec_req).await {
-                                Ok(response) => {
-                                    let exec_response = response.into_inner();
-                                    let _ = tx.send(Ok(CommandResponse {
-                                        id: exec_response.id,
-                                        success: exec_response.success,
-                                        message: exec_response.message,
-                                        execution_time_ms: exec_response.execution_time_ms,
-                                        mouse_x: exec_response.mouse_x,
-                                        mouse_y: exec_response.mouse_y,
-                                        position_captured: exec_response.position_captured,
-                                    })).await;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        break;
-                    }
+        // Get agent stream from request
+        let agent_stream = request.into_inner();
+        
+        // Get the current connection (we're in single-agent mode)
+        let connection_id = {
+            let current = self.registry.get_current_connection().await;
+            match current {
+                Some(agent) => agent.connection_id.clone(),
+                None => {
+                    return Err(Status::failed_precondition("No agent registered"));
                 }
             }
-        });
-
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        };
+        
+        info!("Starting bidirectional stream for connection: {}", connection_id);
+        
+        // Handle the stream
+        let response_stream = self.stream_handler
+            .handle_agent_stream(connection_id, agent_stream)
+            .await?;
+        
+        info!("Bidirectional stream established successfully");
+        
+        Ok(Response::new(response_stream))
     }
-
-    // Monitor connection status with validation, rate limiting, and metrics
-    type MonitorConnectionStream = tokio_stream::wrappers::ReceiverStream<
-        Result<ConnectionStatus, Status>
-    >;
-
-    // This method allows clients to receive real-time updates about the connection status to the agent
-    async fn monitor_connection(
+    
+    /// Query connections (monitoring API)
+    async fn query_connections(
         &self,
-        request: Request<MonitorRequest>,
-    ) -> Result<Response<Self::MonitorConnectionStream>, Status> {
-        // Validate token from metadata
+        request: Request<proto::ConnectionQuery>,
+    ) -> Result<Response<proto::ConnectionStatusResponse>, Status> {
+        self.monitoring.handle_connection_query(request).await
+    }
+    
+    /// Query servers (monitoring API)
+    async fn query_servers(
+        &self,
+        request: Request<proto::ServerStatusQuery>,
+    ) -> Result<Response<proto::ServerStatusResponse>, Status> {
+        self.monitoring.handle_server_status_query(request).await
+    }
+    
+    /// Get server identity
+    async fn get_server_identity(
+        &self,
+        _request: Request<proto::InfoRequest>,
+    ) -> Result<Response<proto::ServerIdentity>, Status> {
+        let server_identity = identity::build_server_identity(
+            &self.server_identity,
+            "0.0.0.0:50051".to_string(), // TODO: Get actual listen address
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        
+        Ok(Response::new(server_identity))
+    }
+    
+    /// Legacy execute (compatibility)
+    async fn execute(
+        &self,
+        request: Request<proto::ExecuteRequest>,
+    ) -> Result<Response<proto::ExecuteResponse>, Status> {
+        // Clone metadata before consuming request
+        let metadata = request.metadata().clone();
+        let claims = self.validate_token(&metadata).await?;
+        self.check_rate_limit(&claims.sub).await?;
+        
+        // Convert ExecuteRequest to CommandRequest and call execute_command
+        let exec_req = request.into_inner();
+        
+        let cmd_request = proto::CommandRequest {
+            id: exec_req.id.clone(),
+            command: exec_req.command,
+            user_id: Some(exec_req.user_id.clone().unwrap_or_else(|| claims.sub.clone())),
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+
+        let mut new_request = Request::new(cmd_request);
+        *new_request.metadata_mut() = metadata;
+        
+        let cmd_response = self.execute_command(new_request).await?;
+        let response = cmd_response.into_inner();
+        
+        Ok(Response::new(proto::ExecuteResponse {
+            id: response.id,
+            success: response.success,
+            message: response.message,
+            execution_time_ms: response.execution_time_ms,
+            mouse_x: response.mouse_x,
+            mouse_y: response.mouse_y,
+            position_captured: response.position_captured,
+        }))
+    }
+    
+    /// Ping (health check)
+    async fn ping(
+        &self,
+        _request: Request<proto::PingRequest>,
+    ) -> Result<Response<proto::PongResponse>, Status> {
+        Ok(Response::new(proto::PongResponse {
+            alive: true,
+        }))
+    }
+    
+    /// Get agent info
+    async fn get_agent_info(
+        &self,
+        request: Request<proto::AgentInfoRequest>,
+    ) -> Result<Response<proto::AgentInfo>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        self.check_rate_limit(&claims.sub).await?;
+        self.registry.get_current_connection().await
+            .ok_or_else(|| Status::unavailable("No agent connected"))?;
+        let mut metrics = self.metrics.write().await;
+        metrics.total_requests += 1;
+        metrics.successful_requests += 1;
+        
+        info!("Agent info requested by user: {}", claims.sub);
+        
+        Ok(Response::new(proto::AgentInfo {
+            os: proto::OsType::Linux as i32,
+            os_version: String::from("Unknown"),
+            capabilities: vec![],
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        }))
+    }
+    
+    /// Execute command - forward to agent via bidirectional stream
+    async fn execute_command(
+        &self,
+        request: Request<proto::CommandRequest>,
+    ) -> Result<Response<proto::CommandResponse>, Status> {
+        
+        // Validate JWT token
+        let start_time = std::time::Instant::now();
         let claims = self.validate_token(request.metadata()).await?;
 
-        let agent_client = self.agent_client.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        self.check_rate_limit(&claims.sub).await?;
+        
+        // Check if agent is connected
+        if !self.registry.is_agent_connected().await {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_requests += 1;
+            metrics.failed_requests += 1;
+            return Err(Status::unavailable("No agent connected to server"));
+        }
+        
+        let cmd_req = request.into_inner();
+        let command_id = cmd_req.id.clone();
+        let command = cmd_req.command.clone();
+        
+        info!(
+            "Executing command {} via agent: {}",
+            command_id,
+            command
+        );
+        
+        // Queue command and wait for response
+        let response = self.stream_handler.queue_command(cmd_req).await;
+        let execution_time = start_time.elapsed();
+        let mut metrics = self.metrics.write().await;
+        metrics.total_requests += 1;
 
-        info!("Connection monitoring started for user: {}", claims.sub);
-
+        match &response {
+            Ok(resp) => {
+                if resp.success {
+                    metrics.successful_requests += 1;
+                    info!(
+                        "Command {} executed successfully via agent: {} (time: {:?}, user: {})",
+                        command_id,
+                        command,
+                        execution_time,
+                        claims.sub
+                    );
+                } else {
+                    metrics.failed_requests += 1;
+                }
+            }
+            Err(e) => {
+                metrics.failed_requests += 1;
+                warn!(
+                    "Command {} failed (error: {}, time: {:?}, user: {})",
+                    command_id,
+                    e,
+                    execution_time,
+                    claims.sub
+                );
+            }
+        }
+        
+        Ok(Response::new(response?))
+    }
+    
+    /// Monitor connection status stream
+    type MonitorConnectionStream = tokio_stream::wrappers::ReceiverStream<
+        Result<proto::ConnectionStatus, Status>
+    >;
+    
+    async fn monitor_connection(
+        &self,
+        request: Request<proto::MonitorRequest>,
+    ) -> Result<Response<Self::MonitorConnectionStream>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        self.check_rate_limit(&claims.sub).await?;
+        let registry = self.registry.clone();
+        info!("Connection monitoring started by user: {}", claims.sub);
+        
+        info!("Connection monitoring started");
+        
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-                let client = agent_client.read().await;
-                let connected = client.is_some();
-
-                let status = ConnectionStatus {
+                
+                let connected = registry.is_agent_connected().await;
+                
+                let status = proto::ConnectionStatus {
                     connected,
                     message: if connected {
                         "Connected to agent".to_string()
                     } else {
-                        "Disconnected from agent".to_string()
+                        "No agent connected".to_string()
                     },
                     timestamp: chrono::Utc::now().timestamp(),
                 };
-
+                
                 if tx.send(Ok(status)).await.is_err() {
                     break;
                 }
             }
         });
-
+        
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+        async fn get_metrics(
+        &self,
+        request: Request<proto::MetricsRequest>,
+    ) -> Result<Response<proto::MetricsResponse>, Status> {
+        // Phase 3: Validate JWT (admin only)
+        let claims = self.validate_token(request.metadata()).await?;
+        
+        // Check if user has metrics scope
+        if !claims.scopes.contains(&"metrics".to_string()) {
+            return Err(Status::permission_denied(
+                "User does not have permission to view metrics"
+            ));
+        }
+        
+        info!("Metrics requested by user: {}", claims.sub);
+        
+        let metrics = self.metrics.read().await.clone();
+        
+        // Build Prometheus-style metrics response
+        let metrics_text = format!(
+            "# HELP control_center_requests_total Total number of requests\n\
+             # TYPE control_center_requests_total counter\n\
+             control_center_requests_total {}\n\
+             \n\
+             # HELP control_center_requests_success Successful requests\n\
+             # TYPE control_center_requests_success counter\n\
+             control_center_requests_success {}\n\
+             \n\
+             # HELP control_center_requests_failed Failed requests\n\
+             # TYPE control_center_requests_failed counter\n\
+             control_center_requests_failed {}\n\
+             \n\
+             # HELP control_center_auth_failures Authentication failures\n\
+             # TYPE control_center_auth_failures counter\n\
+             control_center_auth_failures {}\n\
+             \n\
+             # HELP control_center_rate_limit_hits Rate limit violations\n\
+             # TYPE control_center_rate_limit_hits counter\n\
+             control_center_rate_limit_hits {}\n",
+            metrics.total_requests,
+            metrics.successful_requests,
+            metrics.failed_requests,
+            metrics.auth_failures,
+            metrics.rate_limit_hits,
+        );
+        
+        Ok(Response::new(proto::MetricsResponse {
+            metrics: metrics_text,
+            timestamp: chrono::Utc::now().timestamp(),
+        }))
     }
 }
 
@@ -474,28 +573,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("JWT Audience: {}", jwt_audience);
     info!("JWT Issuer: {}", jwt_issuer);
 
-    let service = ControlServiceImpl::new(jwt_secret, jwt_audience, jwt_issuer);
+    let server_identity = identity::load_or_generate_identity();
+    info!("Server ID: {}", server_identity.server_id);
+    info!("Network: {}", server_identity.network);
 
-    // Connect to agent with retries
-    service.connect_to_agent().await?;
+    // Create connection registry (single-agent mode by default)
+    let single_agent_mode = std::env::var("SINGLE_AGENT_MODE")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .unwrap_or(true);
 
-    // Spawn background task for cleanup
-    let rate_limiter = service.rate_limiter.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Every hour
-        loop {
-            interval.tick().await;
-            rate_limiter.write().await.cleanup_old_entries();
-            info!("Cleaned up old rate limit entries");
-        }
-    });
+    let registry = Arc::new(registry::ConnectionRegistry::new(single_agent_mode, 100));
 
-    // Start gRPC server
-    let addr = std::env::var("SERVER_ADDR")
+    // Create monitoring handler
+    let monitoring_handler = Arc::new(monitoring::MonitoringHandler::new(
+        registry.clone(),
+        server_identity.clone(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    ));
+
+    // Create stream handler (Phase 2)
+    let stream_handler = Arc::new(stream_handler::StreamHandler::new(
+        registry.clone(),
+        server_identity.server_id.clone(),
+    ));
+
+    let addr: std::net::SocketAddr = std::env::var("SERVER_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".to_string())
         .parse()?;
 
-    info!("Server listening on {}", addr);
+    let listen_address = addr.to_string();
+    info!("Server will listen on {}", addr);
+
+    // Create service
+    let service = ControlCenterService::new(
+        jwt_secret.clone(),
+        jwt_audience.clone(),
+        jwt_issuer.clone(),
+        registry,
+        server_identity,
+        monitoring_handler,
+        stream_handler,
+        listen_address,
+    );
+
+    info!("Server will listen on {}", addr);
     info!("Ready to accept authenticated requests");
 
     Server::builder()

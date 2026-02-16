@@ -1,0 +1,3 @@
+[[bin]]
+name = "generate-token"
+path = "tools/generate_token.rs"
