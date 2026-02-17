@@ -241,7 +241,7 @@ class GRPCClient:
         try:
             if self.channel:
                 state = self.channel.get_state(try_to_connect=True) # type: ignore[attr-defined]
-                return state == grpc.ChannelConnectivity.READY
+                return state in (grpc.ChannelConnectivity.READY, grpc.ChannelConnectivity.IDLE)
         except:
             return False
         

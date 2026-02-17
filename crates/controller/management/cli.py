@@ -230,7 +230,7 @@ def _print_banner(agent_info: dict):
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                   Control Center - Interactive Mode                  ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║ Connected to: {agent_info['os_type']} {agent_info['os_version']:<38}           ║
+║ Connected to: {agent_info['os_type']} {agent_info['os_version']:<38}         ║
 ║ Agent Version: {agent_info['agent_version']:<43}           ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║ Commands:                                                            ║
