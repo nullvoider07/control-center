@@ -147,6 +147,7 @@ class GRPCClient:
             # Create channel
             self.channel = self._create_channel()
             self.stub = control_center_pb2_grpc.ControlServiceStub(self.channel)
+            self.agent_info = None
             
             # Test connection with timeout
             try:

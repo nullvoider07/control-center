@@ -169,20 +169,6 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
         
-        # Connect and get agent info
-        try:
-            if not ctx.client.connect():
-                logger.error("Connection failed")
-                sys.exit(1)
-        except AuthenticationError as e:
-            logger.error(f"Authentication failed: {e}")
-            click.echo("\nAuthentication failed. Please check your API token.", err=True)
-            sys.exit(1)
-        except ConnectionError as e:
-            logger.error(f"Connection error: {e}")
-            click.echo(f"\n{e.suggest_action()}", err=True)
-            sys.exit(1)
-        
         logger.info("✓ Connected and authenticated")
         
         # Get agent info
@@ -242,10 +228,10 @@ def _print_banner(agent_info: dict):
     """Print connection banner"""
     banner = f"""
 ╔══════════════════════════════════════════════════════════════════════╗
-║          Control Center - Interactive Mode                           ║
+║                   Control Center - Interactive Mode                  ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║ Connected to: {agent_info['os_type']} {agent_info['os_version']:<38} ║
-║ Agent Version: {agent_info['agent_version']:<43}                     ║
+║ Connected to: {agent_info['os_type']} {agent_info['os_version']:<38}           ║
+║ Agent Version: {agent_info['agent_version']:<43}           ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║ Commands:                                                            ║
 ║   help                  - Show available commands                    ║

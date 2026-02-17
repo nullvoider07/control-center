@@ -365,7 +365,7 @@ impl ControlService for ControlCenterService {
     ) -> Result<Response<proto::AgentInfo>, Status> {
         let claims = self.validate_token(request.metadata()).await?;
         self.check_rate_limit(&claims.sub).await?;
-        self.registry.get_current_connection().await
+        let agent = self.registry.get_current_connection().await
             .ok_or_else(|| Status::unavailable("No agent connected"))?;
         let mut metrics = self.metrics.write().await;
         metrics.total_requests += 1;
@@ -374,10 +374,10 @@ impl ControlService for ControlCenterService {
         info!("Agent info requested by user: {}", claims.sub);
         
         Ok(Response::new(proto::AgentInfo {
-            os: proto::OsType::Linux as i32,
-            os_version: String::from("Unknown"),
-            capabilities: vec![],
-            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            os: agent.os_type,
+            os_version: agent.os_version.clone(),
+            capabilities: agent.capabilities.clone(),
+            agent_version: agent.agent_version.clone(),
         }))
     }
     
