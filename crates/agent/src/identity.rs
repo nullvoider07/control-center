@@ -108,7 +108,7 @@ pub fn build_agent_identity(
 /// Get Windows computer name
 #[cfg(target_os = "windows")]
 fn get_windows_computer_name() -> Option<String> {
-    use winapi::um::sysinfoapi::GetComputerNameW;
+    use winapi::um::winbase::GetComputerNameW;
     use winapi::shared::minwindef::DWORD;
     
     let mut size: DWORD = 0;
