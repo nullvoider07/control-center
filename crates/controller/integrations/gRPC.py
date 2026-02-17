@@ -234,18 +234,18 @@ class GRPCClient:
     # Public method to check if client is connected and token is valid
     def is_connected(self) -> bool:
         """Check if client is connected"""
-        if not self._connected or not self.token:
+        if not self._connected or not self.token or not self.stub or not self.channel:
             return False
         
         # Check if connection is still alive
         try:
-            if self.channel:
-                state = self.channel.get_state(try_to_connect=True) # type: ignore[attr-defined]
-                return state in (grpc.ChannelConnectivity.READY, grpc.ChannelConnectivity.IDLE)
+            state = self.channel.get_state(try_to_connect=False)
+            if state == grpc.ChannelConnectivity.SHUTDOWN:
+                self._connected = False
+                return False
+            return True
         except:
-            return False
-        
-        return True
+            return self._connected
     
     # Public method to get agent information (OS, version, capabilities)
     def get_agent_info(self) -> Optional[Dict]:

@@ -190,6 +190,7 @@ class Session:
     def record_reconnection_success(self):
         """Record successful reconnection"""
         self.reconnection_attempts = 0
+        self.last_reconnection_attempt = 0
         self.state = ConnectionState.CONNECTED
         self.health_check_failures = 0
         self._log_event("reconnection_success", "Reconnected successfully")

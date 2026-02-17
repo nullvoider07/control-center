@@ -278,7 +278,9 @@ def _interactive_mode(controller):
                     break
             
                 if ctx.session and ctx.session.should_attempt_reconnection():
-                    click.echo(f"\n[!] Connection lost. Reconnection attempt {ctx.session.reconnection_attempts + 1}/{ctx.session.max_reconnection_attempts}...", err=True)
+                    click.echo(f"\n[!] Connection lost. Reconnection attempt "
+                               f"{ctx.session.reconnection_attempts + 1}/"
+                               f"{ctx.session.max_reconnection_attempts}...", err=True)
                     ctx.session.record_reconnection_attempt()
                     
                     try:
@@ -289,8 +291,15 @@ def _interactive_mode(controller):
                             continue
                     except Exception as e:
                         logger.warning(f"Reconnection failed: {e}")
+                    continue
+                elif ctx.session and not ctx.session.should_attempt_reconnection():
+                    if ctx.session.reconnection_attempts >= ctx.session.max_reconnection_attempts:
+                        click.echo("\n[!] Max reconnection attempts reached.", err=True)
+                    else:
+                        import time
+                        time.sleep(1)
+                        continue
                 elif not ctx.session:
-                    # No session tracking - show simple message and try once
                     click.echo("\n[!] Connection lost. Attempting to reconnect...", err=True)
                     try:
                         if ctx.client.connect():
