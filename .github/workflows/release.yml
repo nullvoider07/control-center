@@ -75,13 +75,12 @@ jobs:
         run: |
           mkdir -p package/bin
           
-          # Copy BOTH Rust binaries
           cp target/release/control-center-server package/bin/
           cp target/release/control-center-agent package/bin/
+          cp target/release/generate-token package/bin/
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
-          # Create unified installation script
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
@@ -90,19 +89,22 @@ jobs:
           echo "=========================================="
           echo ""
           
-          # Install Rust binaries
           echo "[1/2] Installing Rust binaries..."
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/generate-token "$HOME/.local/bin/"
           cp bin/control-center "$HOME/.local/bin/"
-          chmod +x "$HOME/.local/bin/control-center-"*
-          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
-          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo "  ✓ CLI: $HOME/.local/bin/control-center"
+          chmod +x "$HOME/.local/bin/control-center-server"
+          chmod +x "$HOME/.local/bin/control-center-agent"
+          chmod +x "$HOME/.local/bin/generate-token"
+          chmod +x "$HOME/.local/bin/control-center"
+          echo "  ✓ Server:          $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:           $HOME/.local/bin/control-center-agent"
+          echo "  ✓ Token generator: $HOME/.local/bin/generate-token"
+          echo "  ✓ CLI:             $HOME/.local/bin/control-center"
           echo ""
           
-          # Check PATH
           if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
               echo "⚠ Add to your PATH:"
               echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
@@ -115,15 +117,16 @@ jobs:
           echo "=========================================="
           echo ""
           echo "Usage:"
-          echo "  control-center server start    # Start server"
-          echo "  control-center agent start     # Start agent"
+          echo "  export JWT_SECRET=\"your-secret-32-chars-minimum\""
+          echo "  generate-token admin"
+          echo "  control-center server start"
+          echo "  control-center agent start"
           echo "  control-center connect --host X --token Y"
           echo "  control-center --help"
           echo ""
           EOF
           chmod +x package/install.sh
           
-          # Create tarball
           cd package
           tar -czvf ../control-center-${{ steps.version.outputs.VERSION }}-linux-x64.tar.gz .
 
@@ -195,13 +198,12 @@ jobs:
         run: |
           mkdir -p package/bin
           
-          # Copy ARM64 Rust binaries
           cp target/aarch64-unknown-linux-gnu/release/control-center-server package/bin/
           cp target/aarch64-unknown-linux-gnu/release/control-center-agent package/bin/
+          cp target/aarch64-unknown-linux-gnu/release/generate-token package/bin/
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
-          # Create installation script (same as x64)
           cat > package/install.sh << 'EOF'
           #!/bin/bash
           set -e
@@ -214,17 +216,23 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/generate-token "$HOME/.local/bin/"
           cp bin/control-center "$HOME/.local/bin/"
-          chmod +x "$HOME/.local/bin/control-center-"*
-          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
-          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo "  ✓ CLI: $HOME/.local/bin/control-center"
+          chmod +x "$HOME/.local/bin/control-center-server"
+          chmod +x "$HOME/.local/bin/control-center-agent"
+          chmod +x "$HOME/.local/bin/generate-token"
+          chmod +x "$HOME/.local/bin/control-center"
+          echo "  ✓ Server:          $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:           $HOME/.local/bin/control-center-agent"
+          echo "  ✓ Token generator: $HOME/.local/bin/generate-token"
+          echo "  ✓ CLI:             $HOME/.local/bin/control-center"
           echo ""
           
           if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
               echo "⚠ Add to your PATH:"
               echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
               echo ""
+              echo "  Add this to your ~/.bashrc or ~/.zshrc"
           fi
           
           echo "=========================================="
@@ -232,9 +240,12 @@ jobs:
           echo "=========================================="
           echo ""
           echo "Usage:"
+          echo "  export JWT_SECRET=\"your-secret-32-chars-minimum\""
+          echo "  generate-token admin"
           echo "  control-center server start"
           echo "  control-center agent start"
           echo "  control-center connect --host X --token Y"
+          echo "  control-center --help"
           echo ""
           EOF
           chmod +x package/install.sh
@@ -310,6 +321,7 @@ jobs:
           
           cp target/release/control-center-server package/bin/
           cp target/release/control-center-agent package/bin/
+          cp target/release/generate-token package/bin/
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
@@ -325,16 +337,23 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/generate-token "$HOME/.local/bin/"
           cp bin/control-center "$HOME/.local/bin/"
-          chmod +x "$HOME/.local/bin/control-center-"*
+          chmod +x "$HOME/.local/bin/control-center-server"
+          chmod +x "$HOME/.local/bin/control-center-agent"
+          chmod +x "$HOME/.local/bin/generate-token"
+          chmod +x "$HOME/.local/bin/control-center"
           
           # Remove quarantine on macOS
           xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-server" 2>/dev/null || true
           xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-agent" 2>/dev/null || true
+          xattr -d com.apple.quarantine "$HOME/.local/bin/generate-token" 2>/dev/null || true
+          xattr -d com.apple.quarantine "$HOME/.local/bin/control-center" 2>/dev/null || true
           
-          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
-          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo "  ✓ CLI: $HOME/.local/bin/control-center"
+          echo "  ✓ Server:          $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:           $HOME/.local/bin/control-center-agent"
+          echo "  ✓ Token generator: $HOME/.local/bin/generate-token"
+          echo "  ✓ CLI:             $HOME/.local/bin/control-center"
           echo ""
           
           if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
@@ -346,6 +365,15 @@ jobs:
           echo "=========================================="
           echo "✓ Installation complete!"
           echo "=========================================="
+          echo ""
+          echo "Usage:"
+          echo "  export JWT_SECRET=\"your-secret-32-chars-minimum\""
+          echo "  generate-token admin"
+          echo "  control-center server start"
+          echo "  control-center agent start"
+          echo "  control-center connect --host X --token Y"
+          echo "  control-center --help"
+          echo ""
           EOF
           chmod +x package/install.sh
           
@@ -420,6 +448,7 @@ jobs:
           
           cp target/release/control-center-server package/bin/
           cp target/release/control-center-agent package/bin/
+          cp target/release/generate-token package/bin/
           cp dist/control-center package/bin/
           chmod +x package/bin/*
           
@@ -435,20 +464,43 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           cp bin/control-center-server "$HOME/.local/bin/"
           cp bin/control-center-agent "$HOME/.local/bin/"
+          cp bin/generate-token "$HOME/.local/bin/"
           cp bin/control-center "$HOME/.local/bin/"
-          chmod +x "$HOME/.local/bin/control-center-"*
+          chmod +x "$HOME/.local/bin/control-center-server"
+          chmod +x "$HOME/.local/bin/control-center-agent"
+          chmod +x "$HOME/.local/bin/generate-token"
+          chmod +x "$HOME/.local/bin/control-center"
           
+          # Remove quarantine on macOS
           xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-server" 2>/dev/null || true
           xattr -d com.apple.quarantine "$HOME/.local/bin/control-center-agent" 2>/dev/null || true
+          xattr -d com.apple.quarantine "$HOME/.local/bin/generate-token" 2>/dev/null || true
+          xattr -d com.apple.quarantine "$HOME/.local/bin/control-center" 2>/dev/null || true
           
-          echo "  ✓ Server: $HOME/.local/bin/control-center-server"
-          echo "  ✓ Agent:  $HOME/.local/bin/control-center-agent"
-          echo "  ✓ CLI: $HOME/.local/bin/control-center"
+          echo "  ✓ Server:          $HOME/.local/bin/control-center-server"
+          echo "  ✓ Agent:           $HOME/.local/bin/control-center-agent"
+          echo "  ✓ Token generator: $HOME/.local/bin/generate-token"
+          echo "  ✓ CLI:             $HOME/.local/bin/control-center"
           echo ""
+          
+          if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+              echo "⚠ Add to your PATH:"
+              echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+              echo ""
+          fi
           
           echo "=========================================="
           echo "✓ Installation complete!"
           echo "=========================================="
+          echo ""
+          echo "Usage:"
+          echo "  export JWT_SECRET=\"your-secret-32-chars-minimum\""
+          echo "  generate-token admin"
+          echo "  control-center server start"
+          echo "  control-center agent start"
+          echo "  control-center connect --host X --token Y"
+          echo "  control-center --help"
+          echo ""
           EOF
           chmod +x package/install.sh
           
@@ -524,9 +576,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path package\bin
           
-          # Copy BOTH Rust binaries
           Copy-Item target\release\control-center-server.exe package\bin\
           Copy-Item target\release\control-center-agent.exe package\bin\
+          Copy-Item target\release\generate-token.exe package\bin\
           Copy-Item dist\control-center.exe package\bin\
           
           # Create installation script
@@ -541,9 +593,15 @@ jobs:
           if not exist "%LOCALAPPDATA%\Programs\ControlCenter" mkdir "%LOCALAPPDATA%\Programs\ControlCenter"
           copy /Y bin\control-center-server.exe "%LOCALAPPDATA%\Programs\ControlCenter\"
           copy /Y bin\control-center-agent.exe "%LOCALAPPDATA%\Programs\ControlCenter\"
-          echo   + Server: %LOCALAPPDATA%\Programs\ControlCenter\control-center-server.exe
-          echo   + Agent:  %LOCALAPPDATA%\Programs\ControlCenter\control-center-agent.exe
-          echo   + CLI: control-center
+          copy /Y bin\generate-token.exe "%LOCALAPPDATA%\Programs\ControlCenter\"
+          echo   + Server:          %LOCALAPPDATA%\Programs\ControlCenter\control-center-server.exe
+          echo   + Agent:           %LOCALAPPDATA%\Programs\ControlCenter\control-center-agent.exe
+          echo   + Token generator: %LOCALAPPDATA%\Programs\ControlCenter\generate-token.exe
+          echo.
+          
+          echo [2/2] Installing CLI...
+          copy /Y bin\control-center.exe "%LOCALAPPDATA%\Programs\ControlCenter\"
+          echo   + CLI: %LOCALAPPDATA%\Programs\ControlCenter\control-center.exe
           echo.
           
           echo ==========================================
@@ -554,6 +612,8 @@ jobs:
           echo   %LOCALAPPDATA%\Programs\ControlCenter
           echo.
           echo Usage:
+          echo   set JWT_SECRET=your-secret-32-chars-minimum
+          echo   generate-token admin
           echo   control-center server start
           echo   control-center agent start
           echo   control-center connect --host X --token Y
@@ -608,6 +668,7 @@ jobs:
             Each platform package contains:
             - ✅ **control-center-server** (Rust gRPC server)
             - ✅ **control-center-agent** (Rust OS actuation agent)
+            - ✅ **generate-token** (Rust JWT token generator)
             - ✅ **control-center CLI** (Python orchestrator)
             - ✅ **install.sh / install.bat** (One-command installer)
             
@@ -632,6 +693,11 @@ jobs:
             ## 📖 Usage
             
             ```bash
+            # Generate an auth token
+            export JWT_SECRET="your-secret-32-chars-minimum"
+            generate-token admin
+            generate-token user123 24 execute monitor
+            
             # Start server
             control-center server start
             

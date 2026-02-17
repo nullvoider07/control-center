@@ -807,13 +807,13 @@ def uninstall(purge, yes):
             Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'ControlCenter' / 'bin',
             Path.home() / '.local' / 'bin',
         ]
-        binary_names = ['control-center.exe', 'control-center-server.exe', 'control-center-agent.exe']
+        binary_names = ['control-center.exe', 'control-center-server.exe', 'control-center-agent.exe', 'generate-token.exe']
     else:
         binary_locations = [
             Path('/usr/local/bin'),
             Path.home() / '.local' / 'bin',
         ]
-        binary_names = ['control-center', 'control-center-server', 'control-center-agent']
+        binary_names = ['control-center', 'control-center-server', 'control-center-agent', 'generate-token']
     
     # Find installed binaries
     found_binaries = []

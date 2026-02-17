@@ -1,5 +1,5 @@
 # Control Center - Unified Windows Installation
-# Installs: Rust binaries (server + agent) + Python CLI
+# Installs: Rust binaries (server + agent + generate-token) + Python CLI
 
 $ErrorActionPreference = "Stop"
 
@@ -11,6 +11,7 @@ $INSTALL_DIR = "$env:LOCALAPPDATA\Programs\ControlCenter"
 $SERVER_BINARY = "control-center-server.exe"
 $AGENT_BINARY = "control-center-agent.exe"
 $CLI_BINARY = "control-center.exe"
+$TOKEN_BINARY = "generate-token.exe"
 
 # ============================================================================
 # Helper Functions
@@ -168,7 +169,7 @@ function Expand-Package {
     try {
         Expand-Archive -Path $ZipFile -DestinationPath $TMP_DIR -Force
         
-        # Verify contents
+        # Verify all binaries exist
         if (-not (Test-Path "$TMP_DIR\bin\$SERVER_BINARY")) {
             Write-ErrorMsg "$SERVER_BINARY not found in package"
             Get-ChildItem "$TMP_DIR\bin" -ErrorAction SilentlyContinue
@@ -182,6 +183,12 @@ function Expand-Package {
         
         if (-not (Test-Path "$TMP_DIR\bin\$CLI_BINARY")) {
             Write-ErrorMsg "$CLI_BINARY not found in package"
+            Get-ChildItem "$TMP_DIR\bin" -ErrorAction SilentlyContinue
+            exit 1
+        }
+
+        if (-not (Test-Path "$TMP_DIR\bin\$TOKEN_BINARY")) {
+            Write-ErrorMsg "$TOKEN_BINARY not found in package"
             Get-ChildItem "$TMP_DIR\bin" -ErrorAction SilentlyContinue
             exit 1
         }
@@ -212,10 +219,12 @@ function Install-RustBinaries {
     # Copy binaries
     Copy-Item "$SourceDir\bin\$SERVER_BINARY" $INSTALL_DIR -Force
     Copy-Item "$SourceDir\bin\$AGENT_BINARY" $INSTALL_DIR -Force
+    Copy-Item "$SourceDir\bin\$TOKEN_BINARY" $INSTALL_DIR -Force
     
     Write-Success "Rust binaries installed"
-    Copy-Item "$SourceDir\bin\$SERVER_BINARY" $INSTALL_DIR -Force
-    Copy-Item "$SourceDir\bin\$AGENT_BINARY" $INSTALL_DIR -Force
+    Write-Host "  • Server:          $INSTALL_DIR\$SERVER_BINARY"
+    Write-Host "  • Agent:           $INSTALL_DIR\$AGENT_BINARY"
+    Write-Host "  • Token generator: $INSTALL_DIR\$TOKEN_BINARY"
 }
 
 function Install-CLIBinary {
@@ -279,28 +288,34 @@ function Write-SuccessMessage {
     Write-Host "==========================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "Installed components:"
-    Write-Host "  • Server:  $INSTALL_DIR\$SERVER_BINARY"
-    Write-Host "  • Agent:   $INSTALL_DIR\$AGENT_BINARY"
-    Write-Host "  • CLI:     $INSTALL_DIR\$CLI_BINARY"
+    Write-Host "  • Server:          $INSTALL_DIR\$SERVER_BINARY"
+    Write-Host "  • Agent:           $INSTALL_DIR\$AGENT_BINARY"
+    Write-Host "  • CLI:             $INSTALL_DIR\$CLI_BINARY"
+    Write-Host "  • Token generator: $INSTALL_DIR\$TOKEN_BINARY"
     Write-Host ""
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host "  Quick Start" -ForegroundColor Cyan
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "1. Start the server:"
+    Write-Host "1. Generate an auth token:"
+    Write-Host "   `$env:JWT_SECRET = 'your-secret-32-chars-minimum'" -ForegroundColor Yellow
+    Write-Host "   generate-token admin" -ForegroundColor Yellow
+    Write-Host "   generate-token user123 24 execute monitor" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "2. Start the server:"
     Write-Host "   control-center server start" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "2. Start the agent (on VM/container):"
+    Write-Host "3. Start the agent (on VM/container):"
     Write-Host "   control-center agent start" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "3. Connect with CLI:"
+    Write-Host "4. Connect with CLI:"
     Write-Host "   control-center connect --host <server-ip> --token <token>" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "4. Configuration:"
+    Write-Host "5. Configuration:"
     Write-Host "   control-center config set-token <token>" -ForegroundColor Yellow
     Write-Host "   control-center config set-server <host> <port>" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "5. Execute commands:"
+    Write-Host "6. Execute commands:"
     Write-Host "   control-center execute -c `"960 540 left`" --host X --token Y" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "==========================================" -ForegroundColor Cyan
@@ -308,6 +323,7 @@ function Write-SuccessMessage {
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  • CLI help:     control-center --help"
+    Write-Host "  • Token help:   generate-token --help"
     Write-Host "  • Version:      control-center version"
     Write-Host "  • System check: control-center doctor"
     Write-Host "  • Docs:         https://github.com/$REPO"

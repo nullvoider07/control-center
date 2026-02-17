@@ -1,6 +1,6 @@
 #!/bin/bash
 # Control Center - Unified Installation Script
-# Installs: Rust binaries (server + agent) + Python CLI
+# Installs: Rust binaries (server + agent + generate-token) + Python CLI
 # Following the-eye pattern: One package, one command
 
 set -e
@@ -13,6 +13,7 @@ INSTALL_DIR="$HOME/.local/bin"
 SERVER_BINARY="control-center-server"
 AGENT_BINARY="control-center-agent"
 CLI_BINARY="control-center"
+TOKEN_BINARY="generate-token"
 
 # Colors
 RED='\033[0;31m'
@@ -114,6 +115,7 @@ check_dependencies() {
 
     print_success "All dependencies found"
 }
+
 # ============================================================================
 # Get Latest Release
 # ============================================================================
@@ -166,7 +168,7 @@ extract_package() {
         exit 1
     fi
 
-    # Verify binaries exist
+    # Verify all binaries exist
     if [ ! -f "$TMP_DIR/bin/$SERVER_BINARY" ]; then
         print_error "$SERVER_BINARY not found in package"
         exit 1
@@ -178,7 +180,13 @@ extract_package() {
     fi
 
     if [ ! -f "$TMP_DIR/bin/$CLI_BINARY" ]; then
-    print_error "$CLI_BINARY not found in package"
+        print_error "$CLI_BINARY not found in package"
+        ls -la "$TMP_DIR/bin" 2>/dev/null
+        exit 1
+    fi
+
+    if [ ! -f "$TMP_DIR/bin/$TOKEN_BINARY" ]; then
+        print_error "$TOKEN_BINARY not found in package"
         ls -la "$TMP_DIR/bin" 2>/dev/null
         exit 1
     fi
@@ -194,22 +202,26 @@ install_rust_binaries() {
     mkdir -p "$INSTALL_DIR"
 
     # Copy binaries
-    cp "$TMP_DIR/bin/control-center-server" "$INSTALL_DIR/"
-    cp "$TMP_DIR/bin/control-center-agent" "$INSTALL_DIR/"
+    cp "$TMP_DIR/bin/$SERVER_BINARY" "$INSTALL_DIR/"
+    cp "$TMP_DIR/bin/$AGENT_BINARY" "$INSTALL_DIR/"
+    cp "$TMP_DIR/bin/$TOKEN_BINARY" "$INSTALL_DIR/"
 
     # Make executable
-    chmod +x "$INSTALL_DIR/control-center-server"
-    chmod +x "$INSTALL_DIR/control-center-agent"
+    chmod +x "$INSTALL_DIR/$SERVER_BINARY"
+    chmod +x "$INSTALL_DIR/$AGENT_BINARY"
+    chmod +x "$INSTALL_DIR/$TOKEN_BINARY"
 
     # macOS: Remove quarantine
     if [[ "$OS_TYPE" == "macos" ]]; then
         xattr -d com.apple.quarantine "$INSTALL_DIR/$SERVER_BINARY" 2>/dev/null || true
         xattr -d com.apple.quarantine "$INSTALL_DIR/$AGENT_BINARY" 2>/dev/null || true
+        xattr -d com.apple.quarantine "$INSTALL_DIR/$TOKEN_BINARY" 2>/dev/null || true
     fi
 
     print_success "Rust binaries installed"
-    echo "  • Server: $INSTALL_DIR/control-center-server"
-    echo "  • Agent:  $INSTALL_DIR/control-center-agent"
+    echo "  • Server:         $INSTALL_DIR/$SERVER_BINARY"
+    echo "  • Agent:          $INSTALL_DIR/$AGENT_BINARY"
+    echo "  • Token generator:$INSTALL_DIR/$TOKEN_BINARY"
 }
 
 install_cli_binary() {
@@ -268,29 +280,35 @@ print_success_message() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "Installed components:"
-    echo "  • Server:  $INSTALL_DIR/$SERVER_BINARY"
-    echo "  • Agent:   $INSTALL_DIR/$AGENT_BINARY"
-    echo "  • CLI:     $INSTALL_DIR/$CLI_BINARY"
+    echo "  • Server:          $INSTALL_DIR/$SERVER_BINARY"
+    echo "  • Agent:           $INSTALL_DIR/$AGENT_BINARY"
+    echo "  • CLI:             $INSTALL_DIR/$CLI_BINARY"
+    echo "  • Token generator: $INSTALL_DIR/$TOKEN_BINARY"
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Quick Start"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    echo "1. Start the server:"
+    echo "1. Generate an auth token:"
+    echo "   export JWT_SECRET=\"your-secret-32-chars-minimum\""
+    echo "   generate-token admin"
+    echo "   generate-token user123 24 execute monitor"
+    echo ""
+    echo "2. Start the server:"
     echo "   control-center server start"
     echo ""
-    echo "2. Start the agent (on VM/container):"
+    echo "3. Start the agent (on VM/container):"
     echo "   control-center agent start"
     echo ""
-    echo "3. Connect with CLI:"
+    echo "4. Connect with CLI:"
     echo "   control-center connect --host <server-ip> --token <your-token>"
     echo ""
-    echo "4. Configuration:"
+    echo "5. Configuration:"
     echo "   control-center config set-token <token>"
     echo "   control-center config set-server <host> <port>"
     echo "   control-center config show"
     echo ""
-    echo "5. Execute commands:"
+    echo "6. Execute commands:"
     echo "   # Interactive mode"
     echo "   control-center> 960 540 left"
     echo "   control-center> type Hello World"
@@ -303,6 +321,7 @@ print_success_message() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "  • CLI help:     control-center --help"
+    echo "  • Token help:   generate-token --help"
     echo "  • Version:      control-center version"
     echo "  • System check: control-center doctor"
     echo "  • Docs:         https://github.com/$REPO"
