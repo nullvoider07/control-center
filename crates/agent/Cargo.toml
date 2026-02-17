@@ -26,19 +26,16 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 regex = "1.10"
 
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
-
-# OS-specific dependencies
+# Windows dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
-winapi = { version = "0.3", features = ["sysinfoapi", "winnt"] }
+winapi = { version = "0.3", features = ["winbase", "sysinfoapi", "winnt", "minwindef"] }
 
+# macOS dependencies
 [target.'cfg(target_os = "macos")'.dependencies]
-# macOS doesn't need special deps (uses ProcessCommand for sw_vers)
 
+# Linux dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
-# Linux doesn't need special deps (uses /etc/os-release)
 
 [build-dependencies]
 tonic-build = "0.12"
