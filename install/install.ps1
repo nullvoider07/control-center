@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 # Configuration
 # ============================================================================
 $REPO = "nullvoider07/control-center"
-$INSTALL_DIR = "$env:LOCALAPPDATA\Programs\ControlCenter"
+$INSTALL_DIR = "$env:LOCALAPPDATA\Programs\ControlCenter\bin"
 $SERVER_BINARY = "control-center-server.exe"
 $AGENT_BINARY = "control-center-agent.exe"
 $CLI_BINARY = "control-center.exe"
