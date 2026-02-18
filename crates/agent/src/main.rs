@@ -469,30 +469,25 @@ impl AgentServiceImpl {
     /// Windows execution by writing to files for AutoHotkey
     #[cfg(target_os = "windows")]
     async fn execute_windows(&self, command: &str) -> Result<String, String> {
-        let tokens: Vec<&str> = command.split_whitespace().collect();
-        
-        // Determine target file based on command type
-        let file_path = if tokens.len() >= 2 
-            && tokens[0].parse::<i32>().is_ok() 
-            && tokens[1].parse::<i32>().is_ok() {
-            "C:\\mouse_cmd.txt"
-        } else {
-            "C:\\keyboard_cmd.txt"
-        };
-        
-        // Write command to file
-        fs::write(file_path, command)
+        use chrono::format;
+
+        let outpuut = ProcessCommand::new("cmd")
+            .arg("/c")
+            .arg(command)
+            .output()
             .map_err(|e| {
-                error!("Failed to write to {}: {}", file_path, e);
-                format!("File write error: {}", e)
+                error!("Failed to execute command: {}", e);
+                format!("Execution error: {}", e)
             })?;
-        
-        info!("Command written to {}: {}", file_path, command);
-        
-        // Small delay for AutoHotkey to pick up the change
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
-        Ok(format!("Executed: {} (written to {})", command, file_path))
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            error!("Command failed: {}", error_msg);
+            return Err(error_msg);
+        }
+
+        info!("Command executed: {}", command);
+        Ok(format!("Executed: {}", command))
     }
     
     /// macOS execution using cliclick

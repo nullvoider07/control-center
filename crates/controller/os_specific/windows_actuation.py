@@ -247,6 +247,11 @@ class WindowsActuation:
         if cmd_type == 'keyboard':
             processed_cmd = self._process_keyboard_command(processed_cmd)
             processed_cmd = processed_cmd.replace('^', '^^')
+
+        if cmd_type == 'mouse':
+            shell_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
+        else:
+            shell_cmd = f'cmd /c echo {processed_cmd} > C:\\keyboard_cmd.txt'
         
         position_before = None
         position_after = None
@@ -257,7 +262,7 @@ class WindowsActuation:
             position_before = self._get_mouse_position()
         
         # Send to server via gRPC
-        result = self.grpc_client.execute_command(processed_cmd)
+        result = self.grpc_client.execute_command(shell_cmd)
         
         # For mouse commands: Get position after action
         if cmd_type == 'mouse' and result['success']:
