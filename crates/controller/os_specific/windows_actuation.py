@@ -246,15 +246,10 @@ class WindowsActuation:
         
         if cmd_type == 'keyboard':
             processed_cmd = self._process_keyboard_command(processed_cmd)
-            if processed_cmd.startswith('type '):
-                processed_cmd = processed_cmd.replace('^', '^^')
-        
-        cmd_safe = processed_cmd.replace('^', '^^')
-
-        if cmd_type == 'mouse':
-            shell_cmd = f'cmd /c echo {cmd_safe} > C:\\mouse_cmd.txt'
+            escaped_cmd = processed_cmd.replace('^', '^^')
+            shell_cmd = f'cmd /c echo {escaped_cmd} > C:\\keyboard_cmd.txt'
         else:
-            shell_cmd = f'cmd /c echo {cmd_safe} > C:\\keyboard_cmd.txt'
+            shell_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
         
         position_before = None
         position_after = None
@@ -346,15 +341,10 @@ class WindowsActuation:
                 if cmd_type != 'invalid':
                     # Escape carets and process standalone modifiers for keyboard commands
                     if cmd_type == 'keyboard':
-                        formatted_cmd = self._process_keyboard_command(formatted_cmd)
-                        if formatted_cmd.startswith('type '):
-                            formatted_cmd = formatted_cmd.replace('^', '^^')
-                    cmd_safe = formatted_cmd.replace('^', '^^')
-
-                    if cmd_type == 'mouse':
-                        shell_cmd = f'cmd /c echo {cmd_safe} > C:\\mouse_cmd.txt'
+                        escaped_cmd = formatted_cmd.replace('^', '^^')
+                        shell_cmd = f'cmd /c echo {escaped_cmd} > C:\\keyboard_cmd.txt'
                     else:
-                        shell_cmd = f'cmd /c echo {cmd_safe} > C:\\keyboard_cmd.txt'
+                        shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'
                     yield shell_cmd, i, len(commands), command
         
         success_count = 0
