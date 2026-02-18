@@ -246,7 +246,8 @@ class WindowsActuation:
         
         if cmd_type == 'keyboard':
             processed_cmd = self._process_keyboard_command(processed_cmd)
-            processed_cmd = processed_cmd.replace('^', '^^')
+            if processed_cmd.startswith('type '):
+                processed_cmd = processed_cmd.replace('^', '^^')
 
         if cmd_type == 'mouse':
             shell_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
@@ -344,8 +345,12 @@ class WindowsActuation:
                     # Escape carets and process standalone modifiers for keyboard commands
                     if cmd_type == 'keyboard':
                         formatted_cmd = self._process_keyboard_command(formatted_cmd)
-                        formatted_cmd = formatted_cmd.replace('^', '^^')
-                    yield formatted_cmd, i, len(commands), command
+                        if formatted_cmd.startswith('type '):
+                            formatted_cmd = formatted_cmd.replace('^', '^^')
+                        shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\keyboard_cmd.txt'
+                    else:
+                        shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'
+                    yield shell_cmd, i, len(commands), command
         
         success_count = 0
         total_count = 0
