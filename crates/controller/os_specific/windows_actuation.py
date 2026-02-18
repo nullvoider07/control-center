@@ -261,7 +261,7 @@ class WindowsActuation:
             position_before = self._get_mouse_position()
         
         # Send to server via gRPC
-        result = self.grpc_client.execute_command(processed_cmd)
+        result = self.grpc_client.execute_command(remote_cmd)
         
         # For mouse commands: Get position after action
         if cmd_type == 'mouse' and result['success']:
