@@ -244,24 +244,20 @@ class WindowsActuation:
                 print("[✗] Failed to get mouse position")
                 return False
         
-        # For keyboard commands, process standalone modifiers and escape carets
-        if cmd_type == 'keyboard':
-            # Process standalone modifiers (# → {LWin}, etc.)
+        # Prepare command for gRPC execution
+        if cmd_type == 'mouse':
+            remote_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
+        else:
             processed_cmd = self._process_keyboard_command(processed_cmd)
-            
-            # The agent will write this to the file, so we need to escape carets
             processed_cmd = processed_cmd.replace('^', '^^')
+            remote_cmd = f'cmd /c echo {processed_cmd} > C:\\keyboard_cmd.txt'
         
-        # For mouse commands: Track position before and after
         position_before = None
         position_after = None
         target_coords = None
-        
+
         if cmd_type == 'mouse':
-            # Extract target coordinates from original command (if present)
             target_coords = self._extract_coordinates_from_command(command)
-            
-            # Get position before action
             position_before = self._get_mouse_position()
         
         # Send to server via gRPC
