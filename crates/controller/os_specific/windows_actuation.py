@@ -290,6 +290,7 @@ class WindowsActuation:
                 kb_content = self._convert_modifiers_to_explicit(kb_content)
                 echo_payload = f'press {kb_content}'
             else:
+                kb_content = kb_content.replace('^', '{^^}')
                 echo_payload = f'type {kb_content}'
 
             shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
@@ -391,6 +392,7 @@ class WindowsActuation:
                             kb_content = self._convert_modifiers_to_explicit(kb_content)
                             echo_payload = f'press {kb_content}'
                         else:
+                            kb_content = kb_content.replace('^', '{^^}')
                             echo_payload = f'type {kb_content}'
                         shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
                     else:
