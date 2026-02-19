@@ -246,8 +246,21 @@ class WindowsActuation:
         
         if cmd_type == 'keyboard':
             processed_cmd = self._process_keyboard_command(processed_cmd)
-            escaped_cmd = processed_cmd.replace('^', '^^')
-            shell_cmd = f'cmd /c echo {escaped_cmd} > C:\\keyboard_cmd.txt'
+            # Use PowerShell Set-Content instead of 'cmd /c echo'.
+            #
+            # The old SSH tool relied on cmd.exe's command-line parser collapsing
+            # '^^' -> '^' before writing to the file. That worked because SSH's
+            # exec_command routes through cmd.exe's interpreter on Windows.
+            #
+            # The gRPC Rust agent uses std::process::Command which passes arguments
+            # as tokenised subprocess args -- cmd.exe never runs its escape-character
+            # pass, so '^^' lands in the file literally. AHK then receives
+            # 'Send ^^t' which types a literal caret+t instead of Ctrl+T.
+            #
+            # PowerShell has NO special meaning for '^', so 'press ^t' is written
+            # to the file exactly as-is, which is exactly what AHK needs.
+            ps_content = processed_cmd.replace("'", "''")   # escape PS single-quotes
+            shell_cmd = f"powershell -Command \"Set-Content -Path 'C:\\keyboard_cmd.txt' -Value '{ps_content}'\"" 
         else:
             shell_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
         
@@ -340,14 +353,11 @@ class WindowsActuation:
                 cmd_type, formatted_cmd = self.detect_command_type(command)
                 if cmd_type != 'invalid':
                     if cmd_type == 'keyboard':
-                        # Must call _process_keyboard_command FIRST (same as execute_command)
-                        # so that standalone modifiers like 'press ^' become 'press {LCtrl}'
-                        # BEFORE the cmd.exe caret-escaping runs. Without this, 'press ^'
-                        # becomes 'press ^^' → file gets 'press ^' → AHK receives bare '^'
-                        # with no key to combine, and the CTRL press silently does nothing.
                         formatted_cmd = self._process_keyboard_command(formatted_cmd)
-                        escaped_cmd = formatted_cmd.replace('^', '^^')
-                        shell_cmd = f'cmd /c echo {escaped_cmd} > C:\\keyboard_cmd.txt'
+                        # Same fix as execute_command: use PowerShell Set-Content so
+                        # '^' is never treated as a cmd.exe escape character.
+                        ps_content = formatted_cmd.replace("'", "''")
+                        shell_cmd = f"powershell -Command \"Set-Content -Path 'C:\\keyboard_cmd.txt' -Value '{ps_content}'\"" 
                     else:
                         shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'
                     yield shell_cmd, i, len(commands), command
