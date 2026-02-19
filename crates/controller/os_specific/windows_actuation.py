@@ -160,6 +160,61 @@ class WindowsActuation:
         # e.g., "#r" (Win+R) stays as "#r"
         return command
 
+    def _format_press_for_display(self, keys: str) -> str:
+        """
+        Convert AHK key notation to a human-readable string for CLI output.
+
+        Examples:
+            "^t"        -> "Ctrl+T"
+            "^+{Esc}"   -> "Ctrl+Shift+Esc"
+            "!{Tab}"    -> "Alt+Tab"
+            "#r"        -> "Win+R"
+            "{LCtrl}"   -> "Ctrl"
+            "{Enter}"   -> "Enter"
+            "{F5}"      -> "F5"
+        """
+        modifier_display = {'^': 'Ctrl', '+': 'Shift', '!': 'Alt', '#': 'Win'}
+        special_display = {
+            '{LCtrl}': 'Ctrl', '{RCtrl}': 'Ctrl',
+            '{LShift}': 'Shift', '{RShift}': 'Shift',
+            '{LAlt}': 'Alt', '{RAlt}': 'Alt',
+            '{LWin}': 'Win', '{RWin}': 'Win',
+            '{Enter}': 'Enter', '{Esc}': 'Esc', '{Tab}': 'Tab',
+            '{Backspace}': 'Backspace', '{BS}': 'Backspace',
+            '{Delete}': 'Delete', '{Del}': 'Delete',
+            '{Space}': 'Space', '{Up}': 'Up', '{Down}': 'Down',
+            '{Left}': 'Left', '{Right}': 'Right',
+            '{Home}': 'Home', '{End}': 'End',
+            '{PgUp}': 'Page Up', '{PgDn}': 'Page Down',
+            '{F1}': 'F1', '{F2}': 'F2', '{F3}': 'F3', '{F4}': 'F4',
+            '{F5}': 'F5', '{F6}': 'F6', '{F7}': 'F7', '{F8}': 'F8',
+            '{F9}': 'F9', '{F10}': 'F10', '{F11}': 'F11', '{F12}': 'F12',
+        }
+
+        # Whole string is a standalone special key
+        if keys in special_display:
+            return special_display[keys]
+
+        # Parse modifier prefix(es) then the remaining key
+        parts = []
+        i = 0
+        while i < len(keys) and keys[i] in modifier_display:
+            parts.append(modifier_display[keys[i]])
+            i += 1
+        key_part = keys[i:]
+
+        if key_part:
+            if key_part in special_display:
+                parts.append(special_display[key_part])
+            elif key_part.startswith('{') and key_part.endswith('}'):
+                parts.append(key_part[1:-1])   # strip braces
+            elif len(key_part) == 1:
+                parts.append(key_part.upper())
+            else:
+                parts.append(key_part)
+
+        return '+'.join(parts) if parts else keys
+
     def _convert_modifiers_to_explicit(self, keys: str) -> str:
         """
         Convert AHK modifier prefix notation to explicit {Key down}/{Key up} syntax.
@@ -282,9 +337,14 @@ class WindowsActuation:
                 print("[✗] Failed to get mouse position")
                 return False
         
+        kb_action = ''
+        original_kb_content = ''
+
         if cmd_type == 'keyboard':
             processed_cmd = self._process_keyboard_command(processed_cmd)
             kb_action, _, kb_content = processed_cmd.partition(' ')
+            # Save original kb_content for display before any transformation
+            original_kb_content = kb_content
 
             if kb_action == 'press':
                 kb_content = self._convert_modifiers_to_explicit(kb_content)
@@ -315,34 +375,39 @@ class WindowsActuation:
         if cmd_type == 'mouse' and result['success']:
             position_after = self._get_mouse_position()
         
-        # Display results with position data
+        # Display results
         if result['success']:
-            if cmd_type == 'mouse':
-                prefix = "[MOUSE]"
-                
-                # Build position info string
-                position_info = ""
-                if position_after:
-                    x, y = position_after
-                    position_info = f" @({x},{y})"
-                    
-                    # If target coords exist, show them too
-                    if target_coords:
-                        tx, ty = target_coords
-                        position_info = f" @({tx},{ty})→({x},{y})"
-                
-                # Enhanced feedback for drag operations
-                if 'drag' in processed_cmd:
-                    parts = processed_cmd.split()
-                    if len(parts) >= 5:
-                        print(f"{prefix} Drag: ({parts[0]},{parts[1]}) → ({parts[3]},{parts[4]}){position_info}")
-                    else:
-                        print(f"{prefix} Executed: {processed_cmd}{position_info}")
+            ms = result['execution_time_ms']
+            if cmd_type == 'keyboard':
+                if kb_action == 'press':
+                    human = self._format_press_for_display(original_kb_content)
+                    print(f"Pressed: {human}, time taken: {ms}ms")
                 else:
-                    print(f"{prefix} {result['message']}{position_info} ({result['execution_time_ms']}ms)")
+                    print(f"Typed: {original_kb_content}, time taken: {ms}ms")
             else:
-                prefix = "[KEYBOARD]"
-                print(f"{prefix} {result['message']} ({result['execution_time_ms']}ms)")
+                # Mouse
+                tokens = command.strip().split()
+                is_here = tokens[0] == 'here'
+                action_tok = tokens[1] if is_here and len(tokens) >= 2 else (tokens[2] if len(tokens) >= 3 else None)
+                pos_str = f"X={position_after[0]}, Y={position_after[1]}" if position_after else "X=?, Y=?"
+
+                if action_tok == 'drag' and len(tokens) >= 5:
+                    print(f"Executed: {command}, dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
+                elif action_tok in ('left', 'right', 'double', 'middle'):
+                    print(f"Executed: {command}, clicked {action_tok} at {pos_str}, time taken: {ms}ms")
+                elif action_tok in ('scroll_up', 'scroll_down'):
+                    direction = 'up' if action_tok == 'scroll_up' else 'down'
+                    count_idx = 2 if is_here else 3
+                    try:
+                        n = int(tokens[count_idx])
+                    except (IndexError, ValueError):
+                        n = 1
+                    notch_str = "1 notch" if n == 1 else f"{n} notches"
+                    print(f"Executed: {command}, scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
+                elif action_tok == 'move':
+                    print(f"Executed: {command}, moved to {pos_str}, time taken: {ms}ms")
+                else:
+                    print(f"Executed: {command}, at {pos_str}, time taken: {ms}ms")
             
             # UI opening commands need delay
             ui_opening_commands = [

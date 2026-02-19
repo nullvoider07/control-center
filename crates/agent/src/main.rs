@@ -3,6 +3,8 @@
 use tonic::{Request, Response, Status};
 use tracing::{info, warn, error, debug};
 use std::process::Command as ProcessCommand;
+#[cfg(target_os = "windows")]
+use std::fs;
 use std::time::Instant;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use regex::Regex;
@@ -306,7 +308,7 @@ impl AgentServiceImpl {
                 
                 if let (Some(x_cap), Some(y_cap)) = (x_regex.captures(&stdout), y_regex.captures(&stdout)) {
                     if let (Ok(x), Ok(y)) = (x_cap[1].parse::<i32>(), y_cap[1].parse::<i32>()) {
-                        info!("Position captured: ({}, {})", x, y);
+                        debug!("Position captured: ({}, {})", x, y);
                         return MousePosition { x, y, captured: true };
                     }
                 }
@@ -328,7 +330,7 @@ impl AgentServiceImpl {
                 
                 if let (Some(x_cap), Some(y_cap)) = (x_regex.captures(&stdout), y_regex.captures(&stdout)) {
                     if let (Ok(x), Ok(y)) = (x_cap[1].parse::<i32>(), y_cap[1].parse::<i32>()) {
-                        info!("Position captured: ({}, {})", x, y);
+                        debug!("Position captured: ({}, {})", x, y);
                         return MousePosition { x, y, captured: true };
                     }
                 }
@@ -350,7 +352,7 @@ impl AgentServiceImpl {
                     
                     if parts.len() == 2 {
                         if let (Ok(x), Ok(y)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
-                            info!("Position captured: ({}, {})", x, y);
+                            debug!("Position captured: ({}, {})", x, y);
                             return MousePosition { x, y, captured: true };
                         }
                     }
@@ -467,7 +469,9 @@ impl AgentServiceImpl {
     /// Windows execution by writing to files for AutoHotkey
     #[cfg(target_os = "windows")]
     async fn execute_windows(&self, command: &str) -> Result<String, String> {
-        let output = ProcessCommand::new("cmd")
+        use chrono::format;
+
+        let outpuut = ProcessCommand::new("cmd")
             .arg("/c")
             .arg(command)
             .output()
@@ -482,7 +486,7 @@ impl AgentServiceImpl {
             return Err(error_msg);
         }
 
-        info!("Command executed: {}", command);
+        debug!("Command executed: {}", command);
         Ok(format!("Executed: {}", command))
     }
     
@@ -510,7 +514,7 @@ impl AgentServiceImpl {
             {
                 Ok(output) => {
                     if output.status.success() {
-                        info!("Command executed via {}: {}", cliclick_path, command);
+                        debug!("Command executed via {}: {}", cliclick_path, command);
                         return Ok(format!("Executed: cliclick {}", command));
                     } else {
                         last_error = String::from_utf8_lossy(&output.stderr).to_string();
@@ -550,7 +554,7 @@ impl AgentServiceImpl {
             return Err(error_msg);
         }
         
-        info!("Command executed: {}", command);
+        debug!("Command executed: {}", command);
         Ok(format!("Executed: {}", command))
     }
     
@@ -595,7 +599,7 @@ impl AgentService for AgentServiceImpl {
     ) -> Result<Response<ExecuteResponse>, Status> {
         let req = request.into_inner();
         
-        info!("Executing command: id={}, cmd={}", req.id, req.command);
+        debug!("Executing command: id={}, cmd={}", req.id, req.command);
         
         let start = Instant::now();
         let (result, position, action) = self.execute_command(&req.command).await;
@@ -606,9 +610,10 @@ impl AgentService for AgentServiceImpl {
                 // Build detailed message
                 let message = self.build_detailed_message(&action, &position, &req.command);
                 
+                // Single clean log line per command
                 info!(
-                    "Command successful: id={}, time={}ms, action={}, position=({}, {}), captured={}", 
-                    req.id, execution_time, action.action_type, position.x, position.y, position.captured
+                    "{{\"action\": \"{}\", \"time_taken\": \"{}ms\"}}",
+                    message, execution_time
                 );
                 
                 Ok(Response::new(ExecuteResponse {
@@ -814,7 +819,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // Track command execution time
                                         let cmd_start_time = std::time::Instant::now();
                                         
-                                        info!("Received command: {} (ID: {})", command, command_id);
+                                        debug!("Received command: {} (ID: {})", command, command_id);
                                         
                                         // Execute command using AgentServiceImpl
                                         let execute_request = proto::ExecuteRequest {
@@ -836,7 +841,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 // Increment success counter
                                                 *commands_executed.write().await += 1;
                                                 
-                                                info!(
+                                                debug!(
                                                     "Command {} executed successfully (time: {:?})",
                                                     command_id,
                                                     execution_time

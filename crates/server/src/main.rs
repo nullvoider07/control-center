@@ -3,7 +3,7 @@
 
 use tonic::{transport::Server, Request, Response, Status, metadata::MetadataMap};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
@@ -176,7 +176,7 @@ impl ControlCenterService {
             }
         };
 
-        info!("Token validated for user: {}", token_data.claims.sub);
+        debug!("Token validated for user: {}", token_data.claims.sub);
         Ok(token_data.claims)
     }
     async fn check_rate_limit(&self, user_id: &str) -> Result<(), Status> {
@@ -405,7 +405,7 @@ impl ControlService for ControlCenterService {
         let command_id = cmd_req.id.clone();
         let command = cmd_req.command.clone();
         
-        info!(
+        debug!(
             "Executing command {} via agent: {}",
             command_id,
             command
@@ -421,12 +421,11 @@ impl ControlService for ControlCenterService {
             Ok(resp) => {
                 if resp.success {
                     metrics.successful_requests += 1;
+                    // Single clean log line matching the agent's JSON format
                     info!(
-                        "Command {} executed successfully via agent: {} (time: {:?}, user: {})",
-                        command_id,
-                        command,
-                        execution_time,
-                        claims.sub
+                        "{{\"action\": \"{}\", \"time_taken\": \"{}ms\"}}",
+                        resp.message,
+                        execution_time.as_millis()
                     );
                 } else {
                     metrics.failed_requests += 1;

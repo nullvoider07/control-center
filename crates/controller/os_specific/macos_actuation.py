@@ -92,6 +92,56 @@ class MacOSActuation:
             print(f"[!] Failed to get mouse position: {e}")
             return None
     
+    def _format_press_for_display(self, keys: str) -> str:
+        """Convert modifier-prefixed key notation to human-readable string for CLI output.
+        
+        The modifier symbols (^, +, !, #, and Unicode equivalents) and brace-enclosed
+        key names are the same input syntax accepted by the controller for press commands.
+        This method is only used for display; it does not affect actuation.
+        
+        Examples:
+            "#c"        -> "Cmd+C"
+            "^v"        -> "Ctrl+V"
+            "!{Tab}"    -> "Option+Tab"
+            "{F11}"     -> "F11"
+            "{Enter}"   -> "Return"
+        """
+        modifier_display = {'^': 'Ctrl', '+': 'Shift', '!': 'Option', '#': 'Cmd',
+                            '⌃': 'Ctrl', '⇧': 'Shift', '⌥': 'Option', '⌘': 'Cmd'}
+        special_display = {
+            '{Enter}': 'Return', '{Return}': 'Return', '{Esc}': 'Esc',
+            '{Tab}': 'Tab', '{Space}': 'Space',
+            '{Backspace}': 'Delete', '{BS}': 'Delete',
+            '{Delete}': 'Fwd Delete', '{Del}': 'Fwd Delete',
+            '{Up}': 'Up', '{Down}': 'Down', '{Left}': 'Left', '{Right}': 'Right',
+            '{Home}': 'Home', '{End}': 'End',
+            '{PgUp}': 'Page Up', '{PgDn}': 'Page Down',
+            '{Cmd}': 'Cmd', '{Command}': 'Cmd',
+            '{Option}': 'Option', '{Alt}': 'Option',
+            '{Control}': 'Ctrl', '{Ctrl}': 'Ctrl', '{Shift}': 'Shift',
+            '{F1}': 'F1', '{F2}': 'F2', '{F3}': 'F3', '{F4}': 'F4',
+            '{F5}': 'F5', '{F6}': 'F6', '{F7}': 'F7', '{F8}': 'F8',
+            '{F9}': 'F9', '{F10}': 'F10', '{F11}': 'F11', '{F12}': 'F12',
+        }
+        if keys in special_display:
+            return special_display[keys]
+        parts = []
+        i = 0
+        while i < len(keys) and keys[i] in modifier_display:
+            parts.append(modifier_display[keys[i]])
+            i += 1
+        key_part = keys[i:]
+        if key_part:
+            if key_part in special_display:
+                parts.append(special_display[key_part])
+            elif key_part.startswith('{') and key_part.endswith('}'):
+                parts.append(key_part[1:-1])
+            elif len(key_part) == 1:
+                parts.append(key_part.upper())
+            else:
+                parts.append(key_part)
+        return '+'.join(parts) if parts else keys
+
     # Helper method to extract coordinates from command (if present)
     def _extract_coordinates_from_command(self, command: str) -> Optional[Tuple[int, int]]:
         """
@@ -463,23 +513,38 @@ class MacOSActuation:
         
         # Display results with position data
         if result['success']:
-            prefix = "[MOUSE]" if cmd_type == 'mouse' else "[KEYBOARD]"
-            
-            if cmd_type == 'mouse':
-                # Build position info string
-                position_info = ""
-                if position_after:
-                    x, y = position_after
-                    position_info = f" @({x},{y})"
-                    
-                    # If target coords exist, show them too
-                    if target_coords:
-                        tx, ty = target_coords
-                        position_info = f" @({tx},{ty})→({x},{y})"
-                
-                print(f"{prefix} {result['message']}{position_info} ({result['execution_time_ms']}ms)")
+            ms = result['execution_time_ms']
+            if cmd_type == 'keyboard':
+                kb_action, _, kb_content = processed_cmd.partition(' ')
+                if kb_action in ('press', 'key'):
+                    human = self._format_press_for_display(kb_content)
+                    print(f"Pressed: {human}, time taken: {ms}ms")
+                else:
+                    print(f"Typed: {kb_content}, time taken: {ms}ms")
             else:
-                print(f"{prefix} {result['message']} ({result['execution_time_ms']}ms)")
+                tokens = command.strip().split()
+                is_here = tokens[0] == 'here'
+                action_tok = tokens[1] if is_here and len(tokens) >= 2 else (tokens[2] if len(tokens) >= 3 else None)
+                pos_str = f"X={position_after[0]}, Y={position_after[1]}" if position_after else "X=?, Y=?"
+
+                if action_tok == 'drag' and len(tokens) >= 5:
+                    print(f"Executed: {command}, dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
+                elif action_tok in ('left', 'click', 'right', 'double', 'triple', 'middle'):
+                    click_label = 'double' if action_tok == 'double' else ('triple' if action_tok == 'triple' else action_tok)
+                    print(f"Executed: {command}, clicked {click_label} at {pos_str}, time taken: {ms}ms")
+                elif action_tok in ('scroll_up', 'scroll_down', 'scroll_left', 'scroll_right'):
+                    direction = action_tok.replace('scroll_', '')
+                    count_idx = 2 if is_here else 3
+                    try:
+                        n = int(tokens[count_idx])
+                    except (IndexError, ValueError):
+                        n = 1
+                    notch_str = "1 notch" if n == 1 else f"{n} notches"
+                    print(f"Executed: {command}, scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
+                elif action_tok == 'move':
+                    print(f"Executed: {command}, moved to {pos_str}, time taken: {ms}ms")
+                else:
+                    print(f"Executed: {command}, at {pos_str}, time taken: {ms}ms")
             
             return True
         else:

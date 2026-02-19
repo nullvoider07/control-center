@@ -190,7 +190,7 @@ impl StreamHandler {
                     
                     if let Some(pending) = pending {
                         let execution_time = pending.sent_at.elapsed();
-                        info!(
+                        debug!(
                             "Command {} completed in {:?} (success: {})",
                             command_id,
                             execution_time,
@@ -319,7 +319,7 @@ impl StreamHandler {
                         let command_id = queued.request.id.clone();
                         let wait_time = queued.queued_at.elapsed();
                         
-                        info!(
+                        debug!(
                             "Sending command {} to agent (waited {:?})",
                             command_id,
                             wait_time
