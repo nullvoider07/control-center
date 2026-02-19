@@ -160,21 +160,24 @@ class WindowsActuation:
         # e.g., "#r" (Win+R) stays as "#r"
         return command
 
-    # Convert AHK modifier-prefix notation to explicit down/up syntax
     def _convert_modifiers_to_explicit(self, keys: str) -> str:
         """
         Convert AHK modifier prefix notation to explicit {Key down}/{Key up} syntax.
 
-        This eliminates '^', '+', '!', '#' from the string that gets passed to
-        cmd /c echo, which would otherwise eat them as escape/special characters.
+        The Rust agent calls ProcessCommand::new("cmd").arg("/c").arg(command),
+        which passes the command as a pre-tokenized argument. Windows CreateProcess
+        quotes it, so cmd.exe never runs its escape-character pass — meaning '^'
+        is never eaten and '^^' never collapses. Therefore '^' must be removed
+        from the echo string for 'press' commands entirely, by converting to
+        explicit AHK down/up syntax that contains no special characters at all.
 
         Examples:
             "^t"        -> "{Ctrl down}t{Ctrl up}"
-            "^c"        -> "{Ctrl down}c{Ctrl up}"
-            "^+t"       -> "{Ctrl down}{Shift down}t{Shift up}{Ctrl up}"
             "^+{Esc}"   -> "{Ctrl down}{Shift down}{Esc}{Shift up}{Ctrl up}"
-            "{F5}"      -> "{F5}"   (no modifier prefix, unchanged)
-            "{LCtrl}"   -> "{LCtrl}" (already explicit, unchanged)
+            "!{Tab}"    -> "{Alt down}{Tab}{Alt up}"
+            "#r"        -> "{LWin down}r{LWin up}"
+            "{F5}"      -> "{F5}"          (no modifier prefix, unchanged)
+            "{LCtrl}"   -> "{LCtrl}"       (already explicit, unchanged)
         """
         modifier_map = {
             '^': ('{Ctrl down}',  '{Ctrl up}'),
@@ -182,7 +185,6 @@ class WindowsActuation:
             '!': ('{Alt down}',   '{Alt up}'),
             '#': ('{LWin down}',  '{LWin up}'),
         }
-
         prefix_down = []
         prefix_up = []
         i = 0
@@ -191,12 +193,9 @@ class WindowsActuation:
             prefix_down.append(down)
             prefix_up.insert(0, up)  # reverse order: last pressed, first released
             i += 1
-
-        key_part = keys[i:]  # everything after the modifier prefix(es)
-
+        key_part = keys[i:]
         if not prefix_down:
-            return keys  # no modifier prefix at all — pass through unchanged
-
+            return keys  # no modifier prefix — pass through unchanged
         return ''.join(prefix_down) + key_part + ''.join(prefix_up)
 
     # Method to detect command type (mouse/keyboard) with smart parsing
@@ -285,23 +284,21 @@ class WindowsActuation:
         
         if cmd_type == 'keyboard':
             processed_cmd = self._process_keyboard_command(processed_cmd)
-            kb_parts = processed_cmd.split(maxsplit=1)
-            kb_action = kb_parts[0]
-            kb_content = kb_parts[1] if len(kb_parts) > 1 else ''
+            kb_action, _, kb_content = processed_cmd.partition(' ')
 
             if kb_action == 'press':
                 # Convert modifier prefixes (^, +, !, #) to explicit AHK down/up
-                # syntax so that '^' never appears in the cmd /c echo string.
-                # cmd.exe treats '^' as its escape character and would eat it,
-                # turning 'press ^t' into 'press t' in the file. By converting
-                # to '{Ctrl down}t{Ctrl up}' first, no '^' enters the echo at all.
+                # so no '^' ever appears in the cmd /c echo string. The Rust agent
+                # passes the command as a pre-tokenized arg; cmd.exe never runs its
+                # escape-char pass, so '^' is not eaten and '^^' never collapses.
                 kb_content = self._convert_modifiers_to_explicit(kb_content)
                 echo_payload = f'press {kb_content}'
             else:
                 # 'type' action: '^' is a literal character the user wants typed.
-                # '^^' in cmd.exe echo collapses to '^'; AHK's SendText treats
-                # the resulting '^' as a literal character — no Ctrl behaviour.
-                echo_payload = processed_cmd.replace('^', '^^')
+                # Since cmd.exe does NOT collapse '^^' in this agent (same reason
+                # as above), we pass '^' raw — it lands in the file as-is, and
+                # AHK's SendText treats it as a plain character, not a modifier.
+                echo_payload = processed_cmd  # no escaping — pass raw
 
             shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
         else:
@@ -397,14 +394,12 @@ class WindowsActuation:
                 if cmd_type != 'invalid':
                     if cmd_type == 'keyboard':
                         formatted_cmd = self._process_keyboard_command(formatted_cmd)
-                        kb_parts = formatted_cmd.split(maxsplit=1)
-                        kb_action = kb_parts[0]
-                        kb_content = kb_parts[1] if len(kb_parts) > 1 else ''
+                        kb_action, _, kb_content = formatted_cmd.partition(' ')
                         if kb_action == 'press':
                             kb_content = self._convert_modifiers_to_explicit(kb_content)
                             echo_payload = f'press {kb_content}'
                         else:
-                            echo_payload = formatted_cmd.replace('^', '^^')
+                            echo_payload = formatted_cmd  # 'type': pass raw, no escaping
                         shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
                     else:
                         shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'
