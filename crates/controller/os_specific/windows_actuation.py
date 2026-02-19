@@ -159,7 +159,46 @@ class WindowsActuation:
         # If it starts with modifiers but has other keys, keep as-is
         # e.g., "#r" (Win+R) stays as "#r"
         return command
-    
+
+    # Convert AHK modifier-prefix notation to explicit down/up syntax
+    def _convert_modifiers_to_explicit(self, keys: str) -> str:
+        """
+        Convert AHK modifier prefix notation to explicit {Key down}/{Key up} syntax.
+
+        This eliminates '^', '+', '!', '#' from the string that gets passed to
+        cmd /c echo, which would otherwise eat them as escape/special characters.
+
+        Examples:
+            "^t"        -> "{Ctrl down}t{Ctrl up}"
+            "^c"        -> "{Ctrl down}c{Ctrl up}"
+            "^+t"       -> "{Ctrl down}{Shift down}t{Shift up}{Ctrl up}"
+            "^+{Esc}"   -> "{Ctrl down}{Shift down}{Esc}{Shift up}{Ctrl up}"
+            "{F5}"      -> "{F5}"   (no modifier prefix, unchanged)
+            "{LCtrl}"   -> "{LCtrl}" (already explicit, unchanged)
+        """
+        modifier_map = {
+            '^': ('{Ctrl down}',  '{Ctrl up}'),
+            '+': ('{Shift down}', '{Shift up}'),
+            '!': ('{Alt down}',   '{Alt up}'),
+            '#': ('{LWin down}',  '{LWin up}'),
+        }
+
+        prefix_down = []
+        prefix_up = []
+        i = 0
+        while i < len(keys) and keys[i] in modifier_map:
+            down, up = modifier_map[keys[i]]
+            prefix_down.append(down)
+            prefix_up.insert(0, up)  # reverse order: last pressed, first released
+            i += 1
+
+        key_part = keys[i:]  # everything after the modifier prefix(es)
+
+        if not prefix_down:
+            return keys  # no modifier prefix at all — pass through unchanged
+
+        return ''.join(prefix_down) + key_part + ''.join(prefix_up)
+
     # Method to detect command type (mouse/keyboard) with smart parsing
     def detect_command_type(self, command: str) -> Tuple[str, str]:
         """
@@ -246,21 +285,25 @@ class WindowsActuation:
         
         if cmd_type == 'keyboard':
             processed_cmd = self._process_keyboard_command(processed_cmd)
-            # Use PowerShell Set-Content instead of 'cmd /c echo'.
-            #
-            # The old SSH tool relied on cmd.exe's command-line parser collapsing
-            # '^^' -> '^' before writing to the file. That worked because SSH's
-            # exec_command routes through cmd.exe's interpreter on Windows.
-            #
-            # The gRPC Rust agent uses std::process::Command which passes arguments
-            # as tokenised subprocess args -- cmd.exe never runs its escape-character
-            # pass, so '^^' lands in the file literally. AHK then receives
-            # 'Send ^^t' which types a literal caret+t instead of Ctrl+T.
-            #
-            # PowerShell has NO special meaning for '^', so 'press ^t' is written
-            # to the file exactly as-is, which is exactly what AHK needs.
-            ps_content = processed_cmd.replace("'", "''")   # escape PS single-quotes
-            shell_cmd = f"powershell -Command \"Set-Content -Path 'C:\\keyboard_cmd.txt' -Value '{ps_content}'\"" 
+            kb_parts = processed_cmd.split(maxsplit=1)
+            kb_action = kb_parts[0]
+            kb_content = kb_parts[1] if len(kb_parts) > 1 else ''
+
+            if kb_action == 'press':
+                # Convert modifier prefixes (^, +, !, #) to explicit AHK down/up
+                # syntax so that '^' never appears in the cmd /c echo string.
+                # cmd.exe treats '^' as its escape character and would eat it,
+                # turning 'press ^t' into 'press t' in the file. By converting
+                # to '{Ctrl down}t{Ctrl up}' first, no '^' enters the echo at all.
+                kb_content = self._convert_modifiers_to_explicit(kb_content)
+                echo_payload = f'press {kb_content}'
+            else:
+                # 'type' action: '^' is a literal character the user wants typed.
+                # '^^' in cmd.exe echo collapses to '^'; AHK's SendText treats
+                # the resulting '^' as a literal character — no Ctrl behaviour.
+                echo_payload = processed_cmd.replace('^', '^^')
+
+            shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
         else:
             shell_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
         
@@ -354,10 +397,15 @@ class WindowsActuation:
                 if cmd_type != 'invalid':
                     if cmd_type == 'keyboard':
                         formatted_cmd = self._process_keyboard_command(formatted_cmd)
-                        # Same fix as execute_command: use PowerShell Set-Content so
-                        # '^' is never treated as a cmd.exe escape character.
-                        ps_content = formatted_cmd.replace("'", "''")
-                        shell_cmd = f"powershell -Command \"Set-Content -Path 'C:\\keyboard_cmd.txt' -Value '{ps_content}'\"" 
+                        kb_parts = formatted_cmd.split(maxsplit=1)
+                        kb_action = kb_parts[0]
+                        kb_content = kb_parts[1] if len(kb_parts) > 1 else ''
+                        if kb_action == 'press':
+                            kb_content = self._convert_modifiers_to_explicit(kb_content)
+                            echo_payload = f'press {kb_content}'
+                        else:
+                            echo_payload = formatted_cmd.replace('^', '^^')
+                        shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
                     else:
                         shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'
                     yield shell_cmd, i, len(commands), command
