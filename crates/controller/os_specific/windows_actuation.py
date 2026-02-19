@@ -339,8 +339,13 @@ class WindowsActuation:
             for i, command in enumerate(commands, 1):
                 cmd_type, formatted_cmd = self.detect_command_type(command)
                 if cmd_type != 'invalid':
-                    # Escape carets and process standalone modifiers for keyboard commands
                     if cmd_type == 'keyboard':
+                        # Must call _process_keyboard_command FIRST (same as execute_command)
+                        # so that standalone modifiers like 'press ^' become 'press {LCtrl}'
+                        # BEFORE the cmd.exe caret-escaping runs. Without this, 'press ^'
+                        # becomes 'press ^^' → file gets 'press ^' → AHK receives bare '^'
+                        # with no key to combine, and the CTRL press silently does nothing.
+                        formatted_cmd = self._process_keyboard_command(formatted_cmd)
                         escaped_cmd = formatted_cmd.replace('^', '^^')
                         shell_cmd = f'cmd /c echo {escaped_cmd} > C:\\keyboard_cmd.txt'
                     else:
