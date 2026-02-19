@@ -287,18 +287,11 @@ class WindowsActuation:
             kb_action, _, kb_content = processed_cmd.partition(' ')
 
             if kb_action == 'press':
-                # Convert modifier prefixes (^, +, !, #) to explicit AHK down/up
-                # so no '^' ever appears in the cmd /c echo string. The Rust agent
-                # passes the command as a pre-tokenized arg; cmd.exe never runs its
-                # escape-char pass, so '^' is not eaten and '^^' never collapses.
                 kb_content = self._convert_modifiers_to_explicit(kb_content)
                 echo_payload = f'press {kb_content}'
             else:
-                # 'type' action: '^' is a literal character the user wants typed.
-                # Since cmd.exe does NOT collapse '^^' in this agent (same reason
-                # as above), we pass '^' raw — it lands in the file as-is, and
-                # AHK's SendText treats it as a plain character, not a modifier.
-                echo_payload = processed_cmd  # no escaping — pass raw
+                kb_content_escaped = kb_content.replace('^', '{^}')
+                echo_payload = f'type {kb_content_escaped}'
 
             shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
         else:
