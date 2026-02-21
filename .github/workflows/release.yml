@@ -37,7 +37,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
 
       - name: Generate Protobuf Files
         run: |
@@ -160,7 +160,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
 
       - name: Generate Protobuf Files
         run: |
@@ -281,7 +281,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
 
       - name: Generate Protobuf Files
         run: |
@@ -408,7 +408,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
 
       - name: Generate Protobuf Files
         run: |
@@ -535,7 +535,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
 
       - name: Generate Protobuf Files
         shell: bash
