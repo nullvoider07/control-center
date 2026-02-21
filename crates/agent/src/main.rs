@@ -3,8 +3,6 @@
 use tonic::{Request, Response, Status};
 use tracing::{info, warn, error, debug};
 use std::process::Command as ProcessCommand;
-#[cfg(target_os = "windows")]
-use std::fs;
 use std::time::Instant;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use regex::Regex;
@@ -469,9 +467,8 @@ impl AgentServiceImpl {
     /// Windows execution by writing to files for AutoHotkey
     #[cfg(target_os = "windows")]
     async fn execute_windows(&self, command: &str) -> Result<String, String> {
-        use chrono::format;
 
-        let outpuut = ProcessCommand::new("cmd")
+        let output = ProcessCommand::new("cmd")
             .arg("/c")
             .arg(command)
             .output()
