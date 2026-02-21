@@ -29,13 +29,19 @@ class JSONFormatter(logging.Formatter):
         if record.exc_info:
             log_data['exception'] = self.formatException(record.exc_info)
         
-        # Add extra fields
-        if hasattr(record, 'user_id'):
-            log_data['user_id'] = getattr(record, 'user_id')
-        if hasattr(record, 'session_id'):
-            log_data['session_id'] = getattr(record, 'session_id')
-        if hasattr(record, 'command'):
-            log_data['command'] = getattr(record, 'command')
+        # Pass through ALL extra fields added via the extra={} kwarg to logger calls.
+        # Previously only user_id/session_id/command were captured; this meant that
+        # AuditLogger's structured fields (event, success, ip_address, attempt, etc.)
+        # were silently dropped from the JSON output.
+        _STDLIB_ATTRS = frozenset({
+            'name', 'msg', 'args', 'levelname', 'levelno', 'pathname', 'filename',
+            'module', 'exc_info', 'exc_text', 'stack_info', 'lineno', 'funcName',
+            'created', 'msecs', 'relativeCreated', 'thread', 'threadName',
+            'processName', 'process', 'message', 'taskName',
+        })
+        for key, value in record.__dict__.items():
+            if key not in _STDLIB_ATTRS and not key.startswith('_'):
+                log_data[key] = value
         
         return json.dumps(log_data)
 
@@ -391,8 +397,24 @@ class AuditLogger:
             extra={'event': 'permission_denied', 'user_id': user_id, 'action': action, 'resource': resource}
         )
 
+    # Log agent disconnect event
+    def log_agent_disconnect(self, session_id: str, user_id: str, reason: str):
+        """Log operator-initiated agent disconnect"""
+        self.logger.info(
+            f"Agent disconnected: {session_id} by {user_id}",
+            extra={
+                'event': 'agent_disconnect',
+                'session_id': session_id,
+                'user_id': user_id,
+                'reason': reason,
+            }
+        )
+
 # Global logger instance (can be imported)
 logger = None
+
+# Global audit logger singleton — lazy-initialised on first call
+_audit_logger: Optional[AuditLogger] = None
 
 # Function to get or create logger instance
 def get_logger(name: Optional[str] = None) -> logging.Logger:
@@ -411,3 +433,25 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
         logger = setup_logger(name or 'control-center')
     
     return logger
+
+
+def get_audit_logger(log_dir: str = "./logs/audit") -> AuditLogger:
+    """Return the process-wide AuditLogger singleton.
+
+    Creates the logger on first call (with the supplied log_dir), then returns
+    the same instance on every subsequent call regardless of log_dir — matching
+    the behaviour of get_logger().
+
+    Usage in cli.py::
+
+        from controller.utils.logger import get_audit_logger
+        audit = get_audit_logger()
+        audit.log_session_start(session_id, user_id)
+        audit.log_auth_attempt(user_id, success=True, ip_address=host)
+        ...
+        audit.log_session_end(session_id, duration_seconds)
+    """
+    global _audit_logger
+    if _audit_logger is None:
+        _audit_logger = AuditLogger(log_dir=log_dir)
+    return _audit_logger

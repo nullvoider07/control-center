@@ -74,6 +74,16 @@ class ControlServiceStub(object):
                 request_serializer=control__center__pb2.InfoRequest.SerializeToString,
                 response_deserializer=control__center__pb2.ServerIdentity.FromString,
                 _registered_method=True)
+        self.DisconnectAgent = channel.unary_unary(
+                '/control_center.ControlService/DisconnectAgent',
+                request_serializer=control__center__pb2.DisconnectAgentRequest.SerializeToString,
+                response_deserializer=control__center__pb2.DisconnectAgentResponse.FromString,
+                _registered_method=True)
+        self.GetConnectionHistory = channel.unary_unary(
+                '/control_center.ControlService/GetConnectionHistory',
+                request_serializer=control__center__pb2.ConnectionHistoryRequest.SerializeToString,
+                response_deserializer=control__center__pb2.ConnectionHistoryResponse.FromString,
+                _registered_method=True)
         self.GetAgentInfo = channel.unary_unary(
                 '/control_center.ControlService/GetAgentInfo',
                 request_serializer=control__center__pb2.AgentInfoRequest.SerializeToString,
@@ -133,21 +143,35 @@ class ControlServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def QueryConnections(self, request, context):
-        """Query connection status (for monitoring)
+        """Query connection status (for monitoring) - no auth required
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def QueryServers(self, request, context):
-        """Query server status (for monitoring)
+        """Query server status (for monitoring) - no auth required
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetServerIdentity(self, request, context):
-        """Get server identity
+        """Get server identity - no auth required
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DisconnectAgent(self, request, context):
+        """Disconnect the currently connected agent - requires auth
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetConnectionHistory(self, request, context):
+        """Get connection history - no auth required
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -173,7 +197,7 @@ class ControlServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def GetMetrics(self, request, context):
-        """Get server metrics (Prometheus format)
+        """Get server metrics (Prometheus format) - requires auth + metrics scope
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -216,6 +240,16 @@ def add_ControlServiceServicer_to_server(servicer, server):
                     servicer.GetServerIdentity,
                     request_deserializer=control__center__pb2.InfoRequest.FromString,
                     response_serializer=control__center__pb2.ServerIdentity.SerializeToString,
+            ),
+            'DisconnectAgent': grpc.unary_unary_rpc_method_handler(
+                    servicer.DisconnectAgent,
+                    request_deserializer=control__center__pb2.DisconnectAgentRequest.FromString,
+                    response_serializer=control__center__pb2.DisconnectAgentResponse.SerializeToString,
+            ),
+            'GetConnectionHistory': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetConnectionHistory,
+                    request_deserializer=control__center__pb2.ConnectionHistoryRequest.FromString,
+                    response_serializer=control__center__pb2.ConnectionHistoryResponse.SerializeToString,
             ),
             'GetAgentInfo': grpc.unary_unary_rpc_method_handler(
                     servicer.GetAgentInfo,
@@ -432,6 +466,60 @@ class ControlService(object):
             '/control_center.ControlService/GetServerIdentity',
             control__center__pb2.InfoRequest.SerializeToString,
             control__center__pb2.ServerIdentity.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DisconnectAgent(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/DisconnectAgent',
+            control__center__pb2.DisconnectAgentRequest.SerializeToString,
+            control__center__pb2.DisconnectAgentResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetConnectionHistory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/control_center.ControlService/GetConnectionHistory',
+            control__center__pb2.ConnectionHistoryRequest.SerializeToString,
+            control__center__pb2.ConnectionHistoryResponse.FromString,
             options,
             channel_credentials,
             insecure,

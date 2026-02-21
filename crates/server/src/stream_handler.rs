@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::proto::{
     AgentMessage, ServerMessage, CommandRequest, CommandResponse,
     agent_message, server_message, ServerHeartbeat, ServerStatus,
+    DisconnectNotice,
 };
 use crate::registry::ConnectionRegistry;
 
@@ -257,14 +258,20 @@ impl StreamHandler {
         }
         
         info!("Incoming message handler ended for {}", connection_id);
+        // Ensure registry is cleaned up if the stream ended without an explicit
+        // DisconnectNotice from the agent (e.g. network drop, process killed).
+        registry.unregister_agent(&connection_id, Some("stream closed".to_string())).await;
         Ok(())
     }
     
-    /// Handle outgoing messages to agent
+    /// Handle outgoing messages to agent.
+    /// On each heartbeat tick, also checks the registry disconnect_signal.
+    /// If a signal is present (set by DisconnectAgent RPC), it drains the
+    /// command queue, sends a graceful DisconnectNotice to the agent, and exits.
     async fn handle_outgoing_messages(
         connection_id: String,
         server_tx: mpsc::Sender<Result<ServerMessage, Status>>,
-        _registry: Arc<ConnectionRegistry>,
+        registry: Arc<ConnectionRegistry>,
         command_queue: Arc<RwLock<VecDeque<QueuedCommand>>>,
         pending_commands: Arc<RwLock<HashMap<String, PendingCommand>>>,
         new_command_notify: Arc<tokio::sync::Notify>,
@@ -279,14 +286,72 @@ impl StreamHandler {
             tokio::select! {
                 // Send heartbeat
                 _ = heartbeat_interval.tick() => {
+                    // --- Check for operator-requested disconnect first ---
+                    if let Some(reason) = registry.consume_disconnect_signal().await {
+                        info!(
+                            "Disconnect signal received for connection {}: {}",
+                            connection_id, reason
+                        );
+
+                        // Send graceful disconnect notice to agent
+                        let notice = DisconnectNotice {
+                            reason: reason.clone(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            graceful: true,
+                        };
+                        let _ = server_tx.send(Ok(ServerMessage {
+                            payload: Some(server_message::Payload::Disconnect(notice)),
+                        })).await;
+
+                        // Fail queued commands so CLI callers unblock immediately
+                        let mut queue = command_queue.write().await;
+                        while let Some(queued) = queue.pop_front() {
+                            let _ = queued.response_tx.send(CommandResponse {
+                                id: queued.request.id.clone(),
+                                success: false,
+                                message: format!(
+                                    "Agent disconnected by operator: {}", reason
+                                ),
+                                execution_time_ms: 0,
+                                mouse_x: None,
+                                mouse_y: None,
+                                position_captured: None,
+                                metadata: std::collections::HashMap::new(),
+                            });
+                        }
+                        drop(queue);
+
+                        // Fail any in-flight pending commands too
+                        let mut pending = pending_commands.write().await;
+                        for (_, pending_cmd) in pending.drain() {
+                            let _ = pending_cmd.response_tx.send(CommandResponse {
+                                id: String::new(),
+                                success: false,
+                                message: format!(
+                                    "Agent disconnected by operator: {}", reason
+                                ),
+                                execution_time_ms: 0,
+                                mouse_x: None,
+                                mouse_y: None,
+                                position_captured: None,
+                                metadata: std::collections::HashMap::new(),
+                            });
+                        }
+                        drop(pending);
+
+                        registry.unregister_agent(&connection_id, Some(reason)).await;
+                        break;
+                    }
+
+                    // --- Regular heartbeat ---
                     let heartbeat = ServerHeartbeat {
                         server_id: server_id.clone(),
                         timestamp: chrono::Utc::now().timestamp(),
                         status: Some(ServerStatus {
                             accepting_connections: true,
                             agent_connected: true,
-                            total_commands_processed: 0, // TODO: Track actual count
-                            uptime_seconds: 0, // TODO: Track actual uptime
+                            total_commands_processed: 0,
+                            uptime_seconds: 0,
                         }),
                     };
                     

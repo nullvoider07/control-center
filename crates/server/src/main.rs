@@ -540,6 +540,90 @@ impl ControlService for ControlCenterService {
             timestamp: chrono::Utc::now().timestamp(),
         }))
     }
+
+    /// Forcefully disconnect the currently connected agent.
+    /// Sets a signal that the stream handler picks up on its next heartbeat
+    /// tick (within 30 s), sends a graceful DisconnectNotice, then cleans up.
+    /// Requires a valid JWT token; any authenticated user may call this.
+    async fn disconnect_agent(
+        &self,
+        request: Request<proto::DisconnectAgentRequest>,
+    ) -> Result<Response<proto::DisconnectAgentResponse>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        self.check_rate_limit(&claims.sub).await?;
+
+        let req = request.into_inner();
+        let reason = if req.reason.is_empty() {
+            format!("Disconnected by operator: {}", claims.sub)
+        } else {
+            req.reason.clone()
+        };
+
+        info!(
+            "DisconnectAgent requested by user '{}' — reason: {}",
+            claims.sub, reason
+        );
+
+        let (found, conn_id) = self.registry.request_disconnect(reason.clone()).await;
+
+        if found {
+            info!("Disconnect signal set for connection: {}", conn_id);
+            Ok(Response::new(proto::DisconnectAgentResponse {
+                success: true,
+                message: format!("Disconnect signal sent to agent (connection: {})", conn_id),
+                disconnected_connection_id: conn_id,
+            }))
+        } else {
+            Ok(Response::new(proto::DisconnectAgentResponse {
+                success: false,
+                message: "No agent is currently connected".to_string(),
+                disconnected_connection_id: String::new(),
+            }))
+        }
+    }
+
+    /// Return connection history stored in the registry.
+    /// No JWT required — this is read-only operational metadata.
+    async fn get_connection_history(
+        &self,
+        request: Request<proto::ConnectionHistoryRequest>,
+    ) -> Result<Response<proto::ConnectionHistoryResponse>, Status> {
+        let req = request.into_inner();
+
+        // Default 50, clamp to max 500
+        let limit = req.limit
+            .filter(|&l| l > 0)
+            .map(|l| l.min(500) as usize)
+            .unwrap_or(50);
+
+        let history = self.registry.get_history(Some(limit)).await;
+
+        let connections: Vec<proto::HistoricalConnection> = history
+            .into_iter()
+            .map(|h| proto::HistoricalConnection {
+                connection_id: h.connection_id,
+                agent_id: h.agent_id,
+                agent_hostname: h.agent_hostname,
+                agent_ip: h.agent_ip,
+                os_type: h.os_type,
+                os_version: h.os_version,
+                capabilities: h.capabilities,
+                server_ip: h.server_ip,
+                connected_at: h.connected_at,
+                disconnected_at: h.disconnected_at,
+                commands_executed: h.commands_executed,
+                disconnect_reason: h.disconnect_reason,
+            })
+            .collect();
+
+        let total_count = connections.len() as i32;
+        info!("GetConnectionHistory: returning {} records", total_count);
+
+        Ok(Response::new(proto::ConnectionHistoryResponse {
+            connections,
+            total_count,
+        }))
+    }
 }
 
 // Main function to start the gRPC server

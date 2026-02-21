@@ -1,6 +1,7 @@
 // proto/control_center.proto
-// Complete Protocol Buffer Definitions v2.0
-// Includes: Identification, Monitoring, Connection Tracking
+// Complete Protocol Buffer Definitions v3.0
+// Includes: Identification, Monitoring, Connection Tracking,
+//           Agent Management, Connection History
 
 syntax = "proto3";
 
@@ -176,6 +177,54 @@ message ServerInfo {
 }
 
 // ============================================================================
+// AGENT MANAGEMENT MESSAGES
+// ============================================================================
+
+// Request to forcefully disconnect the current agent
+message DisconnectAgentRequest {
+  string connection_id = 1;   // Connection ID to disconnect (empty = disconnect current)
+  string reason = 2;          // Reason for disconnection (for audit log)
+}
+
+// Response to disconnect request
+message DisconnectAgentResponse {
+  bool success = 1;
+  string message = 2;
+  string disconnected_connection_id = 3; // The connection ID that was disconnected
+}
+
+// ============================================================================
+// CONNECTION HISTORY MESSAGES
+// ============================================================================
+
+// A single historical connection record
+message HistoricalConnection {
+  string connection_id = 1;
+  string agent_id = 2;
+  string agent_hostname = 3;
+  string agent_ip = 4;
+  int32 os_type = 5;
+  string os_version = 6;
+  repeated string capabilities = 7;
+  string server_ip = 8;
+  int64 connected_at = 9;
+  optional int64 disconnected_at = 10;
+  uint64 commands_executed = 11;
+  optional string disconnect_reason = 12;
+}
+
+// Request connection history
+message ConnectionHistoryRequest {
+  optional int32 limit = 1;   // Max records to return (default: 50, max: 500)
+}
+
+// Connection history response
+message ConnectionHistoryResponse {
+  repeated HistoricalConnection connections = 1;
+  int32 total_count = 2;
+}
+
+// ============================================================================
 // STREAM MESSAGES
 // ============================================================================
 
@@ -294,31 +343,37 @@ message MetricsResponse {
 service ControlService {
   // Agent registration (agent calls this when connecting)
   rpc RegisterAgent(RegistrationRequest) returns (RegistrationResponse);
-  
+
   // Bidirectional stream between agent and server
   rpc AgentStream(stream AgentMessage) returns (stream ServerMessage);
-  
+
   // Execute command (CLI to server)
   rpc ExecuteCommand(CommandRequest) returns (CommandResponse);
-  
+
   // Monitor connection (CLI to server)
   rpc MonitorConnection(MonitorRequest) returns (stream ConnectionStatus);
-  
-  // Query connection status (for monitoring)
+
+  // Query connection status (for monitoring) - no auth required
   rpc QueryConnections(ConnectionQuery) returns (ConnectionStatusResponse);
-  
-  // Query server status (for monitoring)
+
+  // Query server status (for monitoring) - no auth required
   rpc QueryServers(ServerStatusQuery) returns (ServerStatusResponse);
-  
-  // Get server identity
+
+  // Get server identity - no auth required
   rpc GetServerIdentity(InfoRequest) returns (ServerIdentity);
-  
+
+  // Disconnect the currently connected agent - requires auth
+  rpc DisconnectAgent(DisconnectAgentRequest) returns (DisconnectAgentResponse);
+
+  // Get connection history - no auth required
+  rpc GetConnectionHistory(ConnectionHistoryRequest) returns (ConnectionHistoryResponse);
+
   // Legacy compatibility
   rpc GetAgentInfo(AgentInfoRequest) returns (AgentInfo);
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc Ping(PingRequest) returns (PongResponse);
 
-  // Get server metrics (Prometheus format)
+  // Get server metrics (Prometheus format) - requires auth + metrics scope
   rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
 }
 

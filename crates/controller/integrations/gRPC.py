@@ -1,7 +1,7 @@
 """gRPC client with token-based authentication"""
 
 import grpc
-from typing import Optional, Dict, Iterator, Any
+from typing import Optional, Dict, Iterator, Any, List
 from uuid import uuid4
 import time
 import logging
@@ -241,7 +241,7 @@ class GRPCClient:
         try:
             state = self.channel.get_state(try_to_connect=False)
             if state == grpc.ChannelConnectivity.SHUTDOWN:
-                self._connected = False
+                self.connected = False
                 return False
             return True
         except:
@@ -460,6 +460,293 @@ class GRPCClient:
         }
         return os_map.get(os_enum, "UNKNOWN")
     
+    # ------------------------------------------------------------------ #
+    # Monitoring RPCs (no auth required)
+    # ------------------------------------------------------------------ #
+
+    def query_connections(
+        self,
+        server_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        network: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Query current connection metadata from the server.
+
+        No authentication required.
+
+        Returns:
+            Dict with keys: connections (list[dict]), total_count (int)
+            Each connection dict: connection_id, server_id, agent_id,
+            agent_hostname, agent_ip, server_ip, network, connected_at,
+            last_heartbeat, commands_executed, state
+        """
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+        try:
+            request = control_center_pb2.ConnectionQuery(
+                server_id=server_id or "",
+                agent_id=agent_id or "",
+                network=network or "",
+            )
+            response = self.stub.QueryConnections(request, timeout=self.timeout)
+            self._last_activity = time.time()
+            return {
+                'total_count': response.total_count,
+                'connections': [self._connection_metadata_to_dict(c) for c in response.connections],
+            }
+        except grpc.RpcError as e:
+            logger.error(f"QueryConnections failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+            return None
+
+    def query_server_status(
+        self,
+        server_id: Optional[str] = None,
+        network: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Query server status (identity, uptime, connection state).
+
+        No authentication required.
+
+        Returns:
+            Dict with keys: servers (list[dict]), total_count (int)
+            Each server dict: identity (dict), status (dict),
+            current_connection (dict|None), last_seen (int)
+        """
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+        try:
+            request = control_center_pb2.ServerStatusQuery(
+                server_id=server_id or "",
+                network=network or "",
+            )
+            response = self.stub.QueryServers(request, timeout=self.timeout)
+            self._last_activity = time.time()
+
+            servers = []
+            for srv in response.servers:
+                ident = srv.identity
+                stat = srv.status
+                server_dict: Dict[str, Any] = {
+                    'identity': {
+                        'server_id': ident.server_id,
+                        'hostname': ident.hostname,
+                        'listen_address': ident.listen_address,
+                        'version': ident.version,
+                        'started_at': ident.started_at,
+                        'network': ident.network,
+                    },
+                    'status': {
+                        'accepting_connections': stat.accepting_connections,
+                        'agent_connected': stat.agent_connected,
+                        'total_commands_processed': stat.total_commands_processed,
+                        'uptime_seconds': stat.uptime_seconds,
+                    },
+                    'current_connection': (
+                        self._connection_metadata_to_dict(srv.current_connection)
+                        if srv.HasField('current_connection') else None
+                    ),
+                    'last_seen': srv.last_seen,
+                }
+                servers.append(server_dict)
+
+            return {'total_count': response.total_count, 'servers': servers}
+        except grpc.RpcError as e:
+            logger.error(f"QueryServers failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+            return None
+
+    def get_server_identity(self) -> Optional[Dict]:
+        """Get persistent server identity.
+
+        No authentication required.
+
+        Returns:
+            Dict with keys: server_id, hostname, listen_address, version,
+            started_at (unix int), network
+        """
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+        try:
+            request = control_center_pb2.InfoRequest()
+            response = self.stub.GetServerIdentity(request, timeout=self.timeout)
+            self._last_activity = time.time()
+            return {
+                'server_id': response.server_id,
+                'hostname': response.hostname,
+                'listen_address': response.listen_address,
+                'version': response.version,
+                'started_at': response.started_at,
+                'network': response.network,
+            }
+        except grpc.RpcError as e:
+            logger.error(f"GetServerIdentity failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+            return None
+
+    def ping(self) -> Optional[float]:
+        """Ping the server and measure round-trip time.
+
+        No authentication required.
+
+        Returns:
+            Round-trip time in milliseconds, or None if ping failed.
+        """
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+        try:
+            request = control_center_pb2.PingRequest()
+            start = time.time()
+            response = self.stub.Ping(request, timeout=self.timeout)
+            rtt_ms = (time.time() - start) * 1000
+            self._last_activity = time.time()
+            return rtt_ms if response.alive else None
+        except grpc.RpcError as e:
+            logger.error(f"Ping failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Authenticated monitoring RPCs
+    # ------------------------------------------------------------------ #
+
+    def get_metrics(self) -> Optional[Dict]:
+        """Retrieve server Prometheus-format metrics.
+
+        Requires a valid token with 'metrics' scope.
+
+        Returns:
+            Dict with keys: metrics (str, raw Prometheus text), timestamp (int)
+
+        Raises:
+            AuthenticationError: If token is missing, invalid, or lacks 'metrics' scope.
+        """
+        if not self.token:
+            raise AuthenticationError(message="Not authenticated")
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+        try:
+            request = control_center_pb2.MetricsRequest()
+            response = self.stub.GetMetrics(
+                request,
+                metadata=self._get_metadata(),
+                timeout=self.timeout,
+            )
+            self._last_activity = time.time()
+            return {'metrics': response.metrics, 'timestamp': response.timestamp}
+        except grpc.RpcError as e:
+            logger.error(f"GetMetrics failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+            if e.code() == grpc.StatusCode.PERMISSION_DENIED:
+                raise AuthenticationError(
+                    message="Token lacks 'metrics' scope. Regenerate with: generate_token <user> <hours> execute metrics"
+                )
+            if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                raise AuthenticationError.invalid_token(reason=e.details() or "Token invalid or expired")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Agent management RPCs (require auth)
+    # ------------------------------------------------------------------ #
+
+    def disconnect_agent(self, reason: str = "") -> Dict:
+        """Send a graceful disconnect signal to the currently connected agent.
+
+        The stream handler picks up the signal on its next heartbeat tick
+        (within 30 s) and sends a DisconnectNotice to the agent.
+
+        Requires a valid token.
+
+        Returns:
+            Dict with keys: success (bool), message (str),
+            disconnected_connection_id (str)
+
+        Raises:
+            AuthenticationError: If token is missing or invalid.
+        """
+        if not self.token:
+            raise AuthenticationError(message="Not authenticated")
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+        try:
+            request = control_center_pb2.DisconnectAgentRequest(reason=reason)
+            response = self.stub.DisconnectAgent(
+                request,
+                metadata=self._get_metadata(),
+                timeout=self.timeout,
+            )
+            self._last_activity = time.time()
+            return {
+                'success': response.success,
+                'message': response.message,
+                'disconnected_connection_id': response.disconnected_connection_id,
+            }
+        except grpc.RpcError as e:
+            logger.error(f"DisconnectAgent failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+            if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                raise AuthenticationError.invalid_token(reason=e.details() or "Token invalid or expired")
+            return {
+                'success': False,
+                'message': f"gRPC error: {e.details() if hasattr(e, 'details') else e}",
+                'disconnected_connection_id': '',
+            }
+
+    def get_connection_history(self, limit: int = 50) -> Optional[List[Dict]]:
+        """Fetch historical agent connection records from the server registry.
+
+        No authentication required — read-only operational metadata.
+
+        Args:
+            limit: Maximum records to return (default 50, server-side max 500).
+
+        Returns:
+            List of dicts, each with: connection_id, agent_id, agent_hostname,
+            agent_ip, os_type (int), os_version, capabilities (list[str]),
+            server_ip, connected_at (unix int), disconnected_at (unix int|None),
+            commands_executed (int), disconnect_reason (str|None)
+        """
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+        try:
+            request = control_center_pb2.ConnectionHistoryRequest(limit=limit)
+            response = self.stub.GetConnectionHistory(request, timeout=self.timeout)
+            self._last_activity = time.time()
+            records = []
+            for h in response.connections:
+                records.append({
+                    'connection_id': h.connection_id,
+                    'agent_id': h.agent_id,
+                    'agent_hostname': h.agent_hostname,
+                    'agent_ip': h.agent_ip,
+                    'os_type': h.os_type,
+                    'os_version': h.os_version,
+                    'capabilities': list(h.capabilities),
+                    'server_ip': h.server_ip,
+                    'connected_at': h.connected_at,
+                    'disconnected_at': h.disconnected_at if h.HasField('disconnected_at') else None,
+                    'commands_executed': h.commands_executed,
+                    'disconnect_reason': h.disconnect_reason if h.HasField('disconnect_reason') else None,
+                })
+            return records
+        except grpc.RpcError as e:
+            logger.error(f"GetConnectionHistory failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _connection_metadata_to_dict(self, conn) -> Dict:
+        """Convert a ConnectionMetadata proto message to a plain dict."""
+        return {
+            'connection_id': conn.connection_id,
+            'server_id': conn.server_id,
+            'agent_id': conn.agent_id,
+            'agent_hostname': conn.agent_hostname,
+            'agent_ip': conn.agent_ip,
+            'server_ip': conn.server_ip,
+            'network': conn.network,
+            'connected_at': conn.connected_at,
+            'last_heartbeat': conn.last_heartbeat,
+            'commands_executed': conn.commands_executed,
+            'state': conn.state,
+        }
+
     # Context manager support for automatic connection management
     def __enter__(self):
         """Context manager entry"""
