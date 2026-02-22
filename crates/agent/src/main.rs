@@ -623,7 +623,6 @@ impl AgentServiceImpl {
     /// Windows execution by writing to files for AutoHotkey
     #[cfg(target_os = "windows")]
     async fn execute_windows(&self, command: &str) -> Result<String, String> {
-        use chrono::format;
 
         let output = ProcessCommand::new("cmd")
             .arg("/c")
