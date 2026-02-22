@@ -2763,8 +2763,7 @@ def server_start(host, port, single_agent, network, auth_url, token_url, client_
     click.echo(f"[INFO] Ready to accept agent connections")
     
     env = os.environ.copy()
-    env['GRPC_HOST'] = host
-    env['GRPC_PORT'] = str(port)
+    env['SERVER_ADDR'] = f"{host}:{port}"
     env['SINGLE_AGENT_MODE'] = 'true' if single_agent else 'false'
     if network:
         env['CONTROL_CENTER_NETWORK'] = network

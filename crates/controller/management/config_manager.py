@@ -147,7 +147,7 @@ class ConfigManager:
         config = self.load()
         
         return {
-            'host': host or config.get('server_host'),
+            'host': host or os.getenv('CONTROL_CENTER_HOST') or config.get('server_host'),
             'port': port or config.get('server_port', self.DEFAULTS['server_port']),
             'use_ssl': use_ssl if use_ssl is not None else config.get('use_ssl', self.DEFAULTS['use_ssl']),
             'timeout': config.get('timeout', self.DEFAULTS['timeout']),
