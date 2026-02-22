@@ -49,6 +49,11 @@ class CLIContext:
         self.metrics: Optional[MetricsCollector] = None
         self.config_manager = ConfigManager()
         self.interrupted = False
+        # True only while _interactive_mode() is running.
+        # The signal handler checks this to decide whether to exit the process
+        # outright (non-interactive) or merely raise KeyboardInterrupt so the
+        # interactive loop can handle Ctrl+C gracefully (BUG-011 fix).
+        self.in_interactive_mode = False
     
     def cleanup(self):
         """Cleanup resources"""
@@ -63,11 +68,38 @@ ctx = CLIContext()
 
 # Signal Handling for Graceful Shutdown
 def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    logger.info("\nInterrupt received. Cleaning up...")
-    ctx.interrupted = True
-    ctx.cleanup()
-    sys.exit(0)
+    """Handle Ctrl+C gracefully.
+
+    BUG-011 FIX — Two distinct behaviours depending on whether the process is
+    currently inside the interactive REPL or running a non-interactive command
+    (batch, execute, server start, etc.):
+
+    Interactive mode  (ctx.in_interactive_mode is True):
+        - Do NOT set ctx.interrupted — that flag is the while-loop exit guard.
+          Setting it here would cause the session to terminate on the very next
+          loop iteration after the KeyboardInterrupt is handled.
+        - Do NOT call ctx.cleanup() — that destroys the live gRPC session.
+        - Do NOT call sys.exit() — that kills the whole process immediately,
+          which was the exact symptom reported in BUG-011.
+        - Instead, raise KeyboardInterrupt so it propagates into the interactive
+          loop's  except KeyboardInterrupt  handler, which prints
+          "[*] Interrupted. Type 'exit' to disconnect."  and  continue s.
+          Raising from a signal handler is the standard Python idiom for
+          delegating SIGINT handling back to normal exception-flow logic.
+
+    Non-interactive mode  (ctx.in_interactive_mode is False):
+        - Original behaviour preserved: set the interrupt flag, disconnect, and
+          exit.  Batch jobs and one-shot execute commands terminate cleanly.
+    """
+    if ctx.in_interactive_mode:
+        # Delegate to the interactive loop's except KeyboardInterrupt handler.
+        # Do not touch ctx.interrupted, cleanup(), or sys.exit() here.
+        raise KeyboardInterrupt
+    else:
+        logger.info("\nInterrupt received. Cleaning up...")
+        ctx.interrupted = True
+        ctx.cleanup()
+        sys.exit(0)
 
 # Register signal handler
 signal.signal(signal.SIGINT, signal_handler)
@@ -298,8 +330,16 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
         # Print banner
         _print_banner(agent_info)
         
-        # Enter interactive mode with PERSISTENT connection
-        _interactive_mode(ctx.controller)
+        # Enter interactive mode with PERSISTENT connection.
+        # BUG-011 FIX: Raise the in_interactive_mode flag so signal_handler
+        # knows to raise KeyboardInterrupt instead of calling sys.exit(0).
+        # The try/finally guarantees the flag is always cleared, even if
+        # _interactive_mode exits via an unexpected exception.
+        ctx.in_interactive_mode = True
+        try:
+            _interactive_mode(ctx.controller)
+        finally:
+            ctx.in_interactive_mode = False
         
     except ValidationError as e:
         logger.error(f"Validation error: {e}")
