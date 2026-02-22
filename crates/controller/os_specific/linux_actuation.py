@@ -75,14 +75,14 @@ class LinuxActuation:
             cmd = f"DISPLAY={self.display} xdotool getmouselocation --shell"
             result = self.grpc_client.execute_command(cmd)
             
-            if result['success'] and 'output' in result:
-                output = result['output']
-                # Parse X=123\nY=456\nSCREEN=0\nWINDOW=...
-                x_match = re.search(r'X=(\d+)', output)
-                y_match = re.search(r'Y=(\d+)', output)
-                
-                if x_match and y_match:
-                    return (int(x_match.group(1)), int(y_match.group(1)))
+            # BUG-007 FIX: Position data is returned in mouse_x/mouse_y fields,
+            # not in a non-existent 'output' key. The agent captures position
+            # after mouse commands and returns it via these dedicated fields.
+            if result['success'] and result.get('position_captured'):
+                mx = result.get('mouse_x')
+                my = result.get('mouse_y')
+                if mx is not None and my is not None:
+                    return (mx, my)
             
             return None
         except Exception as e:
@@ -429,18 +429,26 @@ class LinuxActuation:
         result = self.grpc_client.execute_command(xdotool_cmd)
         
         # FOR MOUSE COMMANDS: Get position after action
+        # BUG-007 FIX: Read mouse_x/mouse_y directly from the gRPC result instead
+        # of making a redundant extra execute_command call (which tried to parse a
+        # non-existent 'output' key). The agent captures position after mouse
+        # commands and returns it in the dedicated mouse_x/mouse_y/position_captured fields.
         if cmd_type == 'mouse' and result['success'] and processed_cmd != 'position':
-            position_after = self._get_mouse_position()
+            mx = result.get('mouse_x')
+            my = result.get('mouse_y')
+            captured = result.get('position_captured', False)
+            position_after = (mx, my) if captured and mx is not None and my is not None else None
         
         # Handle position query result separately
-        if processed_cmd == 'position' and result['success'] and 'output' in result:
-            output = result['output']
-            x_match = re.search(r'X=(\d+)', output)
-            y_match = re.search(r'Y=(\d+)', output)
-            
-            if x_match and y_match:
-                x, y = x_match.group(1), y_match.group(1)
-                print(f"[POSITION] X={x}, Y={y}")
+        # BUG-007 FIX: Replace result['output'] (key never existed) with
+        # result.get('mouse_x') / result.get('mouse_y') from the agent's
+        # position capture mechanism.
+        if processed_cmd == 'position' and result['success']:
+            mx = result.get('mouse_x')
+            my = result.get('mouse_y')
+            captured = result.get('position_captured', False)
+            if captured and mx is not None and my is not None:
+                print(f"[POSITION] X={mx}, Y={my}")
                 return True
         
         # Display result with position info for mouse actions

@@ -231,33 +231,33 @@ class AuthenticationError(GRPCError):
     @classmethod
     def invalid_credentials(cls, user_id: str) -> 'AuthenticationError':
         """Create error for invalid credentials"""
+        # BUG-005 FIX: is_retryable removed — __init__ sets it via token_expired=False
         return cls(
             message="Authentication failed: Invalid credentials",
             user_id=user_id,
-            is_retryable=False,
         )
     
     # Factory method for session expiration with retry logic
     @classmethod
     def session_expired(cls, session_id: str, user_id: Optional[str] = None) -> 'AuthenticationError':
         """Create error for expired session"""
+        # BUG-005 FIX: is_retryable removed — __init__ sets it via token_expired=True → is_retryable=True
         return cls(
             message="Session has expired",
             session_id=session_id,
             user_id=user_id,
             token_expired=True,
-            is_retryable=True,
         )
     
     # Factory method for invalid token with security context
     @classmethod
     def invalid_token(cls, reason: str, user_id: Optional[str] = None) -> 'AuthenticationError':
         """Create error for invalid token"""
+        # BUG-005 FIX: is_retryable removed — __init__ sets it via token_expired=False
         return cls(
             message="Invalid session token",
             details=reason,
             user_id=user_id,
-            is_retryable=False,
         )
     
     # Suggest action to user based on error details

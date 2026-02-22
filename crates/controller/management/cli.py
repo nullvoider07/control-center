@@ -313,7 +313,7 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
         # Persist session data before cleanup so 'session' commands can read it
         _save_session_data()
         if ctx.session:
-            duration = ctx.session.get_duration()
+            duration = ctx.session.duration_seconds if hasattr(ctx.session, 'duration_seconds') else 0
             audit.log_session_end(session_id, duration)
         ctx.cleanup()
 
@@ -457,8 +457,20 @@ def _interactive_mode(controller):
             # Execute command
             command_count += 1
             try:
+                # BUG-010 FIX: Time the execution so we can pass execution_time_ms
+                # to record_command(). The controllers return only a bool, so we
+                # measure wall-clock time around the call. This is the minimal
+                # surgical change — no controller method signatures are altered.
+                _cmd_start = time.time()
                 success = controller.execute_command(user_input)
-                
+                _exec_ms = int((time.time() - _cmd_start) * 1000)
+
+                # Record the command in the MetricsCollector so that session stats,
+                # export, and the interactive `status` report all show real data
+                # instead of perpetual zeroes (which was the observable symptom).
+                if ctx.metrics:
+                    ctx.metrics.record_command(user_input, success, _exec_ms)
+
                 if success and ctx.session:
                     ctx.session.update_activity()
                     consecutive_failures = 0
@@ -796,8 +808,14 @@ def batch(host, port, token, ssl, input_file, fmt, delay, stop_on_error, output)
 # Status Command Group
 # ============================================================================
 
-@cli.group()
-def status():
+@cli.group(invoke_without_command=True)
+@click.option('--host', help='Server host')
+@click.option('--port', type=int, help='Server port')
+@click.option('--token', envvar='CONTROL_CENTER_TOKEN', help='API token')
+@click.option('--format', 'fmt', default='text', type=click.Choice(['text', 'json']),
+              help='Output format')
+@click.pass_context
+def status(click_ctx, host, port, token, fmt):
     """Show connection and server status (subcommands) or live summary (bare)
     
     Run bare with no subcommand for a combined live overview.
@@ -810,27 +828,20 @@ def status():
         control-center status system             # Controller host resources
         control-center status session            # Current/last session info
     """
-    pass
+    # BUG-012 FIX: Previously there were TWO registrations under the name
+    # "status" in Click's command registry: first @cli.group() (which attached
+    # all the subcommands), then @cli.command(name='status') (the bare overview).
+    # Click's registry is a dict so the second registration silently overwrote
+    # the first, discarding the entire subcommand tree. The fix is to use a
+    # single group decorated with invoke_without_command=True and run the
+    # overview logic here when no subcommand is provided.
+    if click_ctx.invoked_subcommand is not None:
+        # A subcommand was given — let Click dispatch to it; do nothing here.
+        return
 
-@status.result_callback()
-def _status_bare(result, **kwargs):
-    pass
-
-@cli.command(name='status')
-@click.option('--host', help='Server host')
-@click.option('--port', type=int, help='Server port')
-@click.option('--token', envvar='CONTROL_CENTER_TOKEN', help='API token')
-@click.option('--format', 'fmt', default='text', type=click.Choice(['text', 'json']),
-              help='Output format')
-def status_overview(host, port, token, fmt):
-    """Combined live status overview (connection + server + metrics + system)
-    
-    Examples:
-        control-center status
-        control-center status --format json
-    """
+    # ── Bare invocation: run the combined live status overview ────────────────
     h, p = _resolve_host_port(host, port)
-    
+
     # Try to get live connection data (no auth needed)
     client = _get_no_auth_client(h, p)
     conn_data = None
@@ -845,7 +856,7 @@ def status_overview(host, port, token, fmt):
     finally:
         if client.channel:
             client.channel.close()
-    
+
     # Always show local session/metrics if available from ctx
     if fmt == 'json':
         out: Dict = {
@@ -857,9 +868,9 @@ def status_overview(host, port, token, fmt):
         }
         click.echo(json.dumps(out, indent=2, default=str))
         return
-    
+
     click.echo("\n=== Control Center Status ===\n")
-    
+
     if server_data:
         ident = server_data['identity']
         st = server_data['status']
@@ -869,7 +880,7 @@ def status_overview(host, port, token, fmt):
         click.echo(f"Uptime:   {st.get('uptime_seconds', 0)}s")
         click.echo(f"Commands: {st.get('total_commands_processed', 0)} processed")
         click.echo("")
-    
+
     if conn_data:
         click.echo(f"Agent:    {conn_data.get('agent_hostname', 'N/A')} ({conn_data.get('agent_ip', '')})")
         click.echo(f"OS:       {conn_data.get('os_type', 'N/A')}")
@@ -880,16 +891,16 @@ def status_overview(host, port, token, fmt):
     else:
         click.echo("Agent:    No agent connected")
         click.echo("")
-    
+
     if ctx.metrics:
         stats = ctx.metrics.get_stats()
         click.echo(f"Session commands: {stats.get('total_commands', 0)}  "
                    f"success rate: {stats.get('success_rate', 0):.1f}%  "
                    f"avg: {stats.get('avg_execution_time_ms', 0):.1f}ms")
         click.echo("")
-    
-    sys = StatusReporter.get_system_status()
-    click.echo(f"CPU: {sys['cpu_percent']}%  Memory: {sys['memory_percent']}%  Disk: {sys['disk_percent']}%")
+
+    sys_info = StatusReporter.get_system_status()
+    click.echo(f"CPU: {sys_info['cpu_percent']}%  Memory: {sys_info['memory_percent']}%  Disk: {sys_info['disk_percent']}%")
     click.echo("")
 
 
@@ -1403,7 +1414,11 @@ def agent_history(host, port, limit, fmt):
         if client.channel:
             client.channel.close()
 
-    records = data.get('records', []) if data else []
+    # BUG-013 FIX: get_connection_history() returns a plain List[Dict], not a
+    # wrapper dict {"records": [...]}. Calling .get('records', []) on a list
+    # raised: AttributeError: 'list' object has no attribute 'get'.
+    # The fix is a single line: use the list directly.
+    records = data if data is not None else []
 
     if fmt == 'json':
         click.echo(json.dumps(records, indent=2, default=str))
@@ -1875,17 +1890,21 @@ def _jwt_secret() -> str:
 @click.option('--scopes', multiple=True, default=('execute', 'monitor'),
               help='Permission scopes (repeatable). '
                    'Options: execute monitor metrics admin  '
-                   'Example: --scopes execute --scopes metrics')
-@click.option('--expires', default=24, show_default=True,
-              help='Token lifetime in hours (0 = no expiry)')
+                   'Example: --scopes execute --scopes monitor')
+@click.option('--expires', default=24, type=float, show_default=True,
+              help='Token lifetime in hours, fractions allowed (0 = no expiry)')
 @click.option('--secret', 'secret_override', default=None, envvar='CC_JWT_SECRET',
               help='JWT signing secret (or set CC_JWT_SECRET)')
 @click.option('--algorithm', default='HS256',
               type=click.Choice(['HS256', 'HS384', 'HS512']),
               help='HMAC algorithm (default: HS256)')
+@click.option('--audience', default=None, envvar='JWT_AUDIENCE',
+              help='JWT audience claim (default: control-center)')
+@click.option('--issuer', default=None, envvar='JWT_ISSUER',
+              help='JWT issuer claim (default: control-center-auth)')
 @click.option('--output', '-o', default=None,
               help='Write token to this file instead of stdout')
-def token_generate(user, scopes, expires, secret_override, algorithm, output):
+def token_generate(user, scopes, expires, secret_override, algorithm, audience, issuer, output):
     """Generate a signed JWT API token
 
     The generated token is validated by the server on every authenticated RPC.
@@ -1896,7 +1915,7 @@ def token_generate(user, scopes, expires, secret_override, algorithm, output):
       admin    - DisconnectAgent, all admin operations
 
     Examples:
-        control-center token generate --user ops-bot --scopes execute monitor
+        control-center token generate --user ops-bot --scopes execute --scopes monitor
         control-center token generate --user ci --scopes execute --expires 1
     """
     try:
@@ -1908,13 +1927,21 @@ def token_generate(user, scopes, expires, secret_override, algorithm, output):
     secret = secret_override or _jwt_secret()
 
     import datetime as dt
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc)
+
+    # BUG-006 FIX: include aud and iss — server requires both claims
+    aud = audience or os.environ.get('JWT_AUDIENCE', 'control-center')
+    iss = issuer  or os.environ.get('JWT_ISSUER',   'control-center-auth')
+
     payload = {
         'sub':    user,
+        'aud':    aud,
+        'iss':    iss,
         'iat':    now,
         'scopes': list(scopes),
         'jti':    str(uuid.uuid4()),
     }
+    # BUG-003 FIX: expires is now float so sub-hour values work
     if expires and expires > 0:
         payload['exp'] = now + dt.timedelta(hours=expires)
 
@@ -1937,7 +1964,8 @@ def token_generate(user, scopes, expires, secret_override, algorithm, output):
     # Print metadata to stderr so stdout stays clean when piping
     exp_str = (f"expires in {expires}h" if expires else "no expiry")
     click.echo(
-        f"\n  user={user}  scopes={','.join(scopes)}  {exp_str}  alg={algorithm}",
+        f"\n  user={user}  scopes={','.join(scopes)}  {exp_str}  alg={algorithm}"
+        f"  aud={aud}  iss={iss}",
         err=True
     )
 
@@ -1989,7 +2017,9 @@ def token_inspect(token_string, fmt):
 @click.argument('token_string')
 @click.option('--secret', 'secret_override', default=None, envvar='CC_JWT_SECRET',
               help='JWT signing secret (or set CC_JWT_SECRET)')
-def token_validate(token_string, secret_override):
+@click.option('--audience', default=None, envvar='JWT_AUDIENCE',
+              help='Expected audience claim (default: control-center)')
+def token_validate(token_string, secret_override, audience):
     """Verify a JWT token's signature and expiry against your secret"""
     try:
         import jwt
@@ -1998,11 +2028,15 @@ def token_validate(token_string, secret_override):
         sys.exit(1)
 
     secret = secret_override or _jwt_secret()
+    # BUG-006 FIX: PyJWT>=2 raises InvalidAudienceError if aud is present but
+    # audience= is not passed to decode().  Match the server default.
+    aud = audience or os.environ.get('JWT_AUDIENCE', 'control-center')
 
     try:
         payload = jwt.decode(
             token_string, secret,
             algorithms=["HS256", "HS384", "HS512"],
+            audience=aud,
         )
         click.echo("[+] Token is VALID")
         click.echo(f"    user={payload.get('sub')}  "
@@ -2692,6 +2726,29 @@ def server_start(host, port, single_agent, network, auth_url, token_url, client_
         env['OAUTH_TOKEN_URL'] = token_url
     if client_id:
         env['OAUTH_CLIENT_ID'] = client_id
+
+    # BUG-004 FIX: The Rust binary reads JWT_SECRET (not CC_JWT_SECRET).
+    # Map CC_JWT_SECRET → JWT_SECRET so users only need to export one variable.
+    # Config file is the fallback if the env var isn't set.
+    if 'JWT_SECRET' not in env:
+        cc_secret = os.environ.get('CC_JWT_SECRET') or ctx.config_manager.get('jwt_secret')
+        if cc_secret:
+            env['JWT_SECRET'] = cc_secret
+        else:
+            click.echo(
+                "[ERROR] JWT_SECRET is required by the server but is not set.\n"
+                "  Export CC_JWT_SECRET (≥32 chars) before running server start:\n"
+                "    export CC_JWT_SECRET='your-secret-at-least-32-chars'\n"
+                "  Or store it: control-center config set jwt_secret YOUR_SECRET",
+                err=True
+            )
+            sys.exit(1)
+
+    # Pass audience and issuer so the server uses the same values as the CLI.
+    # These default to the same values the server uses when the vars are absent,
+    # so this is a no-op unless the user has overridden them.
+    env.setdefault('JWT_AUDIENCE', os.environ.get('JWT_AUDIENCE', 'control-center'))
+    env.setdefault('JWT_ISSUER',   os.environ.get('JWT_ISSUER',   'control-center-auth'))
     
     server_bin = _find_binary('control-center-server')
     if not server_bin:

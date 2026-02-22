@@ -178,7 +178,20 @@ class ConfigManager:
             del config['api_token']
             self.save(config)
             logger.info("API token cleared from config")
-    
+
+    # BUG-001 FIX: Generic set/get for arbitrary config keys (e.g. jwt_secret)
+    def set(self, key: str, value: str):
+        """Set an arbitrary key in the config file."""
+        config = self.load()
+        config[key] = value
+        self.save(config)
+        logger.info(f"Config key '{key}' updated")
+
+    def get(self, key: str, default: Optional[Any] = None) -> Optional[Any]:
+        """Get an arbitrary key from the config file, with optional default."""
+        config = self.load()
+        return config.get(key, default)
+
     # Get all configuration values for display (masking sensitive info)
     def get_all(self) -> Dict[str, Any]:
         """Get all configuration (for display)"""

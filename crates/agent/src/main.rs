@@ -247,7 +247,163 @@ impl AgentServiceImpl {
         Ok(())
     }
     
-    // Parse command to extract action details
+    // BUG-008 FIX ─────────────────────────────────────────────────────────────
+    // The Python actuation layer translates human commands ("960 540 left") into
+    // OS-level shell commands before sending them to the agent.  parse_action_details()
+    // was receiving those raw OS strings, so build_detailed_message() logged entries
+    // like {"action": "Typed: cmd /c echo 960 540 left > C:\mouse_cmd.txt"}.
+    //
+    // extract_human_command() reverses the platform translation so that
+    // parse_action_details() and build_detailed_message() always work with the
+    // original semantic command string.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Extract a human-readable command from the raw OS command sent by the
+    /// Python actuation layer.
+    fn extract_human_command(&self, command: &str) -> String {
+        // ── Windows ──────────────────────────────────────────────────────────
+        // Pattern: "cmd /c echo <human_cmd> > C:\mouse_cmd.txt"
+        //      or: "cmd /c echo <human_cmd> > C:\keyboard_cmd.txt"
+        // Extract the text between "echo " and " > C:\".
+        if command.starts_with("cmd /c echo ") {
+            let after_echo = &command["cmd /c echo ".len()..];
+            if let Some(pos) = after_echo.find(" > C:\\") {
+                return after_echo[..pos].trim().to_string();
+            }
+        }
+
+        // ── Linux xdotool ────────────────────────────────────────────────────
+        // Pattern: "DISPLAY=:0 xdotool <sub-command> …"
+        // Reconstruct a human command from the xdotool syntax.
+        if command.contains("xdotool") {
+            return self.extract_xdotool_human_command(command);
+        }
+
+        // ── macOS cliclick ───────────────────────────────────────────────────
+        // "cliclick" already contains the substring "click", so parse_action_details()
+        // already classifies these as mouse actions.  Return the command as-is;
+        // build_detailed_message() will produce a useful output ("Performed action
+        // at (x, y)") once position capture is working.
+
+        // Fallback – return unchanged.
+        command.to_string()
+    }
+
+    /// Parse an xdotool command string and return a human-readable equivalent.
+    fn extract_xdotool_human_command(&self, command: &str) -> String {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+
+        // Locate "xdotool" and take everything after it as the sub-command.
+        let xdotool_idx = match tokens.iter().position(|&t| t == "xdotool") {
+            Some(i) => i,
+            None => return command.to_string(),
+        };
+        let sub = &tokens[xdotool_idx + 1..];
+
+        if sub.is_empty() {
+            return command.to_string();
+        }
+
+        match sub[0] {
+            // "DISPLAY=:0 xdotool getmouselocation --shell" → "position"
+            "getmouselocation" => "position".to_string(),
+
+            // "DISPLAY=:0 xdotool type \"Hello World\"" → "type Hello World"
+            "type" => {
+                let text = sub[1..].join(" ").trim_matches('"').to_string();
+                format!("type {}", text)
+            }
+
+            // "DISPLAY=:0 xdotool key ctrl+c" → "press ctrl+c"
+            "key" => {
+                let keys = sub[1..].join(" ");
+                format!("press {}", keys)
+            }
+
+            // "DISPLAY=:0 xdotool mousemove X Y [...]"
+            "mousemove" => {
+                if sub.len() < 3 {
+                    return command.to_string();
+                }
+                let x = sub[1];
+                let y = sub[2];
+
+                if sub.len() == 3 {
+                    // Pure move: "X Y move"
+                    return format!("{} {} move", x, y);
+                }
+
+                match sub[3] {
+                    "click" => {
+                        // "xdotool mousemove X Y click [--repeat N] [--clearmodifiers] BTN"
+                        self.parse_xdotool_click_tokens(&sub[3..], Some((x, y)))
+                    }
+                    "mousedown" => {
+                        // Drag: "xdotool mousemove X Y mousedown 1 mousemove X2 Y2 mouseup 1"
+                        // Find the second "mousemove" to get the destination.
+                        let dest = sub[4..].windows(3).find(|w| w[0] == "mousemove");
+                        if let Some(m) = dest {
+                            if m.len() >= 3 {
+                                return format!("{} {} drag {} {}", x, y, m[1], m[2]);
+                            }
+                        }
+                        format!("{} {} drag", x, y)
+                    }
+                    _ => format!("{} {} move", x, y),
+                }
+            }
+
+            // "DISPLAY=:0 xdotool click [--repeat N] BTN" → "here <action>"
+            "click" => self.parse_xdotool_click_tokens(sub, None),
+
+            _ => command.to_string(),
+        }
+    }
+
+    /// Convert an xdotool `click` token slice into a human action string.
+    ///
+    /// `tokens[0]` must be `"click"`.
+    /// `coords` is `Some((x, y))` for coordinate-based commands, `None` for "here".
+    fn parse_xdotool_click_tokens(&self, tokens: &[&str], coords: Option<(&str, &str)>) -> String {
+        let prefix = match coords {
+            Some((x, y)) => format!("{} {} ", x, y),
+            None => "here ".to_string(),
+        };
+
+        let mut i = 1usize; // skip "click"
+        let mut repeat: Option<&str> = None;
+
+        if tokens.get(i) == Some(&"--repeat") {
+            repeat = tokens.get(i + 1).copied();
+            i += 2;
+        }
+        if tokens.get(i) == Some(&"--clearmodifiers") {
+            i += 1;
+        }
+
+        let button = tokens.get(i).copied().unwrap_or("1");
+
+        match button {
+            "1" => match repeat {
+                Some("2") => format!("{}double", prefix),
+                Some(_)   => format!("{}double", prefix), // --repeat N means double/multi
+                None      => format!("{}left", prefix),
+            },
+            "2" => format!("{}middle", prefix),
+            "3" => format!("{}right", prefix),
+            "4" => match repeat {
+                Some(n) => format!("{}scroll_up {}", prefix, n),
+                None    => format!("{}scroll_up", prefix),
+            },
+            "5" => match repeat {
+                Some(n) => format!("{}scroll_down {}", prefix, n),
+                None    => format!("{}scroll_down", prefix),
+            },
+            _ => format!("{}left", prefix),
+        }
+    }
+
+    // ── end BUG-008 helpers ───────────────────────────────────────────────────
     fn parse_action_details(&self, command: &str) -> ActionDetails {
         let tokens: Vec<&str> = command.split_whitespace().collect();
         
@@ -467,6 +623,7 @@ impl AgentServiceImpl {
     /// Windows execution by writing to files for AutoHotkey
     #[cfg(target_os = "windows")]
     async fn execute_windows(&self, command: &str) -> Result<String, String> {
+        use chrono::format;
 
         let output = ProcessCommand::new("cmd")
             .arg("/c")
@@ -599,13 +756,24 @@ impl AgentService for AgentServiceImpl {
         debug!("Executing command: id={}, cmd={}", req.id, req.command);
         
         let start = Instant::now();
-        let (result, position, action) = self.execute_command(&req.command).await;
+        // execute_command() runs the OS-level command and captures mouse position
+        // when the OS string is recognisable as a mouse action (e.g. xdotool/cliclick
+        // commands containing "click").  We keep calling it with the raw OS command
+        // so execution is unchanged.
+        let (result, position, _os_action) = self.execute_command(&req.command).await;
         let execution_time = start.elapsed().as_millis() as i64;
+        
+        // BUG-008 FIX: derive the human-readable command ("960 540 left") from the
+        // raw OS command ("cmd /c echo 960 540 left > C:\mouse_cmd.txt") so that
+        // parse_action_details() and build_detailed_message() produce meaningful
+        // log entries instead of "Typed: cmd /c echo …".
+        let human_cmd = self.extract_human_command(&req.command);
+        let human_action = self.parse_action_details(&human_cmd);
         
         match result {
             Ok(_) => {
-                // Build detailed message
-                let message = self.build_detailed_message(&action, &position, &req.command);
+                // Build detailed message from the HUMAN command, not the OS command
+                let message = self.build_detailed_message(&human_action, &position, &human_cmd);
                 
                 // Single clean log line per command
                 info!(

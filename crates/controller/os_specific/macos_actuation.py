@@ -80,12 +80,15 @@ class MacOSActuation:
             pos_cmd = f"{self.cliclick_path} p:."
             result = self.grpc_client.execute_command(pos_cmd)
             
-            if result['success'] and 'output' in result:
-                output = result['output'].strip()
-                # Output format: "123,456"
-                match = re.match(r'(\d+),(\d+)', output)
-                if match:
-                    return (int(match.group(1)), int(match.group(2)))
+            # BUG-007 FIX: Position data is returned in mouse_x/mouse_y fields,
+            # not in a non-existent 'output' key. cliclick commands contain the
+            # string "click" so the Rust agent classifies them as mouse actions,
+            # captures position after execution, and returns it here.
+            if result['success'] and result.get('position_captured'):
+                mx = result.get('mouse_x')
+                my = result.get('mouse_y')
+                if mx is not None and my is not None:
+                    return (mx, my)
             
             return None
         except Exception as e:
@@ -508,8 +511,14 @@ class MacOSActuation:
         result = self.grpc_client.execute_command(cliclick_cmd)
         
         # For mouse commands: Get position after action
+        # BUG-007 FIX: Read mouse_x/mouse_y directly from the gRPC result.
+        # The agent captures position internally after mouse commands and returns
+        # it in the dedicated fields — no extra gRPC call needed.
         if cmd_type == 'mouse' and result['success']:
-            position_after = self._get_mouse_position()
+            mx = result.get('mouse_x')
+            my = result.get('mouse_y')
+            captured = result.get('position_captured', False)
+            position_after = (mx, my) if captured and mx is not None and my is not None else None
         
         # Display results with position data
         if result['success']:
