@@ -7,6 +7,9 @@ description = "OAuth 2.0 and JWT authentication"
 license.workspace = true
 
 [dependencies]
+# Shared types (canonical Claims struct)
+control-center-common = { workspace = true }
+
 # OAuth 2.0
 oauth2 = "4.4"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }

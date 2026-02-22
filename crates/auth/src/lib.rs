@@ -17,18 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// JWT Claims structure
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Claims {
-    pub sub: String,           // Subject (user ID)
-    pub exp: i64,              // Expiration time
-    pub iat: i64,              // Issued at
-    pub nbf: i64,              // Not before
-    pub session_id: String,    // Session identifier
-    pub scopes: Vec<String>,   // OAuth scopes granted
-    pub aud: String,           // Audience (server identifier)
-    pub iss: String,           // Issuer
-}
+// Single canonical Claims definition — shared across all crates.
+// Do NOT define a local Claims struct here.
+use control_center_common::Claims;
 
 /// OAuth token response
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,7 +189,8 @@ impl AuthManager {
         Ok(jwt_token)
     }
 
-    /// Create JWT token from session data
+    /// Create JWT token from session data.
+    /// Signs with HS256 to match the server's validation algorithm.
     fn create_jwt(&self, user_id: &str, session_id: &str, scopes: &[String]) -> Result<String> {
         let now = Utc::now();
         let exp = (now + Duration::hours(24)).timestamp();
@@ -207,15 +199,15 @@ impl AuthManager {
             sub: user_id.to_string(),
             exp,
             iat: now.timestamp(),
-            nbf: now.timestamp(),
-            session_id: session_id.to_string(),
+            nbf: Some(now.timestamp()),
+            session_id: Some(session_id.to_string()),
             scopes: scopes.to_vec(),
             aud: self.config.audience.clone(),
             iss: self.config.issuer.clone(),
         };
 
         let header = Header {
-            alg: Algorithm::HS512,
+            alg: Algorithm::HS256,   // FIX: was HS512, server validates with HS256
             ..Default::default()
         };
 
@@ -227,9 +219,10 @@ impl AuthManager {
         .context("Failed to create JWT token")
     }
 
-    /// Validate JWT token
+    /// Validate JWT token.
+    /// Uses HS256 to match create_jwt and the server's validation algorithm.
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
-        let mut validation = Validation::new(Algorithm::HS512);
+        let mut validation = Validation::new(Algorithm::HS256);   // FIX: was HS512
         validation.set_audience(&[&self.config.audience]);
         validation.set_issuer(&[&self.config.issuer]);
 
@@ -340,6 +333,7 @@ mod tests {
 
         let claims = auth_manager.validate_token(&token).unwrap();
         assert_eq!(claims.sub, "user123");
-        assert_eq!(claims.session_id, "session456");
+        // session_id is now Option<String> in the shared Claims struct
+        assert_eq!(claims.session_id, Some("session456".to_string()));
     }
 }

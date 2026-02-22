@@ -7,7 +7,6 @@ use tracing::{info, warn, debug};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
-use serde::{Deserialize, Serialize};
 mod identity;
 mod registry;
 mod monitoring;
@@ -23,16 +22,9 @@ use proto::{
     control_service_server::{ControlService, ControlServiceServer},
 };
 
-/// JWT Claims structure
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Claims {
-    pub sub: String,           // Subject (user ID)
-    pub exp: i64,              // Expiration
-    pub iat: i64,              // Issued at
-    pub scopes: Vec<String>,   // Permissions
-    pub aud: String,           // Audience
-    pub iss: String,           // Issuer
-}
+// Single canonical Claims definition — shared across all crates.
+// Do NOT define a local Claims struct here.
+use control_center_common::Claims;
 
 /// Rate limiter for preventing abuse
 struct RateLimiter {
@@ -179,6 +171,7 @@ impl ControlCenterService {
         debug!("Token validated for user: {}", token_data.claims.sub);
         Ok(token_data.claims)
     }
+
     async fn check_rate_limit(&self, user_id: &str) -> Result<(), Status> {
         let mut limiter = self.rate_limiter.write().await;
         
@@ -489,11 +482,11 @@ impl ControlService for ControlCenterService {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
-        async fn get_metrics(
+    async fn get_metrics(
         &self,
         request: Request<proto::MetricsRequest>,
     ) -> Result<Response<proto::MetricsResponse>, Status> {
-        // Phase 3: Validate JWT (admin only)
+        // Validate JWT (metrics scope required)
         let claims = self.validate_token(request.metadata()).await?;
         
         // Check if user has metrics scope

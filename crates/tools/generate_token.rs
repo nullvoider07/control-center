@@ -2,18 +2,11 @@
 // JWT Token Generator for Control Center
 
 use jsonwebtoken::{encode, EncodingKey, Header, Algorithm};
-use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,           // Subject (user ID)
-    exp: i64,              // Expiration
-    iat: i64,              // Issued at
-    scopes: Vec<String>,   // Permissions
-    aud: String,           // Audience
-    iss: String,           // Issuer
-}
+// Single canonical Claims definition — shared across all crates.
+// Do NOT define a local Claims struct here.
+use control_center_common::Claims;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -25,12 +18,22 @@ fn main() {
         eprintln!("  generate_token admin");
         eprintln!("  generate_token user123 24");
         eprintln!("  generate_token admin 168 execute metrics");
+        eprintln!();
+        eprintln!("Note: duration_hours must be greater than 0. Tokens without");
+        eprintln!("      an expiry are not supported — the server requires 'exp'.");
         std::process::exit(1);
     }
     
     let user_id = &args[1];
     let duration_hours = if args.len() > 2 {
-        args[2].parse::<i64>().unwrap_or(24)
+        let parsed = args[2].parse::<i64>().unwrap_or(0);
+        if parsed <= 0 {
+            eprintln!("ERROR: duration_hours must be a positive integer greater than 0.");
+            eprintln!("       Tokens without an expiry are not supported.");
+            eprintln!("       Example: generate_token admin 24");
+            std::process::exit(1);
+        }
+        parsed
     } else {
         24
     };
@@ -67,6 +70,8 @@ fn main() {
         sub: user_id.clone(),
         exp: expiration,
         iat: now,
+        nbf: None,
+        session_id: None,
         scopes: scopes.clone(),
         aud: jwt_audience.clone(),
         iss: jwt_issuer.clone(),
@@ -97,9 +102,5 @@ fn main() {
     println!("Usage:");
     println!("  export TOKEN=\"{}\"", token);
     println!("  control-center execute -c \"960 540 left\"");
-    println!();
-    println!("Or with curl:");
-    println!("  curl -H \"Authorization: Bearer {}\" \\", token);
-    println!("       http://server:50051/execute");
     println!();
 }

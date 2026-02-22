@@ -7,6 +7,9 @@ description = "gRPC server for Control Center"
 license.workspace = true
 
 [dependencies]
+# Shared types (canonical Claims struct)
+control-center-common = { workspace = true }
+
 # gRPC
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"

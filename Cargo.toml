@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/server", "crates/agent", "crates/auth", "crates/tools"]
+members = ["crates/server", "crates/agent", "crates/auth", "crates/common", "crates/tools"]
 resolver = "2"
 
 [workspace.package]
@@ -15,3 +15,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "1.0"
+control-center-common = { path = "crates/common" }

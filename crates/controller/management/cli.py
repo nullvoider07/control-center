@@ -1932,7 +1932,7 @@ def _jwt_secret() -> str:
                    'Options: execute monitor metrics admin  '
                    'Example: --scopes execute --scopes monitor')
 @click.option('--expires', default=24, type=float, show_default=True,
-              help='Token lifetime in hours, fractions allowed (0 = no expiry)')
+              help='Token lifetime in hours, fractions allowed. Must be > 0.')
 @click.option('--secret', 'secret_override', default=None, envvar='CC_JWT_SECRET',
               help='JWT signing secret (or set CC_JWT_SECRET)')
 @click.option('--algorithm', default='HS256',
@@ -1964,6 +1964,15 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
         click.echo("Error: PyJWT not installed. Run: pip install PyJWT", err=True)
         sys.exit(1)
 
+    if expires <= 0:
+        click.echo(
+            "Error: --expires must be greater than 0.\n"
+            "Tokens without an expiry are not supported — the server requires 'exp'.\n"
+            "Use a large value like --expires 8760 for a one-year token.",
+            err=True
+        )
+        sys.exit(1)
+
     secret = secret_override or _jwt_secret()
 
     import datetime as dt
@@ -1981,9 +1990,8 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
         'scopes': list(scopes),
         'jti':    str(uuid.uuid4()),
     }
-    # BUG-003 FIX: expires is now float so sub-hour values work
-    if expires and expires > 0:
-        payload['exp'] = now + dt.timedelta(hours=expires)
+    
+    payload['exp'] = now + dt.timedelta(hours=expires)
 
     try:
         tok = jwt.encode(payload, secret, algorithm=algorithm)
@@ -2002,7 +2010,7 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
         click.echo(tok)
 
     # Print metadata to stderr so stdout stays clean when piping
-    exp_str = (f"expires in {expires}h" if expires else "no expiry")
+    exp_str = f"expires in {expires}h"
     click.echo(
         f"\n  user={user}  scopes={','.join(scopes)}  {exp_str}  alg={algorithm}"
         f"  aud={aud}  iss={iss}",
@@ -2043,12 +2051,12 @@ def token_inspect(token_string, fmt):
     click.echo(f"  Issued at:       {_fmt_ts(payload.get('iat'))}")
     exp = payload.get('exp')
     if exp:
-        exp_dt = dt.datetime.utcfromtimestamp(exp)
-        now = dt.datetime.utcnow()
+        exp_dt = dt.datetime.fromtimestamp(exp, dt.timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
         expired = now > exp_dt
         click.echo(f"  Expires at:      {_fmt_ts(exp)}  {'[EXPIRED]' if expired else '[VALID]'}")
     else:
-        click.echo("  Expires at:      never")
+        click.echo("  Expires at:      [NONE] — this token has no expiry claim and will be rejected by the server")
     click.echo(f"  Token ID (jti):  {payload.get('jti', 'N/A')}")
     click.echo("")
 

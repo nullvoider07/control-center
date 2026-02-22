@@ -242,6 +242,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "control-center-common",
  "jsonwebtoken",
  "oauth2",
  "openssl",
@@ -255,11 +256,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "control-center-common"
+version = "1.0.0"
+dependencies = [
+ "jsonwebtoken",
+ "serde",
+]
+
+[[package]]
 name = "control-center-server"
 version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "control-center-common",
  "hostname",
  "jsonwebtoken",
  "openssl",
@@ -2571,8 +2581,8 @@ dependencies = [
 name = "tools"
 version = "1.0.0"
 dependencies = [
+ "control-center-common",
  "jsonwebtoken",
- "serde",
 ]
 
 [[package]]

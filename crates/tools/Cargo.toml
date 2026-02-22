@@ -10,5 +10,7 @@ name = "generate-token"
 path = "generate_token.rs"
 
 [dependencies]
+# Shared types (canonical Claims struct)
+control-center-common = { workspace = true }
+
 jsonwebtoken = "9"
-serde = { version = "1.0", features = ["derive"] }

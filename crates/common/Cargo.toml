@@ -1,0 +1,11 @@
+[package]
+name = "control-center-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Shared types for Control Center (JWT Claims, etc.)"
+license.workspace = true
+
+[dependencies]
+jsonwebtoken = "9.3"
+serde = { workspace = true }
