@@ -498,7 +498,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_queue_command() {
-        let registry = Arc::new(ConnectionRegistry::new(true, 100));
+        let registry = Arc::new(ConnectionRegistry::new(true, 100, "127.0.0.1".to_string()));
         let handler = StreamHandler::new(registry, "srv-test".to_string());
         
         let request = CommandRequest {
@@ -517,7 +517,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_queue_stats() {
-        let registry = Arc::new(ConnectionRegistry::new(true, 100));
+        let registry = Arc::new(ConnectionRegistry::new(true, 100, "127.0.0.1".to_string()));
         let handler = StreamHandler::new(registry, "srv-test".to_string());
         
         let (queued, pending) = handler.get_queue_stats().await;

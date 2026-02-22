@@ -54,9 +54,8 @@ pub struct ConnectionRegistry {
     connection_history: Arc<RwLock<Vec<AgentMetadata>>>,
     max_history: usize,
     single_agent_mode: bool,
-    /// Notify channel: when Some(reason) is set, the stream handler should
-    /// gracefully close the agent stream.
     disconnect_signal: Arc<RwLock<Option<String>>>,
+    server_ip: String,
 }
 
 /// Historical connection metadata (maps 1:1 to HistoricalConnection proto)
@@ -78,7 +77,7 @@ pub struct AgentMetadata {
 
 impl ConnectionRegistry {
     /// Create new registry
-    pub fn new(single_agent_mode: bool, max_history: usize) -> Self {
+    pub fn new(single_agent_mode: bool, max_history: usize, server_ip: String) -> Self {
         info!("Initializing connection registry (single_agent_mode: {})", single_agent_mode);
 
         Self {
@@ -87,6 +86,7 @@ impl ConnectionRegistry {
             max_history,
             single_agent_mode,
             disconnect_signal: Arc::new(RwLock::new(None)),
+            server_ip,
         }
     }
 
@@ -101,16 +101,33 @@ impl ConnectionRegistry {
 
         // 1:1 enforcement check
         if self.single_agent_mode {
-            if let Some(existing) = connection_lock.as_ref() {
-                let error_msg = format!(
-                    "Server in single-agent mode. Agent {} (hostname: {}) is already connected. \
-                     Disconnect existing agent or restart server to accept new connections.",
+            if let Some(existing) = connection_lock.take() {
+                warn!(
+                    "Single-agent mode: evicting stale connection {} (agent: {}, hostname: {}) \
+                    to accept new registration.",
+                    existing.connection_id,
                     existing.agent_id,
                     existing.agent_hostname
                 );
-
-                warn!("Registration rejected: {}", error_msg);
-                return Err(error_msg);
+                let mut history_lock = self.connection_history.write().await;
+                history_lock.push(AgentMetadata {
+                    connection_id: existing.connection_id.clone(),
+                    agent_id: existing.agent_id.clone(),
+                    agent_hostname: existing.agent_hostname.clone(),
+                    agent_ip: existing.agent_ip.clone(),
+                    os_type: existing.os_type,
+                    os_version: existing.os_version.clone(),
+                    capabilities: existing.capabilities.clone(),
+                    server_ip: self.server_ip.clone(),
+                    connected_at: chrono::Utc::now().timestamp()
+                        - existing.connected_at.elapsed().as_secs() as i64,
+                    disconnected_at: Some(chrono::Utc::now().timestamp()),
+                    commands_executed: existing.commands_executed,
+                    disconnect_reason: Some("Evicted by new agent registration".to_string()),
+                });
+                if history_lock.len() > self.max_history {
+                    history_lock.remove(0);
+                }
             }
         }
 
@@ -170,7 +187,7 @@ impl ConnectionRegistry {
                     os_type: agent.os_type,
                     os_version: agent.os_version,
                     capabilities: agent.capabilities,
-                    server_ip: "0.0.0.0".to_string(),
+                    server_ip: self.server_ip.clone(),
                     connected_at: chrono::Utc::now().timestamp()
                         - agent.connected_at.elapsed().as_secs() as i64,
                     disconnected_at: Some(chrono::Utc::now().timestamp()),
@@ -323,11 +340,12 @@ pub struct RegistryStats {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[tokio::test]
     async fn test_single_agent_enforcement() {
-        let registry = ConnectionRegistry::new(true, 10);
+        let registry = ConnectionRegistry::new(true, 10, "127.0.0.1".to_string());
 
         let agent1 = crate::proto::AgentIdentity {
             agent_id: "agent-1".to_string(),
@@ -362,12 +380,22 @@ mod tests {
             .register_agent(&agent2, "conn-2".to_string(), "192.168.1.101".to_string())
             .await;
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().contains("single-agent mode"));
+        let current = registry.get_current_connection().await;
+        assert!(current.is_some());
+        assert_eq!(current.unwrap().agent_id, "agent-2");
+
+        let history = registry.get_history(None).await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].agent_id, "agent-1");
+        assert_eq!(
+            history[0].disconnect_reason.as_deref(),
+            Some("Evicted by new agent registration")
+        );
     }
 
     #[tokio::test]
     async fn test_unregister_and_history() {
-        let registry = ConnectionRegistry::new(true, 10);
+        let registry = ConnectionRegistry::new(true, 10, "127.0.0.1".to_string());
 
         let agent = crate::proto::AgentIdentity {
             agent_id: "agent-1".to_string(),
@@ -399,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_disconnect_signal() {
-        let registry = ConnectionRegistry::new(true, 10);
+        let registry = ConnectionRegistry::new(true, 10, "127.0.0.1".to_string());
 
         // No agent connected — request_disconnect should return false
         let (disconnected, _) = registry

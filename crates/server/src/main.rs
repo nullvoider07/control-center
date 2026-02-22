@@ -659,7 +659,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .unwrap_or(true);
 
-    let registry = Arc::new(registry::ConnectionRegistry::new(single_agent_mode, 100));
+    let addr: std::net::SocketAddr = std::env::var("SERVER_ADDR")
+    .unwrap_or_else(|_| "0.0.0.0:50051".to_string())
+    .parse()?;
+
+    let listen_address = addr.to_string();
+    info!("Server will listen on {}", addr);
+
+    let registry = Arc::new(registry::ConnectionRegistry::new(
+        single_agent_mode,
+        100,
+        addr.ip().to_string(),
+    ));
 
     // Create monitoring handler
     let monitoring_handler = Arc::new(monitoring::MonitoringHandler::new(
@@ -673,13 +684,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.clone(),
         server_identity.server_id.clone(),
     ));
-
-    let addr: std::net::SocketAddr = std::env::var("SERVER_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:50051".to_string())
-        .parse()?;
-
-    let listen_address = addr.to_string();
-    info!("Server will listen on {}", addr);
 
     // Create service
     let service = ControlCenterService::new(

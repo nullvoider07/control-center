@@ -1497,6 +1497,20 @@ def agent_start(server_host, server_port, token):
     env = os.environ.copy()
     env['AGENT_SERVER_HOST'] = server_host
     env['AGENT_SERVER_PORT'] = str(server_port)
+    env.setdefault('RUST_LOG', 'info')
+
+    if not token:
+        click.echo(
+            "[WARN] No --token provided and CONTROL_CENTER_TOKEN is not set.\n"
+            "       The agent will connect but 'control-center connect' will fail\n"
+            "       because the server requires a JWT token.\n"
+            "       Generate one first:\n"
+            "         export CC_JWT_SECRET='your-secret'\n"
+            "         export CONTROL_CENTER_TOKEN=$(control-center token generate "
+            "--user me --scopes execute monitor)",
+            err=True
+        )
+        
     if token:
         env['CONTROL_CENTER_TOKEN'] = token
 
