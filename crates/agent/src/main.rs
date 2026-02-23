@@ -487,8 +487,8 @@ impl AgentServiceImpl {
             "#Requires AutoHotkey v2.0\ntry FileDelete(\"{}\")\nMouseGetPos(&xpos, &ypos)\nFileAppend(\"X=\" xpos \"`nY=\" ypos, \"{}\")\n",
             pos_file, pos_file
         );
-        
-        if std::fs::write(&temp_path, script).is_err() {
+
+        if std::fs::write(&script_path, script).is_err() {
             return MousePosition { x: 0, y: 0, captured: false };
         }
 
@@ -503,7 +503,7 @@ impl AgentServiceImpl {
         for ahk_path in &ahk_paths {
             match ProcessCommand::new(ahk_path)
                 .arg("/ErrorStdOut")
-                .arg(temp_path.to_str().unwrap_or(""))
+                .arg(script_path.to_str().unwrap_or(""))
                 .output()
             {
                 Ok(output) if output.status.success() => {
@@ -513,7 +513,7 @@ impl AgentServiceImpl {
 
                     if let (Some(x_cap), Some(y_cap)) = (x_regex.captures(&stdout), y_regex.captures(&stdout)) {
                         if let (Ok(x), Ok(y)) = (x_cap[1].parse::<i32>(), y_cap[1].parse::<i32>()) {
-                            let _ = std::fs::remove_file(&temp_path);
+                            let _ = std::fs::remove_file(&script_path);
                             debug!("Position captured via AHK v2: ({}, {})", x, y);
                             return MousePosition { x, y, captured: true };
                         }
@@ -523,7 +523,7 @@ impl AgentServiceImpl {
             }
         }
 
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_file(&script_path);
         MousePosition { x: 0, y: 0, captured: false }
     }
     
