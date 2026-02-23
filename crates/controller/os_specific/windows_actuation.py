@@ -361,13 +361,7 @@ class WindowsActuation:
         else:
             shell_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
         
-        position_before = None
         position_after = None
-        target_coords = None
-
-        if cmd_type == 'mouse':
-            target_coords = self._extract_coordinates_from_command(command)
-            position_before = self._get_mouse_position()
         
         # Send to server via gRPC
         result = self.grpc_client.execute_command(shell_cmd)

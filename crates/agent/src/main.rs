@@ -481,8 +481,12 @@ impl AgentServiceImpl {
     
     #[cfg(target_os = "windows")]
     async fn capture_position_windows(&self) -> MousePosition {
-        let script = "#Requires AutoHotkey v2.0\nMouseGetPos(&xpos, &ypos)\nFileAppend(\"X=\" xpos \"`nY=\" ypos, \"*\")\n";
-        let temp_path = std::env::temp_dir().join("cc_getpos.ahk");
+        let pos_file = r"C:\cc_pos.txt";
+        let script_path = std::env::temp_dir().join("cc_getpos.ahk");
+        let script = format!(
+            "#Requires AutoHotkey v2.0\ntry FileDelete(\"{}\")\nMouseGetPos(&xpos, &ypos)\nFileAppend(\"X=\" xpos \"`nY=\" ypos, \"{}\")\n",
+            pos_file, pos_file
+        );
         
         if std::fs::write(&temp_path, script).is_err() {
             return MousePosition { x: 0, y: 0, captured: false };
@@ -821,10 +825,17 @@ impl AgentService for AgentServiceImpl {
                 let message = self.build_detailed_message(&human_action, &position, &human_cmd);
                 
                 // Single clean log line per command
-                info!(
-                    "{{\"action\": \"{}\", \"time_taken\": \"{}ms\"}}",
-                    message, execution_time
-                );
+                if position.captured && human_action.is_mouse {
+                    info!(
+                        "{{\"action\": \"{}\", \"X\": {}, \"Y\": {}, \"time_taken\": \"{}ms\"}}",
+                        message, position.x, position.y, execution_time
+                    );
+                } else {
+                    info!(
+                        "{{\"action\": \"{}\", \"time_taken\": \"{}ms\"}}",
+                        message, execution_time
+                    );
+                }
                 
                 Ok(Response::new(ExecuteResponse {
                     id: req.id,

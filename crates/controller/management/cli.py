@@ -361,21 +361,59 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
 # Interactive Mode Implementation
 # ============================================================================
 def _print_banner(agent_info: dict):
-    """Print connection banner"""
-    banner = f"""
-\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
-\u2551                   Control Center - Interactive Mode                  \u2551
-\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
-\u2551 Connected to: {agent_info['os_type']} {agent_info['os_version']:<38}           \u2551
-\u2551 Agent Version: {agent_info['agent_version']:<43}           \u2551
-\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
-\u2551 Commands:                                                            \u2551
-\u2551   help                  - Show available commands                    \u2551
-\u2551   status                - Show connection status                     \u2551
-\u2551   exit, quit            - Disconnect and exit                        \u2551
-\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
-"""
-    click.echo(banner)
+    """Print connection banner — box auto-sizes to content."""
+
+    # ── Box-drawing characters ────────────────────────────────────────────────
+    TL, TR, BL, BR   = '╔', '╗', '╚', '╝'
+    HZ, VT           = '═', '║'
+    ML, MR, MC       = '╠', '╣', '╦'   # mid-left, mid-right, mid-cross (unused)
+
+    def _top(w):    return TL + HZ * w + TR
+    def _mid(w):    return ML + HZ * w + MR
+    def _bot(w):    return BL + HZ * w + BR
+    def _row(text, w, pad=1):
+        inner = ' ' * pad + text
+        return VT + inner + ' ' * (w - len(inner)) + VT
+
+    # ── Content lines ─────────────────────────────────────────────────────────
+    title    = 'Control Center - Interactive Mode'
+    conn_line   = f"Connected to: {agent_info.get('os_type','?')} {agent_info.get('os_version','?')}"
+    ver_line    = f"Agent Version: {agent_info.get('agent_version','?')}"
+    cmd_lines   = [
+        ('help',        'Show available commands'),
+        ('status',      'Show connection status'),
+        ('exit, quit',  'Disconnect and exit'),
+    ]
+
+    # ── Compute required inner width ──────────────────────────────────────────
+    cmd_col1_w = max(len(k) for k, _ in cmd_lines)
+    cmd_rows   = [f"  {k:<{cmd_col1_w}}  - {v}" for k, v in cmd_lines]
+
+    candidates = [
+        title,
+        conn_line,
+        ver_line,
+        'Commands:',
+        *cmd_rows,
+    ]
+    inner_w = max(len(s) for s in candidates) + 2   # +2 for 1-space padding each side
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    lines = [
+        '',
+        _top(inner_w),
+        _row(title.center(inner_w - 2), inner_w, pad=1),
+        _mid(inner_w),
+        _row(conn_line, inner_w),
+        _row(ver_line, inner_w),
+        _mid(inner_w),
+        _row('Commands:', inner_w),
+        *[_row(r, inner_w) for r in cmd_rows],
+        _bot(inner_w),
+        '',
+    ]
+
+    click.echo('\n'.join(lines))
 
 # ============================================================================
 # Interactive Command Loop with Persistent Connection
