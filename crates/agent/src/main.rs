@@ -481,49 +481,23 @@ impl AgentServiceImpl {
     
     #[cfg(target_os = "windows")]
     async fn capture_position_windows(&self) -> MousePosition {
+        // mouse_control.ahk writes C:\cc_pos.txt after every action including
+        // the "position" query. Just read it directly — no separate AHK spawn needed.
         let pos_file = r"C:\cc_pos.txt";
-        let script_path = std::env::temp_dir().join("cc_getpos.ahk");
-        let script = format!(
-            "#Requires AutoHotkey v2.0\ntry FileDelete(\"{}\")\nMouseGetPos(&xpos, &ypos)\nFileAppend(\"X=\" xpos \"`nY=\" ypos, \"{}\")\n",
-            pos_file, pos_file
-        );
 
-        if std::fs::write(&script_path, script).is_err() {
-            return MousePosition { x: 0, y: 0, captured: false };
-        }
+        if let Ok(contents) = std::fs::read_to_string(pos_file) {
+            let x_regex = Regex::new(r"X=(\d+)").unwrap();
+            let y_regex = Regex::new(r"Y=(\d+)").unwrap();
 
-        let ahk_paths = [
-            r"C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe",
-            r"C:\Program Files\AutoHotkey\AutoHotkey64.exe",
-            r"C:\Program Files\AutoHotkey\AutoHotkey.exe",
-            "AutoHotkey64.exe",
-            "AutoHotkey.exe",
-        ];
-
-        for ahk_path in &ahk_paths {
-            match ProcessCommand::new(ahk_path)
-                .arg("/ErrorStdOut")
-                .arg(script_path.to_str().unwrap_or(""))
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let x_regex = Regex::new(r"X=(\d+)").unwrap();
-                    let y_regex = Regex::new(r"Y=(\d+)").unwrap();
-
-                    if let (Some(x_cap), Some(y_cap)) = (x_regex.captures(&stdout), y_regex.captures(&stdout)) {
-                        if let (Ok(x), Ok(y)) = (x_cap[1].parse::<i32>(), y_cap[1].parse::<i32>()) {
-                            let _ = std::fs::remove_file(&script_path);
-                            debug!("Position captured via AHK v2: ({}, {})", x, y);
-                            return MousePosition { x, y, captured: true };
-                        }
-                    }
+            if let (Some(xc), Some(yc)) = (x_regex.captures(&contents), y_regex.captures(&contents)) {
+                if let (Ok(x), Ok(y)) = (xc[1].parse::<i32>(), yc[1].parse::<i32>()) {
+                    let _ = std::fs::remove_file(pos_file);
+                    debug!("Position captured from cc_pos.txt: ({}, {})", x, y);
+                    return MousePosition { x, y, captured: true };
                 }
-                _ => continue,
             }
         }
 
-        let _ = std::fs::remove_file(&script_path);
         MousePosition { x: 0, y: 0, captured: false }
     }
     
