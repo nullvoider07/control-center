@@ -35,19 +35,15 @@ class WindowsActuation:
     # Build command to get mouse position using PowerShell
     def _build_position_command(self) -> str:
         """
-        Build AutoHotkey command to get mouse position
-        
-        Returns:
-            PowerShell command that executes AHK script to get position
-        """
-        # AutoHotkey script to get mouse position
-        ahk_script = """
-        MouseGetPos, xpos, ypos
-        FileAppend, X=%xpos%`nY=%ypos%, *
+        Build the command to query mouse position.
+
+        Sends "position" through the same mouse_cmd.txt path as every other
+        mouse command.  The AHK v2 script running on the agent side handles
+        "position", and the Rust agent captures the coordinates via AHK v2
+        after execution and returns them in mouse_x / mouse_y.
         """
         
-        # Return as PowerShell command
-        return f'powershell -Command "Add-Type -AssemblyName System.Windows.Forms; $p=[System.Windows.Forms.Cursor]::Position; Write-Output \\"X=$($p.X)`nY=$($p.Y)\\""'
+        return r'cmd /c echo position > C:\mouse_cmd.txt'
     
     # Parse the output from position command
     def _parse_position_output(self, output: str) -> Optional[Tuple[int, int]]:

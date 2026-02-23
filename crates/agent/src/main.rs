@@ -406,17 +406,20 @@ impl AgentServiceImpl {
     // ── end BUG-008 helpers ───────────────────────────────────────────────────
     fn parse_action_details(&self, command: &str) -> ActionDetails {
         let tokens: Vec<&str> = command.split_whitespace().collect();
-        
-        // Check if it's a "here" command
+
         let is_here = tokens.get(0) == Some(&"here");
-        
-        // Determine action type
+
         let action_type = if tokens.len() >= 3 && tokens[0].parse::<i32>().is_ok() {
             // Coordinate-based: "960 540 left"
             tokens.get(2).unwrap_or(&"move").to_string()
         } else if is_here && tokens.len() >= 2 {
-            // Here command: "here left"
+            // Here command: "here left", "here hold", "here release"
             tokens[1].to_string()
+        } else if tokens.get(0) == Some(&"position") {
+            "position".to_string()
+        } else if tokens.get(0) == Some(&"press") {
+            // "press {Enter}", "press ^c" — keyboard, not mouse
+            "press".to_string()
         } else if command.contains("click") {
             "click".to_string()
         } else if command.contains("drag") {
@@ -426,12 +429,16 @@ impl AgentServiceImpl {
         } else {
             "unknown".to_string()
         };
-        
+
         let is_mouse = matches!(
             action_type.as_str(),
-            "left" | "right" | "middle" | "double" | "triple" | "click" | "drag" | "move" | "scroll_up" | "scroll_down"
+            "left" | "right" | "middle" | "double" | "triple"
+            | "click" | "drag" | "move"
+            | "scroll_up" | "scroll_down"
+            | "hold" | "release"     // mouse button hold/release
+            | "position"             // position query
         );
-        
+
         ActionDetails {
             action_type,
             is_mouse,
@@ -474,23 +481,45 @@ impl AgentServiceImpl {
     
     #[cfg(target_os = "windows")]
     async fn capture_position_windows(&self) -> MousePosition {
-        let ps_cmd = r#"Add-Type -AssemblyName System.Windows.Forms; $p=[System.Windows.Forms.Cursor]::Position; Write-Output "X=$($p.X)`nY=$($p.Y)""#;
+        let script = "#Requires AutoHotkey v2.0\nMouseGetPos(&xpos, &ypos)\nFileAppend(\"X=\" xpos \"`nY=\" ypos, \"*\")\n";
+        let temp_path = std::env::temp_dir().join("cc_getpos.ahk");
         
-        match ProcessCommand::new("powershell").arg("-Command").arg(ps_cmd).output() {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let x_regex = Regex::new(r"X=(\d+)").unwrap();
-                let y_regex = Regex::new(r"Y=(\d+)").unwrap();
-                
-                if let (Some(x_cap), Some(y_cap)) = (x_regex.captures(&stdout), y_regex.captures(&stdout)) {
-                    if let (Ok(x), Ok(y)) = (x_cap[1].parse::<i32>(), y_cap[1].parse::<i32>()) {
-                        debug!("Position captured: ({}, {})", x, y);
-                        return MousePosition { x, y, captured: true };
+        if std::fs::write(&temp_path, script).is_err() {
+            return MousePosition { x: 0, y: 0, captured: false };
+        }
+
+        let ahk_paths = [
+            r"C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe",
+            r"C:\Program Files\AutoHotkey\AutoHotkey64.exe",
+            r"C:\Program Files\AutoHotkey\AutoHotkey.exe",
+            "AutoHotkey64.exe",
+            "AutoHotkey.exe",
+        ];
+
+        for ahk_path in &ahk_paths {
+            match ProcessCommand::new(ahk_path)
+                .arg("/ErrorStdOut")
+                .arg(temp_path.to_str().unwrap_or(""))
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let x_regex = Regex::new(r"X=(\d+)").unwrap();
+                    let y_regex = Regex::new(r"Y=(\d+)").unwrap();
+
+                    if let (Some(x_cap), Some(y_cap)) = (x_regex.captures(&stdout), y_regex.captures(&stdout)) {
+                        if let (Ok(x), Ok(y)) = (x_cap[1].parse::<i32>(), y_cap[1].parse::<i32>()) {
+                            let _ = std::fs::remove_file(&temp_path);
+                            debug!("Position captured via AHK v2: ({}, {})", x, y);
+                            return MousePosition { x, y, captured: true };
+                        }
                     }
                 }
+                _ => continue,
             }
-            _ => {}
         }
+
+        let _ = std::fs::remove_file(&temp_path);
         MousePosition { x: 0, y: 0, captured: false }
     }
     
@@ -534,41 +563,59 @@ impl AgentServiceImpl {
     
     // Build detailed message with action and position
     fn build_detailed_message(
-        &self, 
-        action: &ActionDetails, 
-        position: &MousePosition, 
-        command: &str
+        &self,
+        action: &ActionDetails,
+        position: &MousePosition,
+        command: &str,
     ) -> String {
+        // ── Keyboard actions ─────────────────────────────────────────────────────
+        if action.action_type == "press" {
+            // "press {Enter}" → "Pressed: Enter"
+            let keys = command.trim_start_matches("press").trim();
+            return format!("Pressed: {}", keys);
+        }
+        if action.action_type == "keyboard" {
+            // "type x.ai/careers" → "Typed: x.ai/careers"
+            let content = command.trim_start_matches("type").trim();
+            return format!("Typed: {}", content);
+        }
         if !action.is_mouse {
-            // Keyboard action - no position
             return format!("Typed: {}", command);
         }
-        
+
+        // ── Position query ───────────────────────────────────────────────────────
+        if action.action_type == "position" {
+            return if position.captured {
+                format!("Position: ({}, {})", position.x, position.y)
+            } else {
+                "Position: (?, ?)".to_string()
+            };
+        }
+
+        // ── Mouse actions that don't need position ───────────────────────────────
         if !position.captured {
-            // Mouse action but position capture failed
             return format!("Executed: {}", command);
         }
-        
-        // Format action name
+
+        // ── Mouse actions with position ──────────────────────────────────────────
         let action_name = match action.action_type.as_str() {
-            "left" => "Left-clicked",
-            "right" => "Right-clicked",
-            "middle" => "Middle-clicked",
-            "double" => "Double-clicked",
-            "triple" => "Triple-clicked",
-            "drag" => "Dragged",
-            "move" => "Moved cursor to",
-            "scroll_up" => "Scrolled up at",
-            "scroll_down" => "Scrolled down at",
-            _ => "Performed action",
+            "left"         => "Left-clicked",
+            "right"        => "Right-clicked",
+            "middle"       => "Middle-clicked",
+            "double"       => "Double-clicked",
+            "triple"       => "Triple-clicked",
+            "drag"         => "Dragged",
+            "move"         => "Moved cursor to",
+            "scroll_up"    => "Scrolled up at",
+            "scroll_down"  => "Scrolled down at",
+            "hold"         => "Held button at",
+            "release"      => "Released button at",
+            _              => "Performed action at",
         };
-        
-        // Build message based on command type
+
         if action.is_here_command {
-            // "here left" -> "Left-clicked here at (x, y)"
             format!("{} here at ({}, {})", action_name, position.x, position.y)
         } else if action.action_type == "drag" {
-            // Extract coordinates for drag
             let tokens: Vec<&str> = command.split_whitespace().collect();
             if tokens.len() >= 5 {
                 if let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
@@ -582,7 +629,6 @@ impl AgentServiceImpl {
             }
             format!("Dragged to ({}, {})", position.x, position.y)
         } else {
-            // Regular coordinate-based action
             format!("{} at ({}, {})", action_name, position.x, position.y)
         }
     }
