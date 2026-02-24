@@ -389,7 +389,7 @@ jobs:
   # JOB 4: MACOS BUILD (Intel / x64)
   # ============================================================================
   build-macos-x64:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       
