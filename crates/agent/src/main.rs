@@ -635,8 +635,24 @@ impl AgentServiceImpl {
         
         // Capture position if it's a mouse action
         let position = if action.is_mouse && result.is_ok() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            self.capture_mouse_position().await
+            #[cfg(target_os = "windows")]
+            {
+                let mut captured = MousePosition { x: 0, y: 0, captured: false };
+                for _ in 0..7u32 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    let pos = self.capture_mouse_position().await;
+                    if pos.captured {
+                        captured = pos;
+                        break;
+                    }
+                }
+                captured
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                self.capture_mouse_position().await
+            }
         } else {
             MousePosition { x: 0, y: 0, captured: false }
         };
