@@ -659,6 +659,17 @@ impl AgentServiceImpl {
     #[cfg(target_os = "windows")]
     async fn execute_windows(&self, command: &str) -> Result<String, String> {
 
+        if command.contains("keyboard_cmd.txt") {
+            if let Some(content) = command
+                .split("echo ")
+                .nth(1)
+                .and_then(|s| s.split(" > ").next())
+            {
+                let _ = std::fs::write(r"C:\keyboard_cmd.txt", content);
+                return Ok(format!("Executed: {}", content));
+            }
+        }
+
         let output = ProcessCommand::new("cmd")
             .arg("/c")
             .arg(command)
