@@ -362,7 +362,7 @@ class WindowsActuation:
                     safe = kb_content.replace('^', '{U+005E}')
                     echo_payload = f'press {safe}'
                 else:
-                    echo_payload = f'type {self._escape_cmd_special(kb_content)}'
+                    echo_payload = f'type {kb_content}'
 
             shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
         else:
@@ -472,7 +472,7 @@ class WindowsActuation:
                                 safe = kb_content.replace('^', '{U+005E}')
                                 echo_payload = f'press {safe}'
                             else:
-                                echo_payload = f'type {self._escape_cmd_special(kb_content)}'
+                                echo_payload = f'type {kb_content}'
                         shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
                     else:
                         shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'
