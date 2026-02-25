@@ -481,22 +481,15 @@ impl AgentServiceImpl {
     
     #[cfg(target_os = "windows")]
     async fn capture_position_windows(&self) -> MousePosition {
-        let pos_file = match std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("cc_pos.txt")))
-        {
-            Some(p) => p,
-            None => return MousePosition { x: 0, y: 0, captured: false },
-        };
+        let pos_file = r"C:\cc_pos.txt";
 
-        if let Ok(contents) = std::fs::read_to_string(&pos_file) {
+        if let Ok(contents) = std::fs::read_to_string(pos_file) {
             let x_regex = Regex::new(r"X=(\d+)").unwrap();
             let y_regex = Regex::new(r"Y=(\d+)").unwrap();
 
             if let (Some(xc), Some(yc)) = (x_regex.captures(&contents), y_regex.captures(&contents)) {
                 if let (Ok(x), Ok(y)) = (xc[1].parse::<i32>(), yc[1].parse::<i32>()) {
-                    let _ = std::fs::remove_file(&pos_file);
-                    debug!("Position captured from cc_pos.txt: ({}, {})", x, y);
+                    debug!("Position captured: ({}, {})", x, y);
                     return MousePosition { x, y, captured: true };
                 }
             }
@@ -641,16 +634,8 @@ impl AgentServiceImpl {
         let position = if action.is_mouse && result.is_ok() {
             #[cfg(target_os = "windows")]
             {
-                let mut captured = MousePosition { x: 0, y: 0, captured: false };
-                for _ in 0..7u32 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    let pos = self.capture_mouse_position().await;
-                    if pos.captured {
-                        captured = pos;
-                        break;
-                    }
-                }
-                captured
+                tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
+                self.capture_mouse_position().await
             }
             #[cfg(not(target_os = "windows"))]
             {
