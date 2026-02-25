@@ -503,9 +503,6 @@ class MacOSActuation:
         if cmd_type == 'mouse':
             # Extract target coordinates from original command (if present)
             target_coords = self._extract_coordinates_from_command(command)
-            
-            # Get position before action
-            position_before = self._get_mouse_position()
         
         # Send to server via gRPC
         result = self.grpc_client.execute_command(cliclick_cmd)

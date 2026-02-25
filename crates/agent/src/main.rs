@@ -280,13 +280,79 @@ impl AgentServiceImpl {
         }
 
         // ── macOS cliclick ───────────────────────────────────────────────────
-        // "cliclick" already contains the substring "click", so parse_action_details()
-        // already classifies these as mouse actions.  Return the command as-is;
-        // build_detailed_message() will produce a useful output ("Performed action
-        // at (x, y)") once position capture is working.
+        // ── macOS cliclick ───────────────────────────────────────────────────
+        if command.contains("cliclick") {
+            return self.extract_cliclick_human_command(command);
+        }
 
         // Fallback – return unchanged.
         command.to_string()
+    }
+
+    /// Parse a cliclick command string and return a human-readable equivalent.
+    fn extract_cliclick_human_command(&self, command: &str) -> String {
+        // Strip leading "cliclick" or full path e.g. "/usr/local/bin/cliclick"
+        let after = command
+            .split_whitespace()
+            .skip_while(|s| s.ends_with("cliclick"))
+            .collect::<Vec<&str>>()
+            .join(" ");
+
+        let tokens: Vec<&str> = after.split_whitespace().collect();
+        if tokens.is_empty() {
+            return command.to_string();
+        }
+
+        // Each token is an action shortcut e.g. "c:.", "rc:960,540", "t:hello"
+        // We only need the first action token to determine the human command type.
+        let action_token = tokens[0];
+
+        // Keyboard: "t:text" → "type text", "kp:return" → "press {Enter}"
+        if let Some(text) = action_token.strip_prefix("t:") {
+            return format!("type {}", text.trim_matches('"'));
+        }
+        if let Some(key) = action_token.strip_prefix("kp:") {
+            return format!("press {{{}}}", key);
+        }
+        if action_token.starts_with("kd:") || action_token.starts_with("ku:") {
+            return format!("press {}", action_token);
+        }
+
+        // Mouse: parse shortcut prefix and coordinates
+        // Shortcuts: c=left, rc=right, dc=double, tc=triple, mc=middle,
+        //            dd=hold, du=release, m=move, p=position
+        let (shortcut, coords) = if let Some(pos) = action_token.find(':') {
+            (&action_token[..pos], &action_token[pos+1..])
+        } else {
+            return command.to_string();
+        };
+
+        let is_here = coords == ".";
+        let coord_str = if is_here {
+            String::new()
+        } else {
+            // "960,540" → "960 540"
+            coords.replace(',', " ")
+        };
+
+        let action = match shortcut {
+            "c"  => "left",
+            "rc" => "right",
+            "dc" => "double",
+            "tc" => "triple",
+            "mc" => "middle",
+            "dd" => "hold",
+            "du" => "release",
+            "m"  => "move",
+            "p"  => return "position".to_string(),
+            _    => "left",
+        };
+
+        if is_here {
+            format!("here {}", action)
+        } else {
+            format!("{} {}", coord_str, action)
+        }
     }
 
     /// Parse an xdotool command string and return a human-readable equivalent.
@@ -696,25 +762,45 @@ impl AgentServiceImpl {
         if !self.capabilities.contains(&"cliclick".to_string()) {
             return Err("cliclick not available - please install it".to_string());
         }
-        
-        // Try multiple cliclick paths
+
+        // Compound commands (scroll uses cliclick && osascript) must run via sh -c.
+        // Pure osascript commands also need shell execution.
+        if command.contains("&&") || command.starts_with("osascript") {
+            let output = ProcessCommand::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .map_err(|e| format!("Execution error: {}", e))?;
+
+            return if output.status.success() {
+                Ok(format!("Executed: {}", command))
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            };
+        }
+
+        // Try multiple cliclick paths.
         let cliclick_paths = [
             "/usr/local/bin/cliclick",
             "/opt/homebrew/bin/cliclick",
             "cliclick",
         ];
-        
+
+        let args: Vec<&str> = command.split_whitespace()
+            .filter(|&s| s != "cliclick")
+            .collect();
+
         let mut last_error = String::new();
-        
+
         for cliclick_path in &cliclick_paths {
             match ProcessCommand::new(cliclick_path)
-                .args(command.split_whitespace())
+                .args(&args)
                 .output()
             {
                 Ok(output) => {
                     if output.status.success() {
                         debug!("Command executed via {}: {}", cliclick_path, command);
-                        return Ok(format!("Executed: cliclick {}", command));
+                        return Ok(format!("Executed: {}", command));
                     } else {
                         last_error = String::from_utf8_lossy(&output.stderr).to_string();
                     }
@@ -725,7 +811,7 @@ impl AgentServiceImpl {
                 }
             }
         }
-        
+
         error!("All cliclick execution attempts failed: {}", last_error);
         Err(format!("Execution failed: {}", last_error))
     }
