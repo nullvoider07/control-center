@@ -619,17 +619,20 @@ impl AgentServiceImpl {
             };
             return (Err(e), MousePosition { x: 0, y: 0, captured: false }, empty_action);
         }
-        
-        // Parse action details
-        let action = self.parse_action_details(command);
-        
+
+        // Derive the human command first so parse_action_details works on
+        // "here left" not "cmd /c echo here left > C:\mouse_cmd.txt".
+        // Without this, is_mouse is always false and position is never captured.
+        let human_cmd = self.extract_human_command(command);
+        let action = self.parse_action_details(&human_cmd);
+
         // Execute the command
         let result = match self.os_type {
             OsType::Windows => self.execute_windows(command).await,
             OsType::Macos => self.execute_macos(command).await,
             OsType::Linux => self.execute_linux(command).await,
         };
-        
+
         // Capture position if it's a mouse action
         let position = if action.is_mouse && result.is_ok() {
             #[cfg(target_os = "windows")]
@@ -645,7 +648,7 @@ impl AgentServiceImpl {
         } else {
             MousePosition { x: 0, y: 0, captured: false }
         };
-        
+
         (result, position, action)
     }
     
