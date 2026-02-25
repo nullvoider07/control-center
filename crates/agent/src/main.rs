@@ -52,6 +52,8 @@ pub struct AgentServiceImpl {
     os_type: OsType,
     os_version: String,
     capabilities: Vec<String>,
+    #[cfg(target_os = "macos")]
+    cliclick_path: Option<String>,
 }
 
 /// Core implementation of the AgentService
@@ -69,7 +71,24 @@ impl AgentServiceImpl {
             os_type,
             os_version,
             capabilities,
+            #[cfg(target_os = "macos")]
+            cliclick_path: Self::resolve_cliclick_path(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resolve_cliclick_path() -> Option<String> {
+        let paths = [
+            "/usr/local/bin/cliclick",
+            "/opt/homebrew/bin/cliclick",
+            "cliclick",
+        ];
+        for p in &paths {
+            if ProcessCommand::new(p).arg("--version").output().is_ok() {
+                return Some(p.to_string());
+            }
+        }
+        None
     }
     
     /// Real OS detection with version information
@@ -629,7 +648,7 @@ impl AgentServiceImpl {
         // ── Position query ───────────────────────────────────────────────────────
         if action.action_type == "position" {
             return if position.captured {
-                format!("Position: ({}, {})", position.x, position.y)
+                format!("Position: X={}, Y={}", position.x, position.y)
             } else {
                 "Position: (?, ?)".to_string()
             };
@@ -657,7 +676,7 @@ impl AgentServiceImpl {
         };
 
         if action.is_here_command {
-            format!("{} at ({}, {})", action_name, position.x, position.y)
+            format!("{} at X={}, Y={}", action_name, position.x, position.y)
         } else if action.action_type == "drag" {
             let tokens: Vec<&str> = command.split_whitespace().collect();
             if tokens.len() >= 5 {
@@ -667,12 +686,12 @@ impl AgentServiceImpl {
                     tokens[3].parse::<i32>(),
                     tokens[4].parse::<i32>(),
                 ) {
-                    return format!("Dragged from ({}, {}) to ({}, {})", x1, y1, x2, y2);
+                    return format!("Dragged from X={}, Y={} to X={}, Y={}", x1, y1, x2, y2);
                 }
             }
-            format!("Dragged to ({}, {})", position.x, position.y)
+            format!("Dragged to X={}, Y={}", position.x, position.y)
         } else {
-            format!("{} at ({}, {})", action_name, position.x, position.y)
+            format!("{} at X={}, Y={}", action_name, position.x, position.y)
         }
     }
     
@@ -780,35 +799,30 @@ impl AgentServiceImpl {
         }
 
         // Try multiple cliclick paths.
-        let cliclick_paths = [
-            "/usr/local/bin/cliclick",
-            "/opt/homebrew/bin/cliclick",
-            "cliclick",
-        ];
-
         let args: Vec<&str> = command.split_whitespace()
             .filter(|&s| s != "cliclick")
             .collect();
 
-        let mut last_error = String::new();
+        // Use cached path resolved at startup — no repeated path probing per command
+        let cliclick_path = self.cliclick_path.as_deref().unwrap_or("cliclick");
 
-        for cliclick_path in &cliclick_paths {
-            match ProcessCommand::new(cliclick_path)
-                .args(&args)
-                .output()
-            {
-                Ok(output) => {
-                    if output.status.success() {
-                        debug!("Command executed via {}: {}", cliclick_path, command);
-                        return Ok(format!("Executed: {}", command));
-                    } else {
-                        last_error = String::from_utf8_lossy(&output.stderr).to_string();
-                    }
+        match ProcessCommand::new(cliclick_path)
+            .args(&args)
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    debug!("Command executed via {}: {}", cliclick_path, command);
+                    Ok(format!("Executed: {}", command))
+                } else {
+                    let err = String::from_utf8_lossy(&output.stderr).to_string();
+                    error!("cliclick failed: {}", err);
+                    Err(format!("Execution failed: {}", err))
                 }
-                Err(e) => {
-                    last_error = format!("Failed to execute {}: {}", cliclick_path, e);
-                    continue;
-                }
+            }
+            Err(e) => {
+                error!("Failed to execute cliclick: {}", e);
+                Err(format!("Execution error: {}", e))
             }
         }
 
