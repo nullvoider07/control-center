@@ -483,7 +483,7 @@ impl AgentServiceImpl {
     async fn capture_position_windows(&self) -> MousePosition {
         let pos_file = r"C:\cc_pos.txt";
 
-        if let Ok(contents) = std::fs::read_to_string(pos_file).await {
+        if let Ok(contents) = tokio::fs::read_to_string(pos_file).await {
             let x_regex = Regex::new(r"X=(\d+)").unwrap();
             let y_regex = Regex::new(r"Y=(\d+)").unwrap();
 
