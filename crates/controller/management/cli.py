@@ -500,6 +500,17 @@ def _interactive_mode(controller):
             else:
                 consecutive_failures = 0
             
+            # Check agent is still alive before prompting
+            if ctx.client:
+                try:
+                    result = ctx.client.ping()
+                    if result is None:
+                        click.echo("\n[!] Agent has disconnected. Session terminated.", err=True)
+                        break
+                except Exception:
+                    click.echo("\n[!] Agent has disconnected. Session terminated.", err=True)
+                    break
+
             # Get user input
             user_input = click.prompt("control-center>", prompt_suffix=" ", default="", show_default=False)
             user_input = user_input.strip()

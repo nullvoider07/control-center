@@ -825,9 +825,6 @@ impl AgentServiceImpl {
                 Err(format!("Execution error: {}", e))
             }
         }
-
-        error!("All cliclick execution attempts failed: {}", last_error);
-        Err(format!("Execution failed: {}", last_error))
     }
     
     /// Linux execution using xdotool
