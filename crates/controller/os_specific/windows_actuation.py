@@ -161,6 +161,13 @@ class WindowsActuation:
         # e.g., "#r" (Win+R) stays as "#r"
         return command
 
+    # Helper method to escape cmd.exe special characters in keyboard commands
+    def _escape_cmd_special(self, text: str) -> str:
+        """Escape characters cmd.exe intercepts before they reach keyboard_cmd.txt."""
+        for ch in ['<', '>', '|', '&', '"']:
+            text = text.replace(ch, f'^{ch}')
+        return text
+
     def _format_press_for_display(self, keys: str) -> str:
         """
         Convert AHK key notation to a human-readable string for CLI output.
@@ -355,7 +362,7 @@ class WindowsActuation:
                     safe = kb_content.replace('^', '{U+005E}')
                     echo_payload = f'press {safe}'
                 else:
-                    echo_payload = f'type {kb_content}'
+                    echo_payload = f'type {self._escape_cmd_special(kb_content)}'
 
             shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
         else:
@@ -465,7 +472,7 @@ class WindowsActuation:
                                 safe = kb_content.replace('^', '{U+005E}')
                                 echo_payload = f'press {safe}'
                             else:
-                                echo_payload = f'type {kb_content}'
+                                echo_payload = f'type {self._escape_cmd_special(kb_content)}'
                         shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
                     else:
                         shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'

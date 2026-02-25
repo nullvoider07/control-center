@@ -591,7 +591,7 @@ impl AgentServiceImpl {
         };
 
         if action.is_here_command {
-            format!("{} here at ({}, {})", action_name, position.x, position.y)
+            format!("{} at ({}, {})", action_name, position.x, position.y)
         } else if action.action_type == "drag" {
             let tokens: Vec<&str> = command.split_whitespace().collect();
             if tokens.len() >= 5 {
@@ -639,7 +639,8 @@ impl AgentServiceImpl {
         let position = if action.is_mouse && result.is_ok() {
             #[cfg(target_os = "windows")]
             {
-                tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
+                let wait_ms = if action.is_here_command { 10 } else { 20 };
+                tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
                 self.capture_mouse_position().await
             }
             #[cfg(not(target_os = "windows"))]
