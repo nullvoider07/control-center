@@ -481,15 +481,17 @@ impl AgentServiceImpl {
     
     #[cfg(target_os = "windows")]
     async fn capture_position_windows(&self) -> MousePosition {
-        let pos_file = r"C:\cc_pos.txt";
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+        use winreg::RegKey;
 
-        if let Ok(contents) = tokio::fs::read_to_string(pos_file).await {
-            let x_regex = Regex::new(r"X=(\d+)").unwrap();
-            let y_regex = Regex::new(r"Y=(\d+)").unwrap();
-
-            if let (Some(xc), Some(yc)) = (x_regex.captures(&contents), y_regex.captures(&contents)) {
-                if let (Ok(x), Ok(y)) = (xc[1].parse::<i32>(), yc[1].parse::<i32>()) {
-                    debug!("Position captured: ({}, {})", x, y);
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(key) = hkcu.open_subkey_with_flags("Software\\MouseTracker", KEY_READ) {
+            if let (Ok(x_str), Ok(y_str)) = (
+                key.get_value::<String, _>("MouseX"),
+                key.get_value::<String, _>("MouseY"),
+            ) {
+                if let (Ok(x), Ok(y)) = (x_str.parse::<i32>(), y_str.parse::<i32>()) {
+                    debug!("Position captured from registry: ({}, {})", x, y);
                     return MousePosition { x, y, captured: true };
                 }
             }

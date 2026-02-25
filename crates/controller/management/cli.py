@@ -583,12 +583,15 @@ def _interactive_mode(controller):
         except KeyboardInterrupt:
             click.echo("\n[*] Interrupted. Type 'exit' to disconnect.")
             continue
+        except click.exceptions.Abort:
+            click.echo("\n[*] Disconnecting...")
+            break
         except EOFError:
             logger.info("EOF detected. Disconnecting...")
             break
         except Exception as e:
-            logger.error(f"Error in interactive mode: {e}", exc_info=True)
-            click.echo(f"[x] Error: {e}", err=True)
+            logger.error("\n[!] Use 'exit' or 'quit' to disconnect")
+            continue
 
     if ctx.session and ctx.session.is_vm_shutdown():
         click.echo("\n[*] Session ended due to VM shutdown")
