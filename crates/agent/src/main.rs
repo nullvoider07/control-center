@@ -784,7 +784,7 @@ impl AgentServiceImpl {
 
         // Compound commands (scroll uses cliclick && osascript) must run via sh -c.
         // Pure osascript commands also need shell execution.
-        if command.contains("&&") || command.starts_with("osascript") {
+        if command.contains("&&") || command.starts_with("osascript") || command.contains("t:\"") {
             let output = ProcessCommand::new("sh")
                 .arg("-c")
                 .arg(command)

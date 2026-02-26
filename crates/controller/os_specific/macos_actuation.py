@@ -354,7 +354,8 @@ class MacOSActuation:
         
         # CASE 1: type <text>
         if action == 'type':
-            return f'{cli} "t:{text}"'
+            escaped = text.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`').replace("'", "\\'")
+            return f'{cli} t:"{escaped}"'
         
         # CASE 2: press <keys>
         elif action in ['press', 'key']:
