@@ -354,47 +354,8 @@ class MacOSActuation:
         
         # CASE 1: type <text>
         if action == 'type':
-            # Characters cliclick t: gets shift-state wrong for — handle explicitly
-            SHIFT_SPECIAL = {
-                '%': '5', '^': '6', '*': '8', '(': '9', ')': '0',
-                '_': '-', '"': "'"
-            }
-            DIRECT_KEY = {
-                '[': '[', ']': ']', '\\': '\\'
-            }
-
-            # Check if text contains any problematic characters
-            has_problem = any(c in text for c in {**SHIFT_SPECIAL, **DIRECT_KEY})
-
-            if not has_problem:
-                escaped = text.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`').replace("'", "\\'")
-                return f'{cli} t:"{escaped}"'
-
-            # Build sequence of cliclick args handling each problematic char
-            args = []
-            chunk = ''
-            for ch in text:
-                if ch in SHIFT_SPECIAL:
-                    if chunk:
-                        escaped = chunk.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`').replace("'", "\\'")
-                        args.append(f't:"{escaped}"')
-                        chunk = ''
-                    args.append(f'kd:shift')
-                    args.append(f'kp:{SHIFT_SPECIAL[ch]}')
-                    args.append(f'ku:shift')
-                elif ch in DIRECT_KEY:
-                    if chunk:
-                        escaped = chunk.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`').replace("'", "\\'")
-                        args.append(f't:"{escaped}"')
-                        chunk = ''
-                    args.append(f'kp:{DIRECT_KEY[ch]}')
-                else:
-                    chunk += ch
-            if chunk:
-                escaped = chunk.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`').replace("'", "\\'")
-                args.append(f't:"{escaped}"')
-
-            return f'{cli} {" ".join(args)}'
+            escaped = text.replace('\\', '\\\\').replace('"', '\\"')
+            return f'osascript -e \'tell application "System Events" to keystroke "{escaped}"\''
         
         # CASE 2: press <keys>
         elif action in ['press', 'key']:
