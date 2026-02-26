@@ -355,6 +355,7 @@ class MacOSActuation:
         # CASE 1: type <text>
         if action == 'type':
             escaped = text.replace('\\', '\\\\').replace('"', '\\"')
+            escaped_sh = escaped.replace("'", "'\"'\"'")
             return f'osascript -e \'tell application "System Events" to keystroke "{escaped}"\''
         
         # CASE 2: press <keys>
