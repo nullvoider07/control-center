@@ -356,7 +356,7 @@ class MacOSActuation:
         if action == 'type':
             escaped = text.replace('\\', '\\\\').replace('"', '\\"')
             escaped_sh = escaped.replace("'", "'\"'\"'")
-            return f'osascript -e \'tell application "System Events" to keystroke "{escaped}"\''
+            return f'osascript -e \'tell application "System Events" to keystroke "{escaped_sh}"\''
         
         # CASE 2: press <keys>
         elif action in ['press', 'key']:
