@@ -7,6 +7,8 @@ use tracing::{info, warn, debug};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+use tokio::sync::broadcast;
+use tokio::time::Duration;
 mod identity;
 mod registry;
 mod monitoring;
@@ -90,6 +92,7 @@ pub struct ControlCenterService {
     listen_address: String,
     rate_limiter: Arc<tokio::sync::RwLock<RateLimiter>>,
     metrics: Arc<tokio::sync::RwLock<ServerMetrics>>,
+    event_tx: broadcast::Sender<proto::CommandEvent>,
 }
 
 // Metrics structure for monitoring server performance and security
@@ -113,6 +116,7 @@ impl ControlCenterService {
         monitoring: Arc<monitoring::MonitoringHandler>,
         stream_handler: Arc<stream_handler::StreamHandler>,
         listen_address: String,
+        event_tx: broadcast::Sender<proto::CommandEvent>,
     ) -> Self {
         Self {
             jwt_secret,
@@ -125,6 +129,7 @@ impl ControlCenterService {
             listen_address,
             rate_limiter: Arc::new(tokio::sync::RwLock::new(RateLimiter::new(100, 60))),
             metrics: Arc::new(tokio::sync::RwLock::new(ServerMetrics::default())),
+            event_tx,
         }
     }
     
@@ -187,6 +192,41 @@ impl ControlCenterService {
         }
 
         Ok(())
+    }
+
+    /// Parse raw command string into (action_type, action_subtype, is_here_command)
+    fn parse_command_meta(command: &str) -> (String, String, bool) {
+        let tokens: Vec<&str> = command.trim().splitn(3, ' ').collect();
+        let first = tokens.first().copied().unwrap_or("").to_lowercase();
+
+        // Keyboard commands
+        if first == "type" {
+            return ("keyboard".to_string(), "type".to_string(), false);
+        }
+        if first == "press" || first == "key" {
+            return ("keyboard".to_string(), "press".to_string(), false);
+        }
+
+        // Position query
+        if first == "position" {
+            return ("position".to_string(), "position".to_string(), false);
+        }
+
+        // Here commands: "here <action>"
+        if first == "here" {
+            let subtype = tokens.get(1).copied().unwrap_or("left").to_lowercase();
+            return ("mouse".to_string(), subtype, true);
+        }
+
+        // Coordinate commands: "<x> <y> <action>"
+        if first.parse::<i32>().is_ok() {
+            let subtype = tokens.get(2).copied().unwrap_or("left").to_lowercase();
+            // Strip amount token if present (e.g. "scroll_down 3" → "scroll_down")
+            let subtype = subtype.split_whitespace().next().unwrap_or("left").to_string();
+            return ("mouse".to_string(), subtype, false);
+        }
+
+        ("mouse".to_string(), first, false)
     }
 }
 
@@ -436,6 +476,36 @@ impl ControlService for ControlCenterService {
             }
         }
         
+        // Broadcast CommandEvent to WatchCommands subscribers
+        let (action_type, action_subtype, is_here_command) = Self::parse_command_meta(&command);
+        let agent = self.registry.get_current_connection().await;
+        let event = proto::CommandEvent {
+            session_id: agent.as_ref().map(|a| a.connection_id.clone()).unwrap_or_default(),
+            agent_id: agent.as_ref().map(|a| a.agent_id.clone()).unwrap_or_default(),
+            agent_version: agent.as_ref().map(|a| a.agent_version.clone()).unwrap_or_default(),
+            os_type: agent.as_ref().map(|a| match a.os_type {
+                0 => "WINDOWS".to_string(),
+                1 => "MACOS".to_string(),
+                2 => "LINUX".to_string(),
+                _ => "UNKNOWN".to_string(),
+            }).unwrap_or_default(),
+            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            raw_command: command.clone(),
+            action_type,
+            action_subtype,
+            is_here_command,
+            success: response.as_ref().map(|r| r.success).unwrap_or(false),
+            error_message: response.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+            execution_time_ms: execution_time.as_millis() as i32,
+            mouse_x: response.as_ref().ok().and_then(|r| r.mouse_x).unwrap_or(0),
+            mouse_y: response.as_ref().ok().and_then(|r| r.mouse_y).unwrap_or(0),
+            position_captured: response.as_ref().ok().and_then(|r| r.position_captured).unwrap_or(false),
+            is_heartbeat: false,
+            agent_alive: true,
+        };
+        // Ignore send errors — no subscribers is fine
+        let _ = self.event_tx.send(event);
+
         Ok(Response::new(response?))
     }
     
@@ -617,6 +687,62 @@ impl ControlService for ControlCenterService {
             total_count,
         }))
     }
+
+    /// WatchCommands stream — no auth required, read-only live feed for Memory Archive
+    type WatchCommandsStream = tokio_stream::wrappers::ReceiverStream<Result<proto::CommandEvent, Status>>;
+    async fn watch_commands(
+        &self,
+        _request: Request<proto::WatchRequest>,
+    ) -> Result<Response<Self::WatchCommandsStream>, Status> {
+        let mut rx = self.event_tx.subscribe();
+        let registry = self.registry.clone();
+        let (tx, stream_rx) = tokio::sync::mpsc::channel(64);
+
+        info!("WatchCommands subscriber connected");
+
+        tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                    // Real command event received — forward it
+                    Ok(Ok(event)) => {
+                        if tx.send(Ok(event)).await.is_err() {
+                            break; // Subscriber disconnected
+                        }
+                    }
+                    // Broadcast channel closed — agent disconnected, close stream
+                    Ok(Err(_)) => {
+                        info!("WatchCommands: broadcast channel closed, stream ending");
+                        break;
+                    }
+                    // Timeout — idle for 5s, send heartbeat
+                    Err(_) => {
+                        let agent = registry.get_current_connection().await;
+                        let heartbeat = proto::CommandEvent {
+                            session_id: agent.as_ref().map(|a| a.connection_id.clone()).unwrap_or_default(),
+                            agent_id: agent.as_ref().map(|a| a.agent_id.clone()).unwrap_or_default(),
+                            agent_version: agent.as_ref().map(|a| a.agent_version.clone()).unwrap_or_default(),
+                            os_type: agent.as_ref().map(|a| match a.os_type {
+                                0 => "WINDOWS".to_string(),
+                                1 => "MACOS".to_string(),
+                                2 => "LINUX".to_string(),
+                                _ => "UNKNOWN".to_string(),
+                            }).unwrap_or_default(),
+                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                            is_heartbeat: true,
+                            agent_alive: true,
+                            ..Default::default()
+                        };
+                        if tx.send(Ok(heartbeat)).await.is_err() {
+                            break; // Subscriber disconnected
+                        }
+                    }
+                }
+            }
+            info!("WatchCommands stream closed");
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(stream_rx)))
+    }
 }
 
 // Main function to start the gRPC server
@@ -685,6 +811,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_identity.server_id.clone(),
     ));
 
+    // Create broadcast channel for WatchCommands (buffer 256 events)
+    let (event_tx, _) = broadcast::channel::<proto::CommandEvent>(256);
+
     // Create service
     let service = ControlCenterService::new(
         jwt_secret.clone(),
@@ -695,6 +824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         monitoring_handler,
         stream_handler,
         listen_address,
+        event_tx,
     );
 
     info!("Server will listen on {}", addr);

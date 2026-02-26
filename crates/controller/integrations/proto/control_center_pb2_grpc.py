@@ -104,6 +104,11 @@ class ControlServiceStub(object):
                 request_serializer=control__center__pb2.MetricsRequest.SerializeToString,
                 response_deserializer=control__center__pb2.MetricsResponse.FromString,
                 _registered_method=True)
+        self.WatchCommands = channel.unary_stream(
+                '/control_center.ControlService/WatchCommands',
+                request_serializer=control__center__pb2.WatchRequest.SerializeToString,
+                response_deserializer=control__center__pb2.CommandEvent.FromString,
+                _registered_method=True)
 
 
 class ControlServiceServicer(object):
@@ -203,6 +208,15 @@ class ControlServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def WatchCommands(self, request, context):
+        """Watch live command events — for Memory Archive (no auth required)
+        Stream closes automatically when agent disconnects.
+        Heartbeat events (is_heartbeat=true) fire every 5s when idle.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ControlServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -270,6 +284,11 @@ def add_ControlServiceServicer_to_server(servicer, server):
                     servicer.GetMetrics,
                     request_deserializer=control__center__pb2.MetricsRequest.FromString,
                     response_serializer=control__center__pb2.MetricsResponse.SerializeToString,
+            ),
+            'WatchCommands': grpc.unary_stream_rpc_method_handler(
+                    servicer.WatchCommands,
+                    request_deserializer=control__center__pb2.WatchRequest.FromString,
+                    response_serializer=control__center__pb2.CommandEvent.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -628,6 +647,33 @@ class ControlService(object):
             '/control_center.ControlService/GetMetrics',
             control__center__pb2.MetricsRequest.SerializeToString,
             control__center__pb2.MetricsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WatchCommands(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/control_center.ControlService/WatchCommands',
+            control__center__pb2.WatchRequest.SerializeToString,
+            control__center__pb2.CommandEvent.FromString,
             options,
             channel_credentials,
             insecure,

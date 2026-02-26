@@ -727,6 +727,55 @@ class GRPCClient:
             logger.error(f"GetConnectionHistory failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
             return None
 
+    # Real-time command event streaming   
+    def watch_commands(self):
+        """Stream live command events from the server — no auth required.
+
+        Yields dicts for each CommandEvent as they arrive:
+            session_id, agent_id, agent_version, os_type,
+            timestamp, raw_command, action_type, action_subtype,
+            is_here_command, success, error_message, execution_time_ms,
+            mouse_x, mouse_y, position_captured,
+            is_heartbeat, agent_alive
+
+        Heartbeat events fire every 5s when idle (is_heartbeat=True).
+        Stream closes automatically when the agent disconnects.
+
+        Raises:
+            ConnectionError: if not connected to server.
+        """
+        if not self.stub:
+            raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
+
+        request = control_center_pb2.WatchRequest()
+
+        try:
+            for event in self.stub.WatchCommands(request):
+                yield {
+                    'session_id':        event.session_id,
+                    'agent_id':          event.agent_id,
+                    'agent_version':     event.agent_version,
+                    'os_type':           event.os_type,
+                    'timestamp':         event.timestamp,
+                    'raw_command':       event.raw_command,
+                    'action_type':       event.action_type,
+                    'action_subtype':    event.action_subtype,
+                    'is_here_command':   event.is_here_command,
+                    'success':           event.success,
+                    'error_message':     event.error_message,
+                    'execution_time_ms': event.execution_time_ms,
+                    'mouse_x':           event.mouse_x,
+                    'mouse_y':           event.mouse_y,
+                    'position_captured': event.position_captured,
+                    'is_heartbeat':      event.is_heartbeat,
+                    'agent_alive':       event.agent_alive,
+                }
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                logger.info("WatchCommands stream closed — agent disconnected")
+            else:
+                logger.error(f"WatchCommands failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #

@@ -709,6 +709,62 @@ def execute(host: Optional[str], port: Optional[int], token: Optional[str], comm
         ctx.cleanup()
 
 # ============================================================================
+# Watch Command — Live command event stream for Memory Archive
+# ============================================================================
+
+@cli.command()
+@click.option('--host', help='Server host')
+@click.option('--port', type=int, help='Server port')
+@click.option('--ssl', is_flag=True, help='Use SSL/TLS')
+@click.option('--fmt', type=click.Choice(['text', 'json']), default='text',
+              help='Output format (default: text)')
+def watch(host: Optional[str], port: Optional[int], ssl: bool, fmt: str):
+    """Watch live command events — streams all commands as they execute.
+
+    No authentication required. Stream closes when agent disconnects.
+    Heartbeat events are emitted every 5s during idle periods.
+
+    Examples:
+
+      control-center watch
+
+      control-center watch --fmt json
+
+      control-center watch --host 192.168.1.10 --port 50051
+    """
+    resolved_host, resolved_port = _resolve_host_port(host, port, ssl)
+
+    try:
+        client = _get_no_auth_client(resolved_host, resolved_port)
+        click.echo(f"[*] Watching command events from {resolved_host}:{resolved_port} (Ctrl+C to stop)\n")
+
+        for event in client.watch_commands():
+            if fmt == 'json':
+                import json
+                click.echo(json.dumps(event))
+            else:
+                if event['is_heartbeat']:
+                    click.echo(
+                        f"[heartbeat] {event['timestamp']} — agent alive "
+                        f"(session: {event['session_id']})"
+                    )
+                else:
+                    status = "✓" if event['success'] else "✗"
+                    click.echo(
+                        f"[{status}] {event['timestamp']} | "
+                        f"{event['action_type']}:{event['action_subtype']} | "
+                        f"{event['raw_command']} | "
+                        f"{event['execution_time_ms']}ms"
+                        + (f" | ERROR: {event['error_message']}" if not event['success'] else "")
+                    )
+
+    except KeyboardInterrupt:
+        click.echo("\n[*] Watch stopped.")
+    except Exception as e:
+        click.echo(f"[x] Error: {e}", err=True)
+        raise SystemExit(1)
+
+# ============================================================================
 # Batch Execution Command
 # ============================================================================
 

@@ -336,6 +336,47 @@ message MetricsResponse {
 }
 
 // ============================================================================
+// WATCH COMMANDS MESSAGES
+// ============================================================================
+
+// Request to start watching commands — no auth needed, read-only
+message WatchRequest {
+  // Empty — no filtering, no auth required
+}
+
+// Live command event streamed to Memory Archive
+message CommandEvent {
+  // Identity
+  string session_id = 1;          // Active session UUID
+  string agent_id = 2;            // Agent machine UUID
+  string agent_version = 3;       // Control Center agent version
+  string os_type = 4;             // WINDOWS / MACOS / LINUX
+
+  // Timing
+  string timestamp = 5;           // ISO 8601 with milliseconds e.g. "2026-02-25T12:58:04.286Z"
+
+  // Command — raw input only
+  string raw_command = 6;         // Exactly as typed e.g. "^a", "here left", "type hello"
+  string action_type = 7;         // "mouse" / "keyboard" / "position"
+  string action_subtype = 8;      // "left", "right", "double", "type", "press" etc.
+  bool is_here_command = 9;       // true if command used "here" keyword
+
+  // Result
+  bool success = 10;
+  string error_message = 11;      // Empty string if success=true
+  int32 execution_time_ms = 12;
+
+  // Spatial — populated for mouse commands only
+  int32 mouse_x = 13;
+  int32 mouse_y = 14;
+  bool position_captured = 15;    // true if mouse_x/mouse_y are real coordinates
+
+  // Health
+  bool is_heartbeat = 16;         // true = keep-alive ping (every 5s when idle), false = real command
+  bool agent_alive = 17;          // Always true while stream is open; stream closes on agent disconnect
+}
+
+// ============================================================================
 // SERVICE DEFINITIONS
 // ============================================================================
 
@@ -375,6 +416,11 @@ service ControlService {
 
   // Get server metrics (Prometheus format) - requires auth + metrics scope
   rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
+
+  // Watch live command events — for Memory Archive (no auth required)
+  // Stream closes automatically when agent disconnects.
+  // Heartbeat events (is_heartbeat=true) fire every 5s when idle.
+  rpc WatchCommands(WatchRequest) returns (stream CommandEvent);
 }
 
 // Agent service (agent-side) - kept for backwards compatibility if needed
