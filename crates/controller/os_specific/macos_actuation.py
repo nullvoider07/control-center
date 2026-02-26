@@ -354,7 +354,7 @@ class MacOSActuation:
         
         # CASE 1: type <text>
         if action == 'type':
-            return f'{cli} t:"{text}"'
+            return f'{cli} "t:{text}"'
         
         # CASE 2: press <keys>
         elif action in ['press', 'key']:
