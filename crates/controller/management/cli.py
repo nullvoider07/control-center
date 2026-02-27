@@ -744,11 +744,17 @@ def watch(host: Optional[str], port: Optional[int], ssl: bool, fmt: str):
                 click.echo(json.dumps(event))
             else:
                 if event['is_heartbeat']:
-                    click.echo(
-                        f"[heartbeat] {event['timestamp']} — agent alive "
-                        f"(session: {event['session_id']})"
+                    sys.stderr.write(
+                        f"\r[alive] {event['timestamp']} | "
+                        f"agent: {event['agent_id']} | "
+                        f"session: {event['session_id']}   "
                     )
+                    sys.stderr.flush()
                 else:
+                    # A real event — start on a fresh line so it doesn't
+                    # overwrite a heartbeat status that may be sitting on stderr
+                    sys.stderr.write("\r\033[K")
+                    sys.stderr.flush()
                     status = "✓" if event['success'] else "✗"
                     click.echo(
                         f"[{status}] {event['timestamp']} | "
