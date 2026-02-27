@@ -421,10 +421,32 @@ def _print_banner(agent_info: dict):
 
 def _interactive_mode(controller):
     """Interactive command loop with PERSISTENT connection"""
+    import threading
+    import select as _select
+
     command_count = 0
     consecutive_failures = 0
     max_failures = 3
-    
+
+    _agent_gone = threading.Event()
+
+    def _watch_for_disconnect():
+        client = ctx.client
+        if client is None:
+            _agent_gone.set()
+            return
+        try:
+            for _ in client.watch_commands():
+                if _agent_gone.is_set():
+                    return  # interactive mode already exiting
+        except Exception:
+            pass
+        # Stream ended — agent has disconnected from the server
+        _agent_gone.set()
+
+    _watcher = threading.Thread(target=_watch_for_disconnect, daemon=True)
+    _watcher.start()
+
     while not ctx.interrupted:
         try:
             if ctx.client and not ctx.client.is_connected():
@@ -514,8 +536,21 @@ def _interactive_mode(controller):
                     click.echo("\n[!] Lost connection to server. Session terminated.", err=True)
                     break
 
-            # Get user input
-            user_input = click.prompt("control-center>", prompt_suffix=" ", default="", show_default=False)
+            # Get user input — poll stdin in 1s intervals so the agent-disconnect
+            # watcher can break the loop without waiting for the user to press Enter.
+            sys.stdout.write("control-center> ")
+            sys.stdout.flush()
+            user_input = None
+            while not ctx.interrupted and not _agent_gone.is_set():
+                ready, _, _ = _select.select([sys.stdin], [], [], 1.0)
+                if ready:
+                    user_input = sys.stdin.readline().rstrip('\n')
+                    break
+            if _agent_gone.is_set():
+                click.echo("\n[!] Agent has disconnected from server. Session terminated.", err=True)
+                break
+            if user_input is None:
+                break
             user_input = user_input.strip()
             
             if not user_input:

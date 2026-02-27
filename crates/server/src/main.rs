@@ -576,7 +576,11 @@ impl ControlService for ControlCenterService {
                 _ => "UNKNOWN".to_string(),
             }).unwrap_or_default(),
             timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-            raw_command: command.clone(),
+            raw_command: response.as_ref()
+                .ok()
+                .map(|r| r.message.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| command.clone()),
             action_type,
             action_subtype,
             is_here_command,
