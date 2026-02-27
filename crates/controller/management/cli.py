@@ -500,15 +500,18 @@ def _interactive_mode(controller):
             else:
                 consecutive_failures = 0
             
-            # Check agent is still alive before prompting
+            # Check whether an agent is still connected to the server.
+            # ping() only reaches the server — it always returns alive=True
+            # even when the agent has disconnected.
+            # query_connections() reflects the live registry state.
             if ctx.client:
                 try:
-                    result = ctx.client.ping()
-                    if result is None:
-                        click.echo("\n[!] Agent has disconnected. Session terminated.", err=True)
+                    connections = ctx.client.query_connections()
+                    if not connections or connections.get('total_count', 0) == 0:
+                        click.echo("\n[!] Agent has disconnected from server. Session terminated.", err=True)
                         break
                 except Exception:
-                    click.echo("\n[!] Agent has disconnected. Session terminated.", err=True)
+                    click.echo("\n[!] Lost connection to server. Session terminated.", err=True)
                     break
 
             # Get user input
@@ -744,25 +747,26 @@ def watch(host: Optional[str], port: Optional[int], ssl: bool, fmt: str):
                 click.echo(json.dumps(event))
             else:
                 if event['is_heartbeat']:
-                    sys.stderr.write(
+                    sys.stdout.write(
                         f"\r[alive] {event['timestamp']} | "
                         f"agent: {event['agent_id']} | "
                         f"session: {event['session_id']}   "
                     )
-                    sys.stderr.flush()
+                    sys.stdout.flush()
                 else:
-                    # A real event — start on a fresh line so it doesn't
-                    # overwrite a heartbeat status that may be sitting on stderr
-                    sys.stderr.write("\r\033[K")
-                    sys.stderr.flush()
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
                     status = "✓" if event['success'] else "✗"
-                    click.echo(
+                    line = (
                         f"[{status}] {event['timestamp']} | "
                         f"{event['action_type']}:{event['action_subtype']} | "
                         f"{event['raw_command']} | "
                         f"{event['execution_time_ms']}ms"
-                        + (f" | ERROR: {event['error_message']}" if not event['success'] else "")
                     )
+                    if not event['success']:
+                        line += f" | ERROR: {event['error_message']}"
+                    sys.stdout.write(line + "\n")
+                    sys.stdout.flush()
 
     except KeyboardInterrupt:
         click.echo("\n[*] Watch stopped.")
@@ -927,6 +931,14 @@ def batch(host, port, token, ssl, input_file, fmt, delay, stop_on_error, output)
                 results.append({'index': i, 'command': cmd, 'success': False, 'error': 'rate_limited'})
                 fail_count += 1
             except Exception as e:
+                error_str = str(e).lower()
+                # If the agent has disconnected there is no point continuing —
+                # every subsequent command will also fail.
+                if 'unavailable' in error_str or 'no agent connected' in error_str:
+                    click.echo(f"\n[!] Agent has disconnected from server. Stopping batch.", err=True)
+                    results.append({'index': i, 'command': cmd, 'success': False, 'error': 'agent_disconnected'})
+                    fail_count += 1
+                    break
                 click.echo(f"         -> ERROR: {e}", err=True)
                 results.append({'index': i, 'command': cmd, 'success': False, 'error': str(e)})
                 fail_count += 1

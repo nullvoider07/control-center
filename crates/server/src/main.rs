@@ -194,39 +194,125 @@ impl ControlCenterService {
         Ok(())
     }
 
-    /// Parse raw command string into (action_type, action_subtype, is_here_command)
+    /// Parse a raw command string — which may be a user-level command
+    /// ("here left", "type hello") OR a translated platform command
+    /// (cliclick, osascript, xdotool, Windows cmd) — into
+    /// (action_type, action_subtype, is_here_command).
     fn parse_command_meta(command: &str) -> (String, String, bool) {
-        let tokens: Vec<&str> = command.trim().splitn(3, ' ').collect();
+        let trimmed = command.trim();
+        let tokens: Vec<&str> = trimmed.splitn(4, ' ').collect();
         let first = tokens.first().copied().unwrap_or("").to_lowercase();
 
-        // Keyboard commands
+        // ── User-level commands ─────────────────────────────────────────────
         if first == "type" {
             return ("keyboard".to_string(), "type".to_string(), false);
         }
         if first == "press" || first == "key" {
             return ("keyboard".to_string(), "press".to_string(), false);
         }
-
-        // Position query
         if first == "position" {
             return ("position".to_string(), "position".to_string(), false);
         }
-
-        // Here commands: "here <action>"
         if first == "here" {
             let subtype = tokens.get(1).copied().unwrap_or("left").to_lowercase();
             return ("mouse".to_string(), subtype, true);
         }
-
-        // Coordinate commands: "<x> <y> <action>"
         if first.parse::<i32>().is_ok() {
             let subtype = tokens.get(2).copied().unwrap_or("left").to_lowercase();
-            // Strip amount token if present (e.g. "scroll_down 3" → "scroll_down")
             let subtype = subtype.split_whitespace().next().unwrap_or("left").to_string();
             return ("mouse".to_string(), subtype, false);
         }
 
-        ("mouse".to_string(), first, false)
+        // ── macOS: cliclick ─────────────────────────────────────────────────
+        // e.g. "cliclick c:."  "/opt/homebrew/bin/cliclick rc:960,540"
+        //      "cliclick kd:cmd t:a ku:cmd"
+        if first.ends_with("cliclick") || trimmed.contains("/cliclick ") {
+            let rest = trimmed.splitn(2, "cliclick ").nth(1).unwrap_or("");
+            let action_token = rest.split_whitespace().next().unwrap_or("");
+
+            if action_token.starts_with("t:") {
+                return ("keyboard".to_string(), "type".to_string(), false);
+            }
+            if action_token.starts_with("kp:") || action_token.starts_with("kd:") {
+                return ("keyboard".to_string(), "press".to_string(), false);
+            }
+            if action_token.starts_with("p:") {
+                return ("position".to_string(), "position".to_string(), false);
+            }
+            let shortcut = action_token.split(':').next().unwrap_or("c");
+            let coords   = action_token.split(':').nth(1).unwrap_or(".");
+            let is_here  = coords == ".";
+            let subtype  = match shortcut {
+                "c"  => "left",
+                "rc" => "right",
+                "dc" => "double",
+                "tc" => "triple",
+                "mc" => "middle",
+                "dd" => "hold",
+                "du" => "release",
+                "m"  => "move",
+                _    => "left",
+            };
+            return ("mouse".to_string(), subtype.to_string(), is_here);
+        }
+
+        // ── macOS: osascript ────────────────────────────────────────────────
+        // e.g. "osascript -e 'tell application "System Events" to keystroke "hello"'"
+        //      "osascript -e 'tell application "System Events" to key code 36'"
+        if first == "osascript" {
+            if trimmed.contains("keystroke") {
+                return ("keyboard".to_string(), "type".to_string(), false);
+            }
+            return ("keyboard".to_string(), "press".to_string(), false);
+        }
+
+        // ── Linux: xdotool ──────────────────────────────────────────────────
+        // e.g. "DISPLAY=:0 xdotool click 1"
+        //      "DISPLAY=:0 xdotool mousemove 960 540 click 1"
+        //      "DISPLAY=:0 xdotool type \"hello\""
+        //      "DISPLAY=:0 xdotool key ctrl+c"
+        if trimmed.contains("xdotool") {
+            let after = trimmed.splitn(2, "xdotool ").nth(1).unwrap_or("");
+            let sub = after.split_whitespace().next().unwrap_or("");
+            return match sub {
+                "type"             => ("keyboard".to_string(), "type".to_string(),     false),
+                "key"              => ("keyboard".to_string(), "press".to_string(),    false),
+                "getmouselocation" => ("position".to_string(), "position".to_string(), false),
+                "mousedown"        => ("mouse".to_string(),    "hold".to_string(),     true),
+                "mouseup"          => ("mouse".to_string(),    "release".to_string(),  true),
+                "click" => {
+                    let is_dbl  = after.contains("--repeat 2");
+                    let subtype = if is_dbl                      { "double" }
+                                  else if after.contains(" 3")   { "right"  }
+                                  else if after.contains(" 2")   { "middle" }
+                                  else                            { "left"   };
+                    ("mouse".to_string(), subtype.to_string(), true)
+                }
+                "mousemove" => {
+                    if !after.contains(" click ") {
+                        return ("mouse".to_string(), "move".to_string(), false);
+                    }
+                    let is_dbl  = after.contains("--repeat 2");
+                    let subtype = if is_dbl                          { "double" }
+                                  else if after.contains("click 3")  { "right"  }
+                                  else if after.contains("click 2")  { "middle" }
+                                  else                                { "left"   };
+                    ("mouse".to_string(), subtype.to_string(), false)
+                }
+                _ => ("mouse".to_string(), sub.to_string(), false),
+            };
+        }
+
+        // ── Windows: cmd /c echo <human_cmd> > C:\*.txt ─────────────────────
+        // e.g. "cmd /c echo here left > C:\mouse_cmd.txt"
+        if first == "cmd" && trimmed.contains("> C:\\") {
+            if let Some(after_echo) = trimmed.splitn(2, "echo ").nth(1) {
+                let human_cmd = after_echo.split(" > C:\\").next().unwrap_or("").trim();
+                return Self::parse_command_meta(human_cmd);
+            }
+        }
+
+        ("unknown".to_string(), first, false)
     }
 }
 
@@ -714,12 +800,13 @@ impl ControlService for ControlCenterService {
                         info!("WatchCommands: broadcast channel closed, stream ending");
                         break;
                     }
-                    // Timeout — idle for 5s, send heartbeat
+                    // Timeout — idle for 5s, send heartbeat (or close if agent gone)
                     Err(_) => {
                         let agent = registry.get_current_connection().await;
+                        let agent_alive = agent.is_some();
                         let heartbeat = proto::CommandEvent {
-                            session_id: agent.as_ref().map(|a| a.connection_id.clone()).unwrap_or_default(),
-                            agent_id: agent.as_ref().map(|a| a.agent_id.clone()).unwrap_or_default(),
+                            session_id:    agent.as_ref().map(|a| a.connection_id.clone()).unwrap_or_default(),
+                            agent_id:      agent.as_ref().map(|a| a.agent_id.clone()).unwrap_or_default(),
                             agent_version: agent.as_ref().map(|a| a.agent_version.clone()).unwrap_or_default(),
                             os_type: agent.as_ref().map(|a| match a.os_type {
                                 0 => "WINDOWS".to_string(),
@@ -727,13 +814,19 @@ impl ControlService for ControlCenterService {
                                 2 => "LINUX".to_string(),
                                 _ => "UNKNOWN".to_string(),
                             }).unwrap_or_default(),
-                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                            timestamp:    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
                             is_heartbeat: true,
-                            agent_alive: true,
+                            agent_alive,
                             ..Default::default()
                         };
                         if tx.send(Ok(heartbeat)).await.is_err() {
                             break; // Subscriber disconnected
+                        }
+                        // Agent gone — send one final heartbeat with agent_alive=false
+                        // then close the stream.
+                        if !agent_alive {
+                            info!("WatchCommands: agent disconnected, closing stream");
+                            break;
                         }
                     }
                 }
