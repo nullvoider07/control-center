@@ -298,7 +298,11 @@ impl AgentServiceImpl {
             return self.extract_xdotool_human_command(command);
         }
 
-        // ── macOS cliclick ───────────────────────────────────────────────────
+        // ── macOS osascript (pure keyboard commands: type / key code) ─────────
+        if command.starts_with("osascript") {
+            return self.extract_osascript_human_command(command);
+        }
+
         // ── macOS cliclick ───────────────────────────────────────────────────
         if command.contains("cliclick") {
             return self.extract_cliclick_human_command(command);
@@ -333,8 +337,11 @@ impl AgentServiceImpl {
         if let Some(key) = action_token.strip_prefix("kp:") {
             return format!("press {{{}}}", key);
         }
-        if action_token.starts_with("kd:") || action_token.starts_with("ku:") {
-            return format!("press {}", action_token);
+        if action_token.starts_with("kd:") {
+            return self.parse_cliclick_key_sequence(&tokens);
+        }
+        if action_token.starts_with("ku:") {
+            return format!("press {}", tokens.join(" "));
         }
 
         // Mouse: parse shortcut prefix and coordinates
@@ -372,6 +379,175 @@ impl AgentServiceImpl {
         } else {
             format!("{} {}", coord_str, action)
         }
+    }
+
+    fn extract_osascript_human_command(&self, command: &str) -> String {
+        // keystroke "text"  →  "type text"
+        if command.contains("keystroke") {
+            if let Some(start) = command.find("keystroke \"") {
+                let after = &command[start + "keystroke \"".len()..];
+                if let Some(end) = after.find('"') {
+                    return format!("type {}", &after[..end]);
+                }
+            }
+            return "type".to_string();
+        }
+
+        // key code N [using {mods}]  →  "press [mods]{KeyName}"
+        if command.contains("key code") {
+            let key_name: &str = if let Some(code_pos) = command.find("key code ") {
+                let after = &command[code_pos + "key code ".len()..];
+                let code_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                match code_str.parse::<u32>() {
+                    Ok(36)  => "{Enter}",
+                    Ok(48)  => "{Tab}",
+                    Ok(51)  => "{Backspace}",
+                    Ok(53)  => "{Esc}",
+                    Ok(117) => "{Delete}",
+                    Ok(116) => "{PgUp}",
+                    Ok(121) => "{PgDn}",
+                    Ok(115) => "{Home}",
+                    Ok(119) => "{End}",
+                    Ok(123) => "{Left}",
+                    Ok(124) => "{Right}",
+                    Ok(125) => "{Down}",
+                    Ok(126) => "{Up}",
+                    _       => "",
+                }
+            } else {
+                ""
+            };
+
+            let mut mods = String::new();
+            if command.contains("command down") { mods.push('#'); }
+            if command.contains("option down")  { mods.push('!'); }
+            if command.contains("control down") { mods.push('^'); }
+            if command.contains("shift down")   { mods.push('+'); }
+
+            if !key_name.is_empty() || !mods.is_empty() {
+                return format!("press {}{}", mods, key_name);
+            }
+        }
+
+        command.to_string()
+    }
+
+    fn parse_cliclick_key_sequence(&self, tokens: &[&str]) -> String {
+        let mut modifiers = String::new();
+        let mut key       = String::new();
+
+        for token in tokens {
+            if let Some(mods_str) = token.strip_prefix("kd:") {
+                for m in mods_str.split(',') {
+                    let sym = match m.trim() {
+                        "cmd"   => "#",
+                        "alt"   => "!",
+                        "ctrl"  => "^",
+                        "shift" => "+",
+                        _       => "",
+                    };
+                    modifiers.push_str(sym);
+                }
+            } else if let Some(text) = token.strip_prefix("t:") {
+                key = text.trim_matches('"').to_string();
+            } else if let Some(key_name) = token.strip_prefix("kp:") {
+                key = match key_name {
+                    "return"      => "{Enter}",
+                    "tab"         => "{Tab}",
+                    "delete"      => "{Backspace}",
+                    "fwd-delete"  => "{Delete}",
+                    "arrow-up"    => "{Up}",
+                    "arrow-down"  => "{Down}",
+                    "arrow-left"  => "{Left}",
+                    "arrow-right" => "{Right}",
+                    "page-up"     => "{PgUp}",
+                    "page-down"   => "{PgDn}",
+                    "home"        => "{Home}",
+                    "end"         => "{End}",
+                    "esc"         => "{Esc}",
+                    "space"       => "{Space}",
+                    "f1"  => "{F1}",  "f2"  => "{F2}",  "f3"  => "{F3}",  "f4"  => "{F4}",
+                    "f5"  => "{F5}",  "f6"  => "{F6}",  "f7"  => "{F7}",  "f8"  => "{F8}",
+                    "f9"  => "{F9}",  "f10" => "{F10}", "f11" => "{F11}", "f12" => "{F12}",
+                    other => other,
+                }.to_string();
+            }
+            // ku: tokens are key-up cleanup — skip them
+        }
+
+        if !modifiers.is_empty() || !key.is_empty() {
+            format!("press {}{}", modifiers, key)
+        } else {
+            format!("press {}", tokens.join(" "))
+        }
+    }
+
+    // Convert a key string with modifiers into a human-readable format
+    fn format_keys_for_display(&self, keys: &str) -> String {
+        let mod_names: &[(&str, &str)] = match self.os_type {
+            OsType::Macos   => &[("#", "Cmd"),   ("!", "Option"), ("^", "Ctrl"), ("+", "Shift")],
+            OsType::Windows => &[("#", "Win"),   ("!", "Alt"),    ("^", "Ctrl"), ("+", "Shift")],
+            OsType::Linux   => &[("#", "Super"), ("!", "Alt"),    ("^", "Ctrl"), ("+", "Shift")],
+        };
+
+        let special_name = |k: &str| -> Option<&'static str> {
+            match k {
+                "{Enter}" | "{Return}" => Some("Return"),
+                "{Tab}"                => Some("Tab"),
+                "{Esc}" | "{Escape}"   => Some("Esc"),
+                "{Backspace}" | "{BS}" => Some("Delete"),
+                "{Delete}" | "{Del}"   => Some("Fwd Delete"),
+                "{Space}"              => Some("Space"),
+                "{Up}"                 => Some("Up"),
+                "{Down}"               => Some("Down"),
+                "{Left}"               => Some("Left"),
+                "{Right}"              => Some("Right"),
+                "{Home}"               => Some("Home"),
+                "{End}"                => Some("End"),
+                "{PgUp}"               => Some("Page Up"),
+                "{PgDn}"               => Some("Page Down"),
+                "{F1}"  => Some("F1"),  "{F2}"  => Some("F2"),
+                "{F3}"  => Some("F3"),  "{F4}"  => Some("F4"),
+                "{F5}"  => Some("F5"),  "{F6}"  => Some("F6"),
+                "{F7}"  => Some("F7"),  "{F8}"  => Some("F8"),
+                "{F9}"  => Some("F9"),  "{F10}" => Some("F10"),
+                "{F11}" => Some("F11"), "{F12}" => Some("F12"),
+                _       => None,
+            }
+        };
+
+        // Fast path: whole string is a bare special key
+        if let Some(name) = special_name(keys) {
+            return name.to_string();
+        }
+
+        let modifier_syms: &[char] = &['#', '!', '^', '+'];
+        let mut parts: Vec<String> = Vec::new();
+        let mut byte_pos = 0usize;
+
+        for ch in keys.chars() {
+            if !modifier_syms.contains(&ch) { break; }
+            let sym = &keys[byte_pos..byte_pos + ch.len_utf8()];
+            if let Some((_, name)) = mod_names.iter().find(|(s, _)| *s == sym) {
+                parts.push(name.to_string());
+            }
+            byte_pos += ch.len_utf8();
+        }
+
+        let key_part = &keys[byte_pos..];
+        if !key_part.is_empty() {
+            if let Some(name) = special_name(key_part) {
+                parts.push(name.to_string());
+            } else if key_part.starts_with('{') && key_part.ends_with('}') {
+                parts.push(key_part[1..key_part.len() - 1].to_string());
+            } else if key_part.chars().count() == 1 {
+                parts.push(key_part.to_uppercase());
+            } else {
+                parts.push(key_part.to_string());
+            }
+        }
+
+        if parts.is_empty() { keys.to_string() } else { parts.join("+") }
     }
 
     /// Parse an xdotool command string and return a human-readable equivalent.
@@ -632,9 +808,8 @@ impl AgentServiceImpl {
     ) -> String {
         // ── Keyboard actions ─────────────────────────────────────────────────────
         if action.action_type == "press" {
-            // "press {Enter}" → "Pressed: Enter"
             let keys = command.trim_start_matches("press").trim();
-            return format!("Pressed: {}", keys);
+            return format!("Pressed: {}", self.format_keys_for_display(keys));
         }
         if action.action_type == "keyboard" {
             // "type x.ai/careers" → "Typed: x.ai/careers"
