@@ -32,15 +32,34 @@ class ConfigManager:
         'use_ssl': False,
     }
     
-    # Config file location
+    # Fallback config locations (used when running from source, not a binary)
     if os.name == 'nt':  # Windows
-        CONFIG_DIR = Path(os.getenv('APPDATA', '~')) / 'control-center'
+        _FALLBACK_CONFIG_DIR = Path(os.getenv('APPDATA', '~')) / 'control-center'
     else:  # Linux/macOS
-        CONFIG_DIR = Path.home() / '.config' / 'control-center'
-    
-    CONFIG_FILE = CONFIG_DIR / 'config.json'
-    
+        _FALLBACK_CONFIG_DIR = Path.home() / '.config' / 'control-center'
+
+    _FALLBACK_CONFIG_FILE = _FALLBACK_CONFIG_DIR / 'config.json'
+
+    @staticmethod
+    def _resolve_config_dir() -> Path:
+        """Resolve config directory to the binary's own directory when running
+        as a compiled binary (PyInstaller), or fall back to the OS-standard
+        location when running from source.
+
+        Keeping the config next to the binary means it travels with the
+        installation and is always found regardless of which user account or
+        working directory the tool is launched from.
+        """
+        import sys
+        if getattr(sys, 'frozen', False):
+            # PyInstaller sets sys.frozen and sys.executable points to the binary
+            return Path(sys.executable).parent
+        # Running from source — use OS-standard location
+        return ConfigManager._FALLBACK_CONFIG_DIR
+
     def __init__(self):
+        self.CONFIG_DIR  = ConfigManager._resolve_config_dir()
+        self.CONFIG_FILE = self.CONFIG_DIR / 'config.json'
         self.config: Dict[str, Any] = {}
         self._ensure_config_dir()
     

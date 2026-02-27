@@ -2102,10 +2102,11 @@ def _jwt_secret() -> str:
 
 @token.command(name='generate')
 @click.option('--user', required=True, help='User identifier (sub claim)')
-@click.option('--scopes', multiple=True, default=('execute', 'monitor'),
-              help='Permission scopes (repeatable). '
+@click.option('--scopes', nargs=-1, default=None,
+              help='Permission scopes (space-separated). '
                    'Options: execute monitor metrics admin  '
-                   'Example: --scopes execute --scopes monitor')
+                   'Shorthand: --scopes all (grants all four scopes)  '
+                   'Example: --scopes execute monitor')
 @click.option('--expires', default=24, type=float, show_default=True,
               help='Token lifetime in hours, fractions allowed. Must be > 0.')
 @click.option('--secret', 'secret_override', default=None, envvar='CC_JWT_SECRET',
@@ -2130,9 +2131,15 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
       admin    - DisconnectAgent, all admin operations
 
     Examples:
-        control-center token generate --user ops-bot --scopes execute --scopes monitor
+        control-center token generate --user ops-bot --scopes execute monitor
         control-center token generate --user ci --scopes execute --expires 1
+        control-center token generate --user admin --scopes all --expires 8760
     """
+    ALL_SCOPES = ('execute', 'monitor', 'metrics', 'admin')
+    if not scopes:
+        scopes = ('execute', 'monitor')
+    elif 'all' in scopes:
+        scopes = ALL_SCOPES
     try:
         import jwt
     except ImportError:
