@@ -2,7 +2,7 @@
 
 import re
 import os
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional
 
 # LinuxActuation class definition
 class LinuxActuation:
@@ -62,32 +62,6 @@ class LinuxActuation:
         """Initialize controller with gRPC client"""
         self.grpc_client = grpc_client
         self.display = os.environ.get('DISPLAY', ':0')
-    
-    # Get current mouse position using xdotool
-    def _get_mouse_position(self) -> Optional[Tuple[int, int]]:
-        """
-        Get current mouse position using xdotool
-        
-        Returns:
-            Tuple of (x, y) or None if failed
-        """
-        try:
-            cmd = f"DISPLAY={self.display} xdotool getmouselocation --shell"
-            result = self.grpc_client.execute_command(cmd)
-            
-            # BUG-007 FIX: Position data is returned in mouse_x/mouse_y fields,
-            # not in a non-existent 'output' key. The agent captures position
-            # after mouse commands and returns it via these dedicated fields.
-            if result['success'] and result.get('position_captured'):
-                mx = result.get('mouse_x')
-                my = result.get('mouse_y')
-                if mx is not None and my is not None:
-                    return (mx, my)
-            
-            return None
-        except Exception as e:
-            print(f"[!] Failed to get mouse position: {e}")
-            return None
     
     def _format_press_for_display(self, keys: str) -> str:
         """Convert modifier-prefixed key notation to human-readable string for CLI output.
@@ -361,30 +335,6 @@ class LinuxActuation:
         
         return None
     
-    # Extract coordinates from command for position tracking
-    def _extract_coordinates_from_command(self, command: str) -> Optional[Tuple[int, int]]:
-        """
-        Extract target coordinates from command (if present)
-        
-        Args:
-            command: Original command string
-            
-        Returns:
-            Tuple of (x, y) if coordinates found, None otherwise
-        """
-        tokens = command.strip().split()
-        
-        # Try to parse first two tokens as coordinates
-        if len(tokens) >= 2:
-            try:
-                x = int(tokens[0])
-                y = int(tokens[1])
-                return (x, y)
-            except ValueError:
-                pass
-        
-        return None
-    
     # Main command execution method with position tracking
     def execute_command(self, command: str) -> bool:
         """
@@ -412,19 +362,10 @@ class LinuxActuation:
             print(f"[✗] Failed to build command: {command}")
             return False
         
-        # FOR MOUSE COMMANDS: Get position before and after
-        position_before = None
+        # Position is captured by the agent after execution and returned in
+        # mouse_x/mouse_y fields — no need to query it via gRPC before the action.
         position_after = None
-        target_coords = None
-        
-        if cmd_type == 'mouse':
-            # Extract target coordinates from original command (if present)
-            target_coords = self._extract_coordinates_from_command(command)
-            
-            # Get position before action (except for position query itself)
-            if processed_cmd != 'position':
-                position_before = self._get_mouse_position()
-        
+
         # Send to server via gRPC
         result = self.grpc_client.execute_command(xdotool_cmd)
         
