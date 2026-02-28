@@ -34,10 +34,11 @@ class ConfigManager:
     
     # Config file location
     if os.name == 'nt':  # Windows
-        CONFIG_DIR = Path(os.getenv('APPDATA', '~')) / 'control-center'
+        CONFIG_DIR = Path(os.environ.get('APPDATA') or
+                          Path.home() / 'AppData' / 'Roaming') / 'control-center'
     else:  # Linux/macOS
         CONFIG_DIR = Path.home() / '.config' / 'control-center'
-    
+
     CONFIG_FILE = CONFIG_DIR / 'config.json'
     
     def __init__(self):
@@ -58,12 +59,15 @@ class ConfigManager:
     # Load configuration from file, merging with defaults
     def load(self) -> Dict[str, Any]:
         """Load configuration from file"""
-        if not self.CONFIG_FILE.exists():
-            logger.debug(f"Config file not found: {self.CONFIG_FILE}")
+        env_path = os.environ.get('CONTROL_CENTER_CONFIG')
+        config_file = Path(env_path) if env_path else self.CONFIG_FILE
+
+        if not config_file.exists():
+            logger.debug(f"Config file not found: {config_file}")
             return self.DEFAULTS.copy()
         
         try:
-            with open(self.CONFIG_FILE, 'r') as f:
+            with open(config_file, 'r') as f:
                 file_config = json.load(f)
             
             # Merge with defaults
@@ -82,14 +86,16 @@ class ConfigManager:
     # Save configuration to file, merging with existing config
     def save(self, config: Dict[str, Any]):
         """Save configuration to file"""
+        env_path = os.environ.get('CONTROL_CENTER_CONFIG')
+        config_file = Path(env_path) if env_path else self.CONFIG_FILE
         try:
-            with open(self.CONFIG_FILE, 'w') as f:
+            with open(config_file, 'w') as f:
                 json.dump(config, f, indent=2)
             
             if os.name != 'nt':
-                os.chmod(self.CONFIG_FILE, 0o600)
+                os.chmod(config_file, 0o600)
 
-            logger.info(f"Saved config to {self.CONFIG_FILE}")
+            logger.info(f"Saved config to {config_file}")
             
         except Exception as e:
             raise ConfigurationError(f"Failed to save config: {e}")
