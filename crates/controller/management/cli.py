@@ -2923,8 +2923,8 @@ def server():
     pass
 
 @server.command(name='start')
-@click.option('--host', default='0.0.0.0', help='Host to bind to')
-@click.option('--port', default=50051, help='gRPC port')
+@click.option('--host', default=None, help='Host to bind to (default: from config or 0.0.0.0)')
+@click.option('--port', default=None, type=int, help='gRPC port (default: from config or 50051)')
 @click.option('--single-agent/--multi-agent', default=True,
               help='Only allow one agent connection (default: single-agent)')
 @click.option('--network', help='Network identifier for this server')
@@ -2940,14 +2940,19 @@ def server_start(host, port, single_agent, network, auth_url, token_url, client_
         control-center server start --multi-agent
         control-center server start --host 0.0.0.0 --port 8080
     """
-    click.echo(f"[START] Starting Control Center Server (Rust) on {host}:{port}")
+    # Resolve host and port: CLI flag > config file > hardcoded default
+    server_config = ctx.config_manager.get_server_config()
+    resolved_host = host or server_config.get('host') or '0.0.0.0'
+    resolved_port = port or server_config.get('port') or 50051
+
+    click.echo(f"[START] Starting Control Center Server (Rust) on {resolved_host}:{resolved_port}")
     click.echo(f"[INFO] Single-agent mode: {single_agent}")
     if network:
         click.echo(f"[INFO] Network: {network}")
     click.echo(f"[INFO] Ready to accept agent connections")
     
     env = os.environ.copy()
-    env['SERVER_ADDR'] = f"{host}:{port}"
+    env['SERVER_ADDR'] = f"{resolved_host}:{resolved_port}"
     env['SINGLE_AGENT_MODE'] = 'true' if single_agent else 'false'
     if network:
         env['CONTROL_CENTER_NETWORK'] = network
