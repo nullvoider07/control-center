@@ -169,6 +169,7 @@ pub fn validate_agent_identity(identity: &crate::proto::AgentIdentity) -> Result
     Ok(())
 }
 
+// Unit tests for agent identity generation and validation
 #[cfg(test)]
 mod tests {
     use super::*;

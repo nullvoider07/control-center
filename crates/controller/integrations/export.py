@@ -9,7 +9,7 @@ from datetime import datetime
 import platform
 import psutil
 
-
+# Exporter class to handle various export formats and comprehensive diagnostics
 class Exporter:
     """Export with comprehensive diagnostics"""
     
@@ -199,6 +199,7 @@ class Exporter:
 
         return str(filepath)
 
+    # Backward-compatible alias for command log export
     def export_command_log_csv(self, commands: List[Dict], filename: Optional[str] = None) -> str:
         """Export command log to CSV. Backward-compatible alias for export_command_log."""
         return self.export_command_log(commands, filename, fmt='csv')
@@ -262,6 +263,7 @@ class Exporter:
 
         return files
     
+    # Audit log export with filtering
     def export_audit_logs(
         self,
         log_dir: str = "./logs/audit",

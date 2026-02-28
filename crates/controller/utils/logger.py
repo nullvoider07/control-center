@@ -434,7 +434,7 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     
     return logger
 
-
+# Function to get or create audit logger singleton
 def get_audit_logger(log_dir: str = "./logs/audit") -> AuditLogger:
     """Return the process-wide AuditLogger singleton.
 

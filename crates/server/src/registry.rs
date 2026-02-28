@@ -75,6 +75,7 @@ pub struct AgentMetadata {
     pub disconnect_reason: Option<String>,
 }
 
+/// Server information for status response
 impl ConnectionRegistry {
     /// Create new registry
     pub fn new(single_agent_mode: bool, max_history: usize, server_ip: String) -> Self {
@@ -338,6 +339,7 @@ pub struct RegistryStats {
     pub total_commands_executed: u64,
 }
 
+/// Implementation of registry handler for monitoring
 #[cfg(test)]
 mod tests {
 

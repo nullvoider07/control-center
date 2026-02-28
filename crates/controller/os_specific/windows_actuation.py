@@ -80,8 +80,6 @@ class WindowsActuation:
             pos_cmd = self._build_position_command()
             result = self.grpc_client.execute_command(pos_cmd)
             
-            # BUG-007 FIX: Position data is returned in mouse_x/mouse_y fields,
-            # not in a non-existent 'output' key.
             if result['success'] and result.get('position_captured'):
                 mx = result.get('mouse_x')
                 my = result.get('mouse_y')
@@ -117,7 +115,7 @@ class WindowsActuation:
         
         return None
     
-    # NEW: Process keyboard command to handle standalone modifier keys
+    # Process keyboard command to handle standalone modifier keys
     def _process_keyboard_command(self, command: str) -> str:
         """
         Process keyboard command, handling standalone modifier keys
@@ -223,6 +221,7 @@ class WindowsActuation:
 
         return '+'.join(parts) if parts else keys
 
+    # Convert AHK modifier prefix notation to explicit down/up syntax for reliable execution
     def _convert_modifiers_to_explicit(self, keys: str) -> str:
         """
         Convert AHK modifier prefix notation to explicit {Key down}/{Key up} syntax.
@@ -374,9 +373,6 @@ class WindowsActuation:
         result = self.grpc_client.execute_command(shell_cmd)
         
         # For mouse commands: Get position after action
-        # BUG-007 FIX: Read mouse_x/mouse_y directly from the gRPC result.
-        # The agent captures position internally after mouse commands and returns
-        # it in the dedicated fields — no extra gRPC call needed.
         if cmd_type == 'mouse' and result['success']:
             mx = result.get('mouse_x')
             my = result.get('mouse_y')
@@ -457,6 +453,7 @@ class WindowsActuation:
         
         print(f"\n[*] Batch mode: Executing {len(commands)} commands...")
         
+        # Generator to yield formatted commands with progress info
         def command_generator():
             for i, command in enumerate(commands, 1):
                 cmd_type, formatted_cmd = self.detect_command_type(command)

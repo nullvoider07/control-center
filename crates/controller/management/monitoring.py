@@ -18,7 +18,7 @@ except ImportError:
     print("[ERROR] Run: python -m grpc_tools.protoc -Iproto --python_out=. --grpc_python_out=. proto/control_center.proto", file=sys.stderr)
     sys.exit(1)
 
-
+# Client class to interact with monitoring gRPC service
 class MonitoringClient:
     """Client for monitoring server and agent status"""
     
@@ -44,12 +44,14 @@ class MonitoringClient:
         if self.channel:
             self.channel.close()
 
+    # Helper to generate gRPC metadata with Bearer token if provided
     def _auth_metadata(self):
         """Return gRPC metadata list with Bearer token, or empty list."""
         if self.token:
             return [('authorization', f'Bearer {self.token}')]
         return []
     
+    # Query methods for connections, server status, identity, and metrics
     def query_connections(self, server_id=None, agent_id=None, network=None):
         """Query connection status"""
         if not self.connect():
@@ -72,6 +74,7 @@ class MonitoringClient:
         finally:
             self.close()
     
+    # Query server status
     def query_server_status(self, server_id=None, network=None):
         """Query server status"""
         if not self.connect():
@@ -93,6 +96,7 @@ class MonitoringClient:
         finally:
             self.close()
     
+    # Query server identity
     def get_server_identity(self):
         """Get server identity"""
         if not self.connect():
@@ -110,6 +114,7 @@ class MonitoringClient:
         finally:
             self.close()
 
+    # Query Prometheus metrics
     def get_metrics(self):
         """Get Prometheus metrics from server (requires token with 'metrics' scope)"""
         if not self.connect():
@@ -138,7 +143,7 @@ class MonitoringClient:
         finally:
             self.close()
 
-
+# Formatting helpers for timestamps, durations, and connection states
 def format_timestamp(timestamp):
     """Format Unix timestamp to human-readable string"""
     try:
@@ -147,7 +152,7 @@ def format_timestamp(timestamp):
     except:
         return "Unknown"
 
-
+# Format duration in seconds to human-readable string
 def format_duration(seconds):
     """Format duration in seconds to human-readable string"""
     if seconds < 60:
@@ -161,7 +166,7 @@ def format_duration(seconds):
         minutes = (seconds % 3600) // 60
         return f"{hours}h {minutes}m"
 
-
+# Format connection state enum to string
 def format_connection_state(state):
     """Format connection state enum to string"""
     states = {
@@ -175,12 +180,10 @@ def format_connection_state(state):
     }
     return states.get(state, "UNKNOWN")
 
-
 @click.group()
 def monitoring():
     """Monitoring commands"""
     pass
-
 
 @monitoring.command(name='status')
 @click.option('--host', default='localhost', help='Server host')
@@ -298,7 +301,6 @@ def status_command(host, port, watch, token, fmt):
     except KeyboardInterrupt:
         click.echo("\n\n[INFO] Stopped monitoring")
 
-
 @monitoring.command(name='connections')
 @click.option('--host', default='localhost', help='Server host')
 @click.option('--port', default=50051, help='Server port')
@@ -354,7 +356,6 @@ def connections_command(host, port, server_id, agent_id, network, token, fmt):
         click.echo(f"  Commands:        {conn.commands_executed}")
         click.echo("")
 
-
 @monitoring.command(name='identity')
 @click.option('--host', default='localhost', help='Server host')
 @click.option('--port', default=50051, help='Server port')
@@ -392,7 +393,6 @@ def identity_command(host, port, token, fmt):
     click.echo(f"  Version:         {identity.version}")
     click.echo(f"  Started At:      {format_timestamp(identity.started_at)}")
     click.echo("")
-
 
 @monitoring.command(name='metrics')
 @click.option('--host', default='localhost', help='Server host')

@@ -17,6 +17,7 @@ from .exceptions import (
     TimeoutError,
 )
 
+# Dynamically import protobuf modules with fallback for PyInstaller bundles
 def _import_protobuf():
     """Import protobuf modules with fallback for PyInstaller bundles."""
     try:
@@ -339,7 +340,7 @@ class GRPCClient:
             
             self._last_activity = time.time()
             
-            # ✅ Extract position data from response
+            # Extract position data from response
             result = {
                 'success': response.success,
                 'message': response.message,
@@ -460,10 +461,7 @@ class GRPCClient:
         }
         return os_map.get(os_enum, "UNKNOWN")
     
-    # ------------------------------------------------------------------ #
     # Monitoring RPCs (no auth required)
-    # ------------------------------------------------------------------ #
-
     def query_connections(
         self,
         server_id: Optional[str] = None,
@@ -498,6 +496,7 @@ class GRPCClient:
             logger.error(f"QueryConnections failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
             return None
 
+    # Query server status (identity, uptime, connection state)
     def query_server_status(
         self,
         server_id: Optional[str] = None,
@@ -554,6 +553,7 @@ class GRPCClient:
             logger.error(f"QueryServers failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
             return None
 
+    # Query persistent server identity and metadata
     def get_server_identity(self) -> Optional[Dict]:
         """Get persistent server identity.
 
@@ -581,6 +581,7 @@ class GRPCClient:
             logger.error(f"GetServerIdentity failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
             return None
 
+    # Ping the server and measure round-trip time
     def ping(self) -> Optional[float]:
         """Ping the server and measure round-trip time.
 
@@ -602,10 +603,7 @@ class GRPCClient:
             logger.error(f"Ping failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
             return None
 
-    # ------------------------------------------------------------------ #
     # Authenticated monitoring RPCs
-    # ------------------------------------------------------------------ #
-
     def get_metrics(self) -> Optional[Dict]:
         """Retrieve server Prometheus-format metrics.
 
@@ -640,10 +638,7 @@ class GRPCClient:
                 raise AuthenticationError.invalid_token(reason=e.details() or "Token invalid or expired")
             return None
 
-    # ------------------------------------------------------------------ #
     # Agent management RPCs (require auth)
-    # ------------------------------------------------------------------ #
-
     def disconnect_agent(self, reason: str = "") -> Dict:
         """Send a graceful disconnect signal to the currently connected agent.
 
@@ -686,6 +681,7 @@ class GRPCClient:
                 'disconnected_connection_id': '',
             }
 
+    # Fetch historical agent connection records from the server registry
     def get_connection_history(self, limit: int = 50) -> Optional[List[Dict]]:
         """Fetch historical agent connection records from the server registry.
 
@@ -776,10 +772,7 @@ class GRPCClient:
             else:
                 logger.error(f"WatchCommands failed: {e.code()}: {e.details() if hasattr(e, 'details') else e}")
 
-    # ------------------------------------------------------------------ #
     # Internal helpers
-    # ------------------------------------------------------------------ #
-
     def _connection_metadata_to_dict(self, conn) -> Dict:
         """Convert a ConnectionMetadata proto message to a plain dict."""
         return {

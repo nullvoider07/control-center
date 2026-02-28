@@ -49,10 +49,6 @@ class CLIContext:
         self.metrics: Optional[MetricsCollector] = None
         self.config_manager = ConfigManager()
         self.interrupted = False
-        # True only while _interactive_mode() is running.
-        # The signal handler checks this to decide whether to exit the process
-        # outright (non-interactive) or merely raise KeyboardInterrupt so the
-        # interactive loop can handle Ctrl+C gracefully (BUG-011 fix).
         self.in_interactive_mode = False
     
     def cleanup(self):
@@ -68,32 +64,9 @@ ctx = CLIContext()
 
 # Signal Handling for Graceful Shutdown
 def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully.
-
-    BUG-011 FIX — Two distinct behaviours depending on whether the process is
-    currently inside the interactive REPL or running a non-interactive command
-    (batch, execute, server start, etc.):
-
-    Interactive mode  (ctx.in_interactive_mode is True):
-        - Do NOT set ctx.interrupted — that flag is the while-loop exit guard.
-          Setting it here would cause the session to terminate on the very next
-          loop iteration after the KeyboardInterrupt is handled.
-        - Do NOT call ctx.cleanup() — that destroys the live gRPC session.
-        - Do NOT call sys.exit() — that kills the whole process immediately,
-          which was the exact symptom reported in BUG-011.
-        - Instead, raise KeyboardInterrupt so it propagates into the interactive
-          loop's  except KeyboardInterrupt  handler, which prints
-          "[*] Interrupted. Type 'exit' to disconnect."  and  continue s.
-          Raising from a signal handler is the standard Python idiom for
-          delegating SIGINT handling back to normal exception-flow logic.
-
-    Non-interactive mode  (ctx.in_interactive_mode is False):
-        - Original behaviour preserved: set the interrupt flag, disconnect, and
-          exit.  Batch jobs and one-shot execute commands terminate cleanly.
-    """
+    """Handle Ctrl+C gracefully. If in interactive mode, raise KeyboardInterrupt
+    to break the loop. Otherwise, perform cleanup and exit."""
     if ctx.in_interactive_mode:
-        # Delegate to the interactive loop's except KeyboardInterrupt handler.
-        # Do not touch ctx.interrupted, cleanup(), or sys.exit() here.
         raise KeyboardInterrupt
     else:
         logger.info("\nInterrupt received. Cleaning up...")
@@ -111,10 +84,12 @@ signal.signal(signal.SIGINT, signal_handler)
 # Last-session persistence path (written on disconnect, read by `session` commands)
 _SESSION_DATA_PATH = Path.home() / '.config' / 'control-center' / 'last_session.json'
 
+# Configuration resolution helpers
 def _get_server_config(host=None, port=None, use_ssl=False):
     """Resolve host/port from CLI flags or saved config."""
     return ctx.config_manager.get_server_config(host=host, port=port, use_ssl=use_ssl)
 
+# Host/port/token resolution helpers
 def _resolve_host_port(host, port, use_ssl=False):
     """Resolve host/port: CLI flags > saved config. Exits if host not found."""
     server_config = _get_server_config(host=host, port=port, use_ssl=use_ssl)
@@ -123,10 +98,12 @@ def _resolve_host_port(host, port, use_ssl=False):
         sys.exit(1)
     return server_config['host'], server_config['port']
 
+# Token resolution helper
 def _resolve_token(token):
     """Resolve token: CLI flag > CONTROL_CENTER_TOKEN env > config file. Returns None if absent."""
     return ctx.config_manager.get_token(cli_token=token)
 
+# Client builders
 def _get_no_auth_client(host: str, port: int, timeout: int = 10) -> GRPCClient:
     """Build a GRPCClient with channel + stub but NO authentication call.
 
@@ -146,6 +123,7 @@ def _get_auth_client(host: str, port: int, token: str, timeout: int = 10) -> GRP
     client.connect()
     return client
 
+# Session data persistence helpers
 def _save_session_data():
     """Persist current session + metrics to disk so 'session' commands can read it after disconnect."""
     if not ctx.session or not ctx.metrics:
@@ -171,6 +149,7 @@ def _load_session_data() -> Optional[Dict]:
     except Exception:
         return None
 
+# Timestamp formatting helper
 def _fmt_ts(unix_ts) -> str:
     """Format a Unix timestamp to a human-readable string."""
     if not unix_ts:
@@ -180,7 +159,6 @@ def _fmt_ts(unix_ts) -> str:
         return datetime.fromtimestamp(float(unix_ts)).strftime('%Y-%m-%d %H:%M:%S')
     except Exception:
         return str(unix_ts)
-
 
 # Main CLI Group
 @click.group()
@@ -329,12 +307,6 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
         
         # Print banner
         _print_banner(agent_info)
-        
-        # Enter interactive mode with PERSISTENT connection.
-        # BUG-011 FIX: Raise the in_interactive_mode flag so signal_handler
-        # knows to raise KeyboardInterrupt instead of calling sys.exit(0).
-        # The try/finally guarantees the flag is always cleared, even if
-        # _interactive_mode exits via an unexpected exception.
         ctx.in_interactive_mode = True
         try:
             _interactive_mode(ctx.controller)
@@ -363,7 +335,7 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
 def _print_banner(agent_info: dict):
     """Print connection banner — box auto-sizes to content."""
 
-    # ── Box-drawing characters ────────────────────────────────────────────────
+    # Box-drawing characters
     TL, TR, BL, BR   = '╔', '╗', '╚', '╝'
     HZ, VT           = '═', '║'
     ML, MR, MC       = '╠', '╣', '╦'   # mid-left, mid-right, mid-cross (unused)
@@ -375,7 +347,7 @@ def _print_banner(agent_info: dict):
         inner = ' ' * pad + text
         return VT + inner + ' ' * (w - len(inner)) + VT
 
-    # ── Content lines ─────────────────────────────────────────────────────────
+    # Content lines
     title    = 'Control Center - Interactive Mode'
     conn_line   = f"Connected to: {agent_info.get('os_type','?')} {agent_info.get('os_version','?')}"
     ver_line    = f"Agent Version: {agent_info.get('agent_version','?')}"
@@ -385,7 +357,7 @@ def _print_banner(agent_info: dict):
         ('exit, quit',  'Disconnect and exit'),
     ]
 
-    # ── Compute required inner width ──────────────────────────────────────────
+    # Compute required inner width
     cmd_col1_w = max(len(k) for k, _ in cmd_lines)
     cmd_rows   = [f"  {k:<{cmd_col1_w}}  - {v}" for k, v in cmd_lines]
 
@@ -398,7 +370,7 @@ def _print_banner(agent_info: dict):
     ]
     inner_w = max(len(s) for s in candidates) + 2   # +2 for 1-space padding each side
 
-    # ── Render ────────────────────────────────────────────────────────────────
+    # Render
     lines = [
         '',
         _top(inner_w),
@@ -456,16 +428,22 @@ def _interactive_mode(controller):
                 if consecutive_failures >= max_failures:
                     logger.error("Multiple connection failures - VM likely shutdown")
                     
-                    click.echo("\n" + "="*70, err=True)
-                    click.echo("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557", err=True)
-                    click.echo("\u2551                  VM/CONTAINER HAS BEEN SHUT DOWN                 \u2551", err=True)
-                    click.echo("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563", err=True)
-                    click.echo("\u2551 The target VM/Container is no longer accessible.                 \u2551", err=True)
-                    click.echo("\u2551 Connection cannot be restored.                                   \u2551", err=True)
-                    click.echo("\u2551                                                                  \u2551", err=True)
-                    click.echo("\u2551 Session will be terminated.                                      \u2551", err=True)
-                    click.echo("\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d", err=True)
-                    click.echo("="*70 + "\n", err=True)
+                    _w = min(shutil.get_terminal_size((70, 20)).columns, 120)
+                    _inner = _w - 2  # space between the two vertical border chars
+                    _bar   = '═' * _inner
+                    _blank = '║' + ' ' * _inner + '║'
+                    def _row(text):
+                        return '║ ' + text + ' ' * (_inner - 2 - len(text)) + '║'
+                    click.echo("\n" + "=" * _w, err=True)
+                    click.echo('╔' + _bar + '╗', err=True)
+                    click.echo(_row('VM/CONTAINER HAS BEEN SHUT DOWN'), err=True)
+                    click.echo('╠' + _bar + '╣', err=True)
+                    click.echo(_row('The target VM/Container is no longer accessible.'), err=True)
+                    click.echo(_row('Connection cannot be restored.'), err=True)
+                    click.echo(_blank, err=True)
+                    click.echo(_row('Session will be terminated.'), err=True)
+                    click.echo('╚' + _bar + '╝', err=True)
+                    click.echo("=" * _w + "\n", err=True)
 
                     if ctx.session:
                         ctx.session.mark_vm_shutdown()
@@ -521,11 +499,7 @@ def _interactive_mode(controller):
                 break
             else:
                 consecutive_failures = 0
-            
-            # Check whether an agent is still connected to the server.
-            # ping() only reaches the server — it always returns alive=True
-            # even when the agent has disconnected.
-            # query_connections() reflects the live registry state.
+                
             if ctx.client:
                 try:
                     connections = ctx.client.query_connections()
@@ -584,17 +558,10 @@ def _interactive_mode(controller):
             # Execute command
             command_count += 1
             try:
-                # BUG-010 FIX: Time the execution so we can pass execution_time_ms
-                # to record_command(). The controllers return only a bool, so we
-                # measure wall-clock time around the call. This is the minimal
-                # surgical change — no controller method signatures are altered.
                 _cmd_start = time.time()
                 success = controller.execute_command(user_input)
                 _exec_ms = int((time.time() - _cmd_start) * 1000)
 
-                # Record the command in the MetricsCollector so that session stats,
-                # export, and the interactive `status` report all show real data
-                # instead of perpetual zeroes (which was the observable symptom).
                 if ctx.metrics:
                     ctx.metrics.record_command(user_input, success, _exec_ms)
 
@@ -1029,18 +996,11 @@ def status(click_ctx, host, port, token, fmt):
         control-center status system             # Controller host resources
         control-center status session            # Current/last session info
     """
-    # BUG-012 FIX: Previously there were TWO registrations under the name
-    # "status" in Click's command registry: first @cli.group() (which attached
-    # all the subcommands), then @cli.command(name='status') (the bare overview).
-    # Click's registry is a dict so the second registration silently overwrote
-    # the first, discarding the entire subcommand tree. The fix is to use a
-    # single group decorated with invoke_without_command=True and run the
-    # overview logic here when no subcommand is provided.
     if click_ctx.invoked_subcommand is not None:
         # A subcommand was given — let Click dispatch to it; do nothing here.
         return
 
-    # ── Bare invocation: run the combined live status overview ────────────────
+    # Bare invocation: run the combined live status overview
     h, p = _resolve_host_port(host, port)
 
     # Try to get live connection data (no auth needed)
@@ -1104,7 +1064,6 @@ def status(click_ctx, host, port, token, fmt):
     click.echo(f"CPU: {sys_info['cpu_percent']}%  Memory: {sys_info['memory_percent']}%  Disk: {sys_info['disk_percent']}%")
     click.echo("")
 
-
 @status.command(name='connection')
 @click.option('--host', help='Server host')
 @click.option('--port', type=int, help='Server port')
@@ -1132,7 +1091,6 @@ def status_connection(host, port, fmt):
         return
     
     StatusReporter.print_connection_detail(conn or {})
-
 
 @status.command(name='server')
 @click.option('--host', help='Server host')
@@ -1171,7 +1129,6 @@ def status_server(host, port, fmt):
         click.echo(f"  Cmds processed:{st.get('total_commands_processed', 0)}")
     click.echo("")
 
-
 @status.command(name='metrics')
 @click.option('--host', help='Server host')
 @click.option('--port', type=int, help='Server port')
@@ -1196,7 +1153,6 @@ def status_metrics(host, port, token, fmt):
     
     StatusReporter.print_metrics_detail(stats)
 
-
 @status.command(name='system')
 @click.option('--format', 'fmt', default='text', type=click.Choice(['text', 'json']))
 def status_system(fmt):
@@ -1206,7 +1162,6 @@ def status_system(fmt):
         click.echo(json.dumps(info, indent=2, default=str))
         return
     StatusReporter.print_system_detail(info)
-
 
 @status.command(name='session')
 @click.option('--format', 'fmt', default='text', type=click.Choice(['text', 'json']))
@@ -1273,7 +1228,6 @@ def session_events(fmt):
         click.echo(f"  {ts}  [{ev.get('type', 'event').upper():<20}]  {ev.get('detail', '')}")
     click.echo("")
 
-
 @session.command(name='commands')
 @click.option('--failed', is_flag=True, help='Show only failed commands')
 @click.option('--limit', default=50, show_default=True, help='Maximum rows to show')
@@ -1314,7 +1268,6 @@ def session_commands(failed, limit, fmt):
         click.echo(f"  {i:<5} {ok:<4} {str(ms):>6}  {cmd.get('command', '')}")
     click.echo("")
 
-
 @session.command(name='stats')
 @click.option('--format', 'fmt', default='text', type=click.Choice(['text', 'json']))
 def session_stats(fmt):
@@ -1344,7 +1297,6 @@ def session_stats(fmt):
     click.echo(f"  p95 time (ms):    {stats.get('p95_execution_time_ms', 0):.1f}")
     click.echo(f"  Session duration: {stats.get('session_duration_seconds', 0):.1f}s")
     click.echo("")
-
 
 @session.command(name='replay')
 @click.option('--host', help='Server host')
@@ -1428,7 +1380,6 @@ def agent():
     """
     pass
 
-
 @agent.command(name='info')
 @click.option('--host', help='Server host')
 @click.option('--port', type=int, help='Server port')
@@ -1463,7 +1414,6 @@ def agent_info(host, port, fmt):
     click.echo(f"  Connected At:    {_fmt_ts(info.connected_at)}")
     click.echo(f"  Commands Run:    {info.commands_executed}")
     click.echo("")
-
 
 @agent.command(name='capabilities')
 @click.option('--host', help='Server host')
@@ -1510,7 +1460,6 @@ def agent_capabilities(host, port, fmt):
         click.echo("\n  (capabilities list inferred from OS type)")
     click.echo("")
 
-
 @agent.command(name='ping')
 @click.option('--host', help='Server host')
 @click.option('--port', type=int, help='Server port')
@@ -1552,7 +1501,6 @@ def agent_ping(host, port, count, fmt):
                    f"avg={sum(ok_results)/len(ok_results):.2f}ms  "
                    f"max={max(ok_results):.2f}ms")
     click.echo("")
-
 
 @agent.command(name='disconnect')
 @click.option('--host', help='Server host')
@@ -1599,7 +1547,6 @@ def agent_disconnect(host, port, token, reason, yes):
         if client.channel:
             client.channel.close()
 
-
 @agent.command(name='history')
 @click.option('--host', help='Server host')
 @click.option('--port', type=int, help='Server port')
@@ -1615,10 +1562,6 @@ def agent_history(host, port, limit, fmt):
         if client.channel:
             client.channel.close()
 
-    # BUG-013 FIX: get_connection_history() returns a plain List[Dict], not a
-    # wrapper dict {"records": [...]}. Calling .get('records', []) on a list
-    # raised: AttributeError: 'list' object has no attribute 'get'.
-    # The fix is a single line: use the list directly.
     records = data if data is not None else []
 
     if fmt == 'json':
@@ -1644,7 +1587,6 @@ def agent_history(host, port, limit, fmt):
     if not records:
         click.echo("  (no history records)")
     click.echo("")
-
 
 @agent.command(name='start')
 @click.option('--server-host', default='127.0.0.1', help='Server host to connect to')
@@ -1712,7 +1654,7 @@ def export():
     """
     pass
 
-
+# Helper to get an Exporter instance with access to current session metrics or logs
 def _require_exporter() -> 'Exporter':
     """Return an Exporter instance wired to the current session's metrics."""
     exporter = Exporter()
@@ -1721,7 +1663,6 @@ def _require_exporter() -> 'Exporter':
     elif _load_session_data():
         pass  # Exporter reads log files; session data used separately
     return exporter
-
 
 @export.command(name='commands')
 @click.option('--format', 'fmt', default='csv',
@@ -1757,7 +1698,6 @@ def export_commands(fmt, type_filter, success_only, failed_only, last_n, output)
         click.echo(f"[x] Export failed: {e}", err=True)
         sys.exit(1)
 
-
 @export.command(name='metrics')
 @click.option('--format', 'fmt', default='json',
               type=click.Choice(['json', 'csv']),
@@ -1787,7 +1727,6 @@ def export_metrics(fmt, output):
 
     click.echo(f"[+] Exported metrics -> {out_path}")
 
-
 @export.command(name='session')
 @click.option('--format', 'fmt', default='json',
               type=click.Choice(['json', 'csv']),
@@ -1815,7 +1754,6 @@ def export_session(fmt, output):
             writer.writerows(commands)
 
     click.echo(f"[+] Exported session -> {out_path}")
-
 
 @export.command(name='audit')
 @click.option('--log-dir', default='./logs/audit', show_default=True,
@@ -1850,7 +1788,6 @@ def export_audit(log_dir, fmt, since, event_type, level, last_n, output):
         click.echo(f"[x] Export failed: {e}", err=True)
         sys.exit(1)
 
-
 @export.command(name='diagnostics')
 @click.option('--output', '-o', default=None, help='Output directory path')
 @click.option('--no-system', 'include_system', is_flag=True, default=True,
@@ -1872,7 +1809,6 @@ def export_diagnostics(output, include_system, include_html):
     except Exception as e:
         click.echo(f"[x] Export failed: {e}", err=True)
         sys.exit(1)
-
 
 @export.command(name='report')
 @click.option('--output', '-o', default=None, help='Output file path')
@@ -1909,14 +1845,12 @@ def audit():
     """
     pass
 
-
 def _parse_audit_line(line: str) -> Optional[Dict]:
     """Try to parse a JSON audit log line; return None on failure."""
     try:
         return json.loads(line.strip())
     except Exception:
         return None
-
 
 def _load_audit_entries(log_dir: str, since: Optional[str] = None,
                         event_type: Optional[str] = None,
@@ -1955,7 +1889,6 @@ def _load_audit_entries(log_dir: str, since: Optional[str] = None,
 
     return entries
 
-
 @audit.command(name='show')
 @click.option('--log-dir', default='./logs/audit', show_default=True)
 @click.option('--since', default=None, help='Start timestamp (YYYY-MM-DD or ISO)')
@@ -1987,7 +1920,6 @@ def audit_show(log_dir, since, event_type, level, last_n, fmt):
         extra = f"  user={uid}" if uid else ""
         click.echo(f"  {ts}  [{lvl:<7}]  {event}{extra}")
     click.echo("")
-
 
 @audit.command(name='tail')
 @click.option('--log-dir', default='./logs/audit', show_default=True)
@@ -2029,7 +1961,6 @@ def audit_tail(log_dir, lines):
                     time.sleep(0.3)
     except KeyboardInterrupt:
         click.echo("\n[*] Stopped.")
-
 
 @audit.command(name='search')
 @click.option('--log-dir', default='./logs/audit', show_default=True)
@@ -2080,7 +2011,7 @@ def token():
     """
     pass
 
-
+# Helper to resolve JWT secret from env or config, with error handling
 def _jwt_secret() -> str:
     """Resolve the JWT signing secret: CC_JWT_SECRET env > config file > error."""
     secret = os.environ.get('CC_JWT_SECRET')
@@ -2098,7 +2029,6 @@ def _jwt_secret() -> str:
         )
         sys.exit(1)
     return secret
-
 
 @token.command(name='generate')
 @click.option('--user', required=True, help='User identifier (sub claim)')
@@ -2162,7 +2092,6 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
     import datetime as dt
     now = dt.datetime.now(dt.timezone.utc)
 
-    # BUG-006 FIX: include aud and iss — server requires both claims
     aud = audience or os.environ.get('JWT_AUDIENCE', 'control-center')
     iss = issuer  or os.environ.get('JWT_ISSUER',   'control-center-auth')
 
@@ -2200,7 +2129,6 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
         f"  aud={aud}  iss={iss}",
         err=True
     )
-
 
 @token.command(name='inspect')
 @click.argument('token_string')
@@ -2244,7 +2172,6 @@ def token_inspect(token_string, fmt):
     click.echo(f"  Token ID (jti):  {payload.get('jti', 'N/A')}")
     click.echo("")
 
-
 @token.command(name='validate')
 @click.argument('token_string')
 @click.option('--secret', 'secret_override', default=None, envvar='CC_JWT_SECRET',
@@ -2260,8 +2187,6 @@ def token_validate(token_string, secret_override, audience):
         sys.exit(1)
 
     secret = secret_override or _jwt_secret()
-    # BUG-006 FIX: PyJWT>=2 raises InvalidAudienceError if aud is present but
-    # audience= is not passed to decode().  Match the server default.
     aud = audience or os.environ.get('JWT_AUDIENCE', 'control-center')
 
     try:
@@ -2281,7 +2206,7 @@ def token_validate(token_string, secret_override, audience):
         sys.exit(1)
 
 # ============================================================================
-# Update and Uninstall Commands  (verbatim from original)
+# Update and Uninstall Commands
 # ============================================================================
 @cli.command()
 @click.option('--check-only', is_flag=True, help='Only check for updates without installing')
@@ -2499,7 +2424,6 @@ def update(check_only):
         click.echo(click.style(f"\n[ERROR] Update failed: {e}", fg='red'), err=True)
         click.echo(f"\nManually download from: https://github.com/{GITHUB_REPO}/releases/latest")
         sys.exit(1)
-
 
 @cli.command()
 @click.option('--purge', is_flag=True, help='Also remove configuration files and data')
@@ -2729,7 +2653,7 @@ def uninstall(purge, yes):
     click.echo("Feedback: https://github.com/nullvoider07/control-center/issues")
 
 # ============================================================================
-# Config Commands  (verbatim from original)
+# Config Commands
 # ============================================================================
 
 @cli.group()
@@ -2857,7 +2781,7 @@ def config_init():
         sys.exit(1)
 
 # ============================================================================
-# Info Commands  (verbatim from original)
+# Info Commands
 # ============================================================================
 
 @cli.command()
@@ -2914,7 +2838,7 @@ def _find_binary(binary_name: str) -> Optional[str]:
     return shutil.which(binary_name)
 
 # ============================================================================
-# Server Commands  (verbatim from original)
+# Server Commands
 # ============================================================================
 
 @cli.group()
@@ -2963,9 +2887,6 @@ def server_start(host, port, single_agent, network, auth_url, token_url, client_
     if client_id:
         env['OAUTH_CLIENT_ID'] = client_id
 
-    # BUG-004 FIX: The Rust binary reads JWT_SECRET (not CC_JWT_SECRET).
-    # Map CC_JWT_SECRET → JWT_SECRET so users only need to export one variable.
-    # Config file is the fallback if the env var isn't set.
     if 'JWT_SECRET' not in env:
         cc_secret = os.environ.get('CC_JWT_SECRET') or ctx.config_manager.get('jwt_secret')
         if cc_secret:
@@ -2980,9 +2901,6 @@ def server_start(host, port, single_agent, network, auth_url, token_url, client_
             )
             sys.exit(1)
 
-    # Pass audience and issuer so the server uses the same values as the CLI.
-    # These default to the same values the server uses when the vars are absent,
-    # so this is a no-op unless the user has overridden them.
     env.setdefault('JWT_AUDIENCE', os.environ.get('JWT_AUDIENCE', 'control-center'))
     env.setdefault('JWT_ISSUER',   os.environ.get('JWT_ISSUER',   'control-center-auth'))
     
@@ -3002,7 +2920,7 @@ def server_start(host, port, single_agent, network, auth_url, token_url, client_
         sys.exit(1)
 
 # ============================================================================
-# Register monitoring group + entry point  (verbatim from original)
+# Register monitoring group + entry point
 # ============================================================================
 
 cli.add_command(monitoring, name='monitor')

@@ -163,6 +163,7 @@ pub fn build_server_identity(
     }
 }
 
+// Unit tests for identity management
 #[cfg(test)]
 mod tests {
     use super::*;

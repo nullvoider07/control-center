@@ -43,6 +43,7 @@ pub struct ConnectionManager {
     commands_failed: Arc<RwLock<u64>>,
 }
 
+// Implement connection manager
 impl ConnectionManager {
     /// Create new connection manager
     pub fn new(
@@ -89,7 +90,7 @@ impl ConnectionManager {
             connection_params: std::collections::HashMap::new(),
         };
         
-        // FIX: Explicitly type the response
+        // Explicitly type the response
         let response: tonic::Response<RegistrationResponse> = client
             .register_agent(Request::new(registration_request))
             .await?;
@@ -179,7 +180,7 @@ impl ConnectionManager {
                     ready: true,
                     commands_executed,
                     commands_failed,
-                    uptime_seconds: 0, // TODO: Track actual uptime
+                    uptime_seconds: 0,
                     system_info: std::collections::HashMap::new(),
                 }),
                 current_command_id: None,
@@ -189,9 +190,6 @@ impl ConnectionManager {
                 connection_id: connection_id.clone(),
                 payload: Some(agent_message::Payload::Heartbeat(heartbeat)),
             };
-            
-            // TODO: Phase 2 - Send heartbeat through bidirectional stream
-            // For now, just prepare the message (used in Phase 2)
             
             if *self.status.read().await == ConnectionStatus::Connected {
                 *self.status.write().await = ConnectionStatus::Active;
@@ -239,6 +237,7 @@ pub struct ReconnectionManager {
     current_attempt: usize,
 }
 
+// Implement reconnection manager
 #[allow(dead_code)]
 impl ReconnectionManager {
     pub fn new(initial_delay_seconds: u64, max_delay_seconds: u64) -> Self {
@@ -270,6 +269,7 @@ impl ReconnectionManager {
     }
 }
 
+// Unit tests for connection manager
 #[cfg(test)]
 mod tests {
     use super::*;

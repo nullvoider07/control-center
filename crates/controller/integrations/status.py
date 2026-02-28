@@ -5,7 +5,7 @@ from datetime import datetime
 import platform
 import psutil
 
-
+# Status Reporter class to gather and report system and connection status, as well as session and metrics info
 class StatusReporter:
     """Report system and connection status"""
     
@@ -137,6 +137,7 @@ class StatusReporter:
             'recent_events': raw.get('events', [])[-10:],
         }
 
+    # Static method to extract detailed metrics status from a MetricsCollector object
     @staticmethod
     def get_metrics_status(metrics) -> Dict:
         """Get full metrics breakdown from a MetricsCollector object."""
@@ -164,6 +165,7 @@ class StatusReporter:
             'uptime_seconds': stats.get('uptime_seconds', 0),
         }
 
+    # Static method to generate a comprehensive status report combining session, metrics, connection, and system status
     @staticmethod
     def generate_status_report(session, metrics, grpc_client) -> Dict:
         """Generate comprehensive status report"""
@@ -221,6 +223,7 @@ class StatusReporter:
 
         print("====================\n")
 
+    # Static methods to print detailed breakdowns of connection, metrics, and system info for specific subcommands
     @staticmethod
     def print_connection_detail(conn: Dict):
         """Print detailed connection info (used by `status connection` subcommand)."""
@@ -254,6 +257,7 @@ class StatusReporter:
                 print(f"  Last Heartbeat:   {conn.get('last_heartbeat')}")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
+    # Static method to print detailed session info (used by `status session` subcommand)
     @staticmethod
     def print_metrics_detail(metrics: Dict):
         """Print detailed metrics breakdown (used by `status metrics` subcommand)."""
@@ -290,6 +294,7 @@ class StatusReporter:
                 print(f"    rate_limit_hits        {rl}")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
+    # Static method to print detailed system info (used by `status system` subcommand)
     @staticmethod
     def print_system_detail(sys_info: Dict):
         """Print detailed controller host system info (used by `status system` subcommand)."""

@@ -15,7 +15,8 @@ from datetime import datetime
 # Map OsType proto integer to readable string (mirrors the server-side enum)
 _OS_TYPE_MAP = {0: "WINDOWS", 1: "MACOS", 2: "LINUX"}
 
-
+# AgentManager class to manage agent information and health, with methods
+# for registration, retrieval, and live-data refresh from gRPC client
 class AgentManager:
     """Manage agent information and health"""
     
@@ -50,10 +51,7 @@ class AgentManager:
         """List all registered agents"""
         return list(self.agents.values())
 
-    # ------------------------------------------------------------------ #
     # Live-data refresh (wires to gRPC client)
-    # ------------------------------------------------------------------ #
-
     def refresh(self, grpc_client) -> bool:
         """Refresh agent registry from the live server connection.
 
@@ -79,7 +77,6 @@ class AgentManager:
             return bool(self.agents)
         except Exception:
             return False
-
 
 # Agent information data class
 class AgentInfo:
@@ -130,10 +127,7 @@ class AgentInfo:
             'disconnect_reason': self.disconnect_reason,
         }
 
-    # ------------------------------------------------------------------ #
     # Factory classmethods
-    # ------------------------------------------------------------------ #
-
     @classmethod
     def from_connection_dict(cls, conn: Dict) -> 'AgentInfo':
         """Build an AgentInfo from a live connection dict.
@@ -162,6 +156,7 @@ class AgentInfo:
         info.connected_at      = conn.get('connected_at')
         return info
 
+    # Factory classmethod for historical connection records (includes disconnect reason)
     @classmethod
     def from_history_dict(cls, hist: Dict) -> 'AgentInfo':
         """Build an AgentInfo from a historical connection dict.

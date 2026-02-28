@@ -80,10 +80,6 @@ class MacOSActuation:
             pos_cmd = f"{self.cliclick_path} p:."
             result = self.grpc_client.execute_command(pos_cmd)
             
-            # BUG-007 FIX: Position data is returned in mouse_x/mouse_y fields,
-            # not in a non-existent 'output' key. cliclick commands contain the
-            # string "click" so the Rust agent classifies them as mouse actions,
-            # captures position after execution, and returns it here.
             if result['success'] and result.get('position_captured'):
                 mx = result.get('mouse_x')
                 my = result.get('mouse_y')
@@ -95,6 +91,7 @@ class MacOSActuation:
             print(f"[!] Failed to get mouse position: {e}")
             return None
     
+    # Helper method to format press command for display
     def _format_press_for_display(self, keys: str) -> str:
         """Convert modifier-prefixed key notation to human-readable string for CLI output.
         
@@ -509,9 +506,6 @@ class MacOSActuation:
         result = self.grpc_client.execute_command(cliclick_cmd)
         
         # For mouse commands: Get position after action
-        # BUG-007 FIX: Read mouse_x/mouse_y directly from the gRPC result.
-        # The agent captures position internally after mouse commands and returns
-        # it in the dedicated fields — no extra gRPC call needed.
         if cmd_type == 'mouse' and result['success']:
             mx = result.get('mouse_x')
             my = result.get('mouse_y')

@@ -21,6 +21,7 @@ pub struct MonitoringHandler {
     started_at: i64,
 }
 
+/// Implementation of monitoring handler
 impl MonitoringHandler {
     /// Create new monitoring handler
     pub fn new(
@@ -203,6 +204,7 @@ pub fn format_connection_status(metadata: &ConnectionMetadata) -> String {
     )
 }
 
+// Unit tests for monitoring module
 #[cfg(test)]
 mod tests {
     use super::*;

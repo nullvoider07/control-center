@@ -63,6 +63,7 @@ class LinuxActuation:
         self.grpc_client = grpc_client
         self.display = os.environ.get('DISPLAY', ':0')
     
+    # Helper method to format key combinations for display in CLI output
     def _format_press_for_display(self, keys: str) -> str:
         """Convert modifier-prefixed key notation to human-readable string for CLI output.
         
@@ -295,6 +296,7 @@ class LinuxActuation:
         
         return None
     
+    # Build xdotool command for keyboard actions
     def _build_keyboard_command(self, command: str) -> Optional[str]:
         """
         Build xdotool keyboard command
@@ -362,18 +364,11 @@ class LinuxActuation:
             print(f"[✗] Failed to build command: {command}")
             return False
         
-        # Position is captured by the agent after execution and returned in
-        # mouse_x/mouse_y fields — no need to query it via gRPC before the action.
         position_after = None
 
         # Send to server via gRPC
         result = self.grpc_client.execute_command(xdotool_cmd)
         
-        # FOR MOUSE COMMANDS: Get position after action
-        # BUG-007 FIX: Read mouse_x/mouse_y directly from the gRPC result instead
-        # of making a redundant extra execute_command call (which tried to parse a
-        # non-existent 'output' key). The agent captures position after mouse
-        # commands and returns it in the dedicated mouse_x/mouse_y/position_captured fields.
         if cmd_type == 'mouse' and result['success'] and processed_cmd != 'position':
             mx = result.get('mouse_x')
             my = result.get('mouse_y')
@@ -381,9 +376,6 @@ class LinuxActuation:
             position_after = (mx, my) if captured and mx is not None and my is not None else None
         
         # Handle position query result separately
-        # BUG-007 FIX: Replace result['output'] (key never existed) with
-        # result.get('mouse_x') / result.get('mouse_y') from the agent's
-        # position capture mechanism.
         if processed_cmd == 'position' and result['success']:
             mx = result.get('mouse_x')
             my = result.get('mouse_y')

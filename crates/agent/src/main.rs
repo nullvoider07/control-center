@@ -265,17 +265,6 @@ impl AgentServiceImpl {
         
         Ok(())
     }
-    
-    // BUG-008 FIX ─────────────────────────────────────────────────────────────
-    // The Python actuation layer translates human commands ("960 540 left") into
-    // OS-level shell commands before sending them to the agent.  parse_action_details()
-    // was receiving those raw OS strings, so build_detailed_message() logged entries
-    // like {"action": "Typed: cmd /c echo 960 540 left > C:\mouse_cmd.txt"}.
-    //
-    // extract_human_command() reverses the platform translation so that
-    // parse_action_details() and build_detailed_message() always work with the
-    // original semantic command string.
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// Extract a human-readable command from the raw OS command sent by the
     /// Python actuation layer.
@@ -326,8 +315,6 @@ impl AgentServiceImpl {
             return command.to_string();
         }
 
-        // Each token is an action shortcut e.g. "c:.", "rc:960,540", "t:hello"
-        // We only need the first action token to determine the human command type.
         let action_token = tokens[0];
 
         // Keyboard: "t:text" → "type text", "kp:return" → "press {Enter}"
@@ -664,7 +651,6 @@ impl AgentServiceImpl {
         }
     }
 
-    // ── end BUG-008 helpers ───────────────────────────────────────────────────
     fn parse_action_details(&self, command: &str) -> ActionDetails {
         let tokens: Vec<&str> = command.split_whitespace().collect();
 
@@ -806,7 +792,7 @@ impl AgentServiceImpl {
         position: &MousePosition,
         command: &str,
     ) -> String {
-        // ── Keyboard actions ─────────────────────────────────────────────────────
+        // Keyboard actions
         if action.action_type == "press" {
             let keys = command.trim_start_matches("press").trim();
             return format!("Pressed: {}", self.format_keys_for_display(keys));
@@ -820,7 +806,7 @@ impl AgentServiceImpl {
             return format!("Typed: {}", command);
         }
 
-        // ── Position query ───────────────────────────────────────────────────────
+        // Position query
         if action.action_type == "position" {
             return if position.captured {
                 format!("Position: X={}, Y={}", position.x, position.y)
@@ -829,12 +815,12 @@ impl AgentServiceImpl {
             };
         }
 
-        // ── Mouse actions that don't need position ───────────────────────────────
+        // Mouse actions that don't need position
         if !position.captured {
             return format!("Executed: {}", command);
         }
 
-        // ── Mouse actions with position ──────────────────────────────────────────
+        // Mouse actions with position
         let action_name = match action.action_type.as_str() {
             "left"         => "Left-clicked",
             "right"        => "Right-clicked",
@@ -1073,17 +1059,8 @@ impl AgentService for AgentServiceImpl {
         debug!("Executing command: id={}, cmd={}", req.id, req.command);
         
         let start = Instant::now();
-        // execute_command() runs the OS-level command and captures mouse position
-        // when the OS string is recognisable as a mouse action (e.g. xdotool/cliclick
-        // commands containing "click").  We keep calling it with the raw OS command
-        // so execution is unchanged.
         let (result, position, _os_action) = self.execute_command(&req.command).await;
         let execution_time = start.elapsed().as_millis() as i64;
-        
-        // BUG-008 FIX: derive the human-readable command ("960 540 left") from the
-        // raw OS command ("cmd /c echo 960 540 left > C:\mouse_cmd.txt") so that
-        // parse_action_details() and build_detailed_message() produce meaningful
-        // log entries instead of "Typed: cmd /c echo …".
         let human_cmd = self.extract_human_command(&req.command);
         let human_action = self.parse_action_details(&human_cmd);
         

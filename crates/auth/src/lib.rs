@@ -17,8 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-// Single canonical Claims definition — shared across all crates.
-// Do NOT define a local Claims struct here.
+// Re-export Claims for use in other crates
 use control_center_common::Claims;
 
 /// OAuth token response
@@ -127,7 +126,7 @@ impl AuthManager {
         Ok((auth_url.to_string(), csrf_value))
     }
 
-    /// Exchange authorization code for tokens (Step 2 of OAuth flow)
+    /// Exchange authorization code for tokens
     pub async fn exchange_code(
         &self,
         code: String,

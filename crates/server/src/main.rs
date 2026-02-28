@@ -203,7 +203,7 @@ impl ControlCenterService {
         let tokens: Vec<&str> = trimmed.splitn(4, ' ').collect();
         let first = tokens.first().copied().unwrap_or("").to_lowercase();
 
-        // ── User-level commands ─────────────────────────────────────────────
+        // User-level commands
         if first == "type" {
             return ("keyboard".to_string(), "type".to_string(), false);
         }
@@ -223,7 +223,7 @@ impl ControlCenterService {
             return ("mouse".to_string(), subtype, false);
         }
 
-        // ── macOS: cliclick ─────────────────────────────────────────────────
+        // macOS: cliclick
         // e.g. "cliclick c:."  "/opt/homebrew/bin/cliclick rc:960,540"
         //      "cliclick kd:cmd t:a ku:cmd"
         if first.ends_with("cliclick") || trimmed.contains("/cliclick ") {
@@ -256,7 +256,7 @@ impl ControlCenterService {
             return ("mouse".to_string(), subtype.to_string(), is_here);
         }
 
-        // ── macOS: osascript ────────────────────────────────────────────────
+        // macOS: osascript
         // e.g. "osascript -e 'tell application "System Events" to keystroke "hello"'"
         //      "osascript -e 'tell application "System Events" to key code 36'"
         if first == "osascript" {
@@ -266,7 +266,7 @@ impl ControlCenterService {
             return ("keyboard".to_string(), "press".to_string(), false);
         }
 
-        // ── Linux: xdotool ──────────────────────────────────────────────────
+        // Linux: xdotool
         // e.g. "DISPLAY=:0 xdotool click 1"
         //      "DISPLAY=:0 xdotool mousemove 960 540 click 1"
         //      "DISPLAY=:0 xdotool type \"hello\""
@@ -303,7 +303,7 @@ impl ControlCenterService {
             };
         }
 
-        // ── Windows: cmd /c echo <human_cmd> > C:\*.txt ─────────────────────
+        // Windows: cmd /c echo <human_cmd> > C:\*.txt
         // e.g. "cmd /c echo here left > C:\mouse_cmd.txt"
         if first == "cmd" && trimmed.contains("> C:\\") {
             if let Some(after_echo) = trimmed.splitn(2, "echo ").nth(1) {
@@ -902,7 +902,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION").to_string(),
     ));
 
-    // Create stream handler (Phase 2)
+    // Create stream handler
     let stream_handler = Arc::new(stream_handler::StreamHandler::new(
         registry.clone(),
         server_identity.server_id.clone(),

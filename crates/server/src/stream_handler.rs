@@ -52,6 +52,7 @@ pub struct StreamHandler {
     command_timeout: Duration,
 }
 
+/// Implementation of stream handler
 impl StreamHandler {
     /// Create new stream handler
     pub fn new(
@@ -492,6 +493,7 @@ impl StreamHandler {
     }
 }
 
+/// Unit tests for stream handler
 #[cfg(test)]
 mod tests {
     use super::*;
