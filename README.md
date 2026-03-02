@@ -1424,6 +1424,29 @@ control-center --debug connect --host 192.168.1.100
 
 ---
 
+# License
+
+Copyright (C) 2026 Kartik (NullVoider)
+
+This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License version 3** as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful, but **without any warranty** — without even the implied warranty of merchantability or fitness for a particular purpose. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+### What this means
+
+- **Use freely** — run Control Center for any purpose, including commercial CUA workflows
+- **Study and modify** — the full source is available and you are free to adapt it
+- **Distribute** — you may share original or modified copies, provided they carry the same GPLv3 license
+- **Contribute back** — modifications distributed to others must also be released under GPLv3
+
+For the full license text, see the [`LICENSE`](./LICENSE) file in the root of the repository.
+
+---
+
 ## Support
 
 - **Issues:** [GitHub Issues](https://github.com/nullvoider07/control-center/issues)
