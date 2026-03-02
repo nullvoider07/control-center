@@ -55,7 +55,8 @@
 15. [Audit Logging](#audit-logging)
 16. [WatchCommands Stream](#watchcommands-stream)
 17. [Troubleshooting](#troubleshooting)
-18. [About This Project](#about-this-project)
+18. [License](#license)
+19. [About This Project](#about-this-project)
 
 ---
 
@@ -1424,7 +1425,19 @@ control-center --debug connect --host 192.168.1.100
 
 ---
 
-# License
+## Support
+
+- **Issues:** [GitHub Issues](https://github.com/nullvoider07/control-center/issues)
+- **Repository:** [GitHub Repository](https://github.com/nullvoider07/control-center)
+
+---
+
+**Last Updated:** February 2026  
+**Developer:** Kartik (NullVoider)
+
+---
+
+## License
 
 Copyright (C) 2026 Kartik (NullVoider)
 
@@ -1443,19 +1456,7 @@ You should have received a copy of the GNU General Public License along with thi
 - **Distribute** — you may share original or modified copies, provided they carry the same GPLv3 license
 - **Contribute back** — modifications distributed to others must also be released under GPLv3
 
-For the full license text, see the [`LICENSE`](./LICENSE) file in the root of the repository.
-
----
-
-## Support
-
-- **Issues:** [GitHub Issues](https://github.com/nullvoider07/control-center/issues)
-- **Repository:** [GitHub Repository](https://github.com/nullvoider07/control-center)
-
----
-
-**Last Updated:** February 2026  
-**Developer:** Kartik (NullVoider)
+For the full license text, see the [`LICENSE`](./LICENSE) file in the root of this repository.
 
 ---
 
