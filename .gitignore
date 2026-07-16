@@ -9,4 +9,5 @@ __pycache__/
 
 # Local-only working directories (not published)
 .claude/
+target/
 cc-scripts.txt
