@@ -11,3 +11,4 @@ __pycache__/
 .claude/
 target/
 cc-scripts.txt
+cc-upgrades-handoff.md
