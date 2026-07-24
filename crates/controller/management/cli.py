@@ -5,6 +5,7 @@ import sys
 import os
 import uuid
 import signal
+import _thread
 import shutil
 import platform
 import subprocess
@@ -14,6 +15,14 @@ import csv
 import io
 from typing import Optional, Union, List, Dict
 from pathlib import Path
+
+# Line editing + in-memory command history for interactive input(). Absent on
+# Windows, where the console host provides line editing natively. History is
+# per-process only; no history file is read or written.
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass
 
 from controller.management.config_manager import ConfigManager, ConfigurationError
 from controller.integrations.gRPC import GRPCClient, AuthenticationError, ConnectionError, RateLimitError
@@ -30,7 +39,7 @@ from controller.management.agent import AgentManager, AgentInfo
 from controller.utils.logger import setup_logger, get_audit_logger
 from controller.utils.validation import require_valid_host, require_valid_port, ValidationError
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Setup logger
 logger = setup_logger('control-center')
@@ -394,13 +403,16 @@ def _print_banner(agent_info: dict):
 def _interactive_mode(controller):
     """Interactive command loop with PERSISTENT connection"""
     import threading
-    import select as _select
 
     command_count = 0
     consecutive_failures = 0
     max_failures = 3
 
     _agent_gone = threading.Event()
+    # Set once the command loop exits, so a stream end during teardown (cleanup
+    # closes the channel, which ends the watched stream) does not fire a stray
+    # SIGINT at the main thread.
+    _session_over = threading.Event()
 
     def _watch_for_disconnect():
         client = ctx.client
@@ -413,8 +425,20 @@ def _interactive_mode(controller):
                     return  # interactive mode already exiting
         except Exception:
             pass
-        # Stream ended — agent has disconnected from the server
+        # Stream ended — agent has disconnected from the server.
         _agent_gone.set()
+        if _session_over.is_set() or not ctx.in_interactive_mode:
+            return
+        # Break the blocking input() on the main thread. A real SIGINT is
+        # required: interrupt_main() only sets a flag and does not wake an idle
+        # readline read. pthread_kill routes through signal_handler (which raises
+        # KeyboardInterrupt while in_interactive_mode). pthread_kill is Unix-only;
+        # Windows falls back to interrupt_main() (native console editing there).
+        main_ident = threading.main_thread().ident
+        if hasattr(signal, 'pthread_kill') and main_ident is not None:
+            signal.pthread_kill(main_ident, signal.SIGINT)
+        else:
+            _thread.interrupt_main()
 
     _watcher = threading.Thread(target=_watch_for_disconnect, daemon=True)
     _watcher.start()
@@ -510,20 +534,14 @@ def _interactive_mode(controller):
                     click.echo("\n[!] Lost connection to server. Session terminated.", err=True)
                     break
 
-            # Get user input — poll stdin in 1s intervals so the agent-disconnect
-            # watcher can break the loop without waiting for the user to press Enter.
-            sys.stdout.write("control-center> ")
-            sys.stdout.flush()
-            user_input = None
-            while not ctx.interrupted and not _agent_gone.is_set():
-                ready, _, _ = _select.select([sys.stdin], [], [], 1.0)
-                if ready:
-                    user_input = sys.stdin.readline().rstrip('\n')
-                    break
+            # Blocking read with readline line editing + in-memory history.
+            # readline decorates the prompt passed to input(); non-empty lines are
+            # auto-appended to history. The agent-disconnect watcher breaks an idle
+            # read by delivering a SIGINT to the main thread, surfacing here as a
+            # KeyboardInterrupt (handled below, distinguished via _agent_gone).
+            user_input = input("control-center> ")
             if _agent_gone.is_set():
                 click.echo("\n[!] Agent has disconnected from server. Session terminated.", err=True)
-                break
-            if user_input is None:
                 break
             user_input = user_input.strip()
             
@@ -597,6 +615,12 @@ def _interactive_mode(controller):
                 click.echo(f"[x] Error: {e}", err=True)
         
         except KeyboardInterrupt:
+            # A watcher-injected SIGINT (agent disconnect) sets _agent_gone before
+            # firing; treat that as a clean session end. A bare Ctrl+C stays in the
+            # loop with the existing hint.
+            if _agent_gone.is_set():
+                click.echo("\n[!] Agent has disconnected from server. Session terminated.", err=True)
+                break
             click.echo("\n[*] Interrupted. Type 'exit' to disconnect.")
             continue
         except click.exceptions.Abort:
@@ -608,6 +632,10 @@ def _interactive_mode(controller):
         except Exception as e:
             logger.error("\n[!] Use 'exit' or 'quit' to disconnect")
             continue
+
+    # Loop has exited; suppress the watcher's SIGINT so the stream end during
+    # teardown (cleanup closes the channel) cannot interrupt the main thread.
+    _session_over.set()
 
     if ctx.session and ctx.session.is_vm_shutdown():
         click.echo("\n[*] Session ended due to VM shutdown")

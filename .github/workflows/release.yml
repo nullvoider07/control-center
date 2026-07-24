@@ -65,6 +65,7 @@ jobs:
             --hidden-import=yaml \
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
+            --hidden-import=readline \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -188,6 +189,7 @@ jobs:
             --hidden-import=yaml \
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
+            --hidden-import=readline \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -309,6 +311,7 @@ jobs:
             --hidden-import=yaml \
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
+            --hidden-import=readline \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -438,6 +441,7 @@ jobs:
             --hidden-import=yaml \
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
+            --hidden-import=readline \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -662,9 +666,26 @@ jobs:
           generate_release_notes: true
           body: |
             # Control Center ${{ github.ref_name }}
-            
+
             **Unified package: Rust binaries + Python CLI in one download**
-            
+
+            ## ✨ What's New in v1.1.0
+
+            Interactive `connect` console upgrades:
+
+            - **Added** — Line editing at the `control-center>` prompt: left/right
+              cursor movement and standard readline editing (via a bundled `readline`).
+            - **Added** — Per-session command history: recall previous commands with the
+              up/down arrows. History is in-memory only (not written to disk) and
+              survives `clear`.
+            - **Fixed** — Left/right arrow keys no longer insert raw escape sequences
+              into the prompt.
+            - **Changed** — The interactive input path was reworked from a stdin poll to
+              a blocking readline reader; agent-disconnect-while-idle detection is
+              preserved (an idle session still terminates promptly on disconnect).
+
+            _CLI only; the server and agent binaries are unchanged in this release._
+
             ## 📦 What's Included
             
             Each platform package contains:

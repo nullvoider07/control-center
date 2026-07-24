@@ -83,6 +83,7 @@ Control Center consists of three components:
 
 - ✅ **Cross-Platform Actuation**: Windows, macOS, and Linux (X11) support from a single command interface
 - ✅ **Three Usage Modes**: Interactive shell, single-command execution, and batch file execution
+- ✅ **Line Editing & History**: The interactive console supports readline line editing (arrow-key cursor movement) and per-session up/down command history (in-memory, survives `clear`)
 - ✅ **Live Command Streaming**: WatchCommands gRPC stream for real-time event observation by external tools
 - ✅ **Auto OS Detection**: Server detects connected agent OS and dispatches commands to the correct backend automatically
 - ✅ **Position Tracking**: All mouse commands automatically report final cursor coordinates after execution
@@ -597,8 +598,11 @@ control-center connect --host 192.168.1.100 --token YOUR_TOKEN
 **Interactive mode features:**
 
 - Persistent connection — no per-command connection overhead
+- Line editing: move the cursor with the left/right arrow keys and edit the current line (readline-backed; on Windows the native console provides editing)
+- Command history: recall previous commands with the up/down arrow keys. History is per-session and held in memory only — it is never written to disk and it survives `clear`
 - Live reconnection: if the connection drops, the session automatically attempts to reconnect (up to the configured retry limit)
 - VM shutdown detection: if the target machine powers off, the session is gracefully terminated with a clear notification
+- Agent-disconnect detection: if the agent disconnects while you are idle at the prompt, the session is terminated promptly without needing a keypress
 - Built-in commands: `help`, `status`, `clear`, `exit`, `quit`
 - Session tracking: all commands, their results, and timing are recorded in memory and saved on exit
 
