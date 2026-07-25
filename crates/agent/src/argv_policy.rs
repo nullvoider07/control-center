@@ -543,6 +543,33 @@ mod tests {
     }
 
     #[test]
+    fn osascript_accepts_real_quoted_payloads() {
+        // Exactly what macos_actuation.py emits for quote-heavy input. Typed text
+        // containing quotes must survive validation, or the grammar would break
+        // ordinary typing on macOS — the failure mode the old escaping bug caused.
+        for (typed, body) in [
+            (r#"say "hi""#, r#"tell application "System Events" to keystroke "say \"hi\"""#),
+            ("it's fine", r#"tell application "System Events" to keystroke "it's fine""#),
+            (r#"""#, r#"tell application "System Events" to keystroke "\"""#),
+            ("'", r#"tell application "System Events" to keystroke "'""#),
+            (r#"a"b'c"#, r#"tell application "System Events" to keystroke "a\"b'c""#),
+            (r#"he said "it's" done"#,
+             r#"tell application "System Events" to keystroke "he said \"it's\" done""#),
+            (r"back\slash", r#"tell application "System Events" to keystroke "back\\slash""#),
+            (r"trailing\", r#"tell application "System Events" to keystroke "trailing\\""#),
+            (r#""quoted phrase""#,
+             r#"tell application "System Events" to keystroke "\"quoted phrase\"""#),
+        ] {
+            let case = argv(&["osascript", "-e", body]);
+            assert!(
+                validate(&case).is_ok(),
+                "typing {:?} must be accepted, but its script was rejected: {:?}",
+                typed, body
+            );
+        }
+    }
+
+    #[test]
     fn osascript_rejects_bad_key_code_specs() {
         for body in [
             "tell application \"System Events\" to key code 9999",
