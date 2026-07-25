@@ -687,8 +687,15 @@ The actuation command language is the same across all three platforms. The contr
 | `<x> <y> scroll_up [n]` | Move to coordinates and scroll up (optionally n times) |
 | `<x> <y> scroll_down [n]` | Move to coordinates and scroll down (optionally n times) |
 | `<x> <y> drag <x2> <y2>` | Click and drag from (x,y) to (x2,y2) |
+| `<x> <y> drag <x2> <y2> dwell <ms>` | macOS: same, with a custom pause after the press and each move (1–5000 ms, default 50) |
+| `<x> <y> drag via <ax> <ay> [via …] to <x2> <y2>` | macOS: drag along a path (up to 16 waypoints) |
 | `here <action>` | Perform action at the current cursor position |
 | `position` | Query and return the current mouse cursor position |
+
+The default single-hop drag with its 50 ms dwells is enough for a selection drag,
+but drag-and-drop targets and some overlay UIs only track a slower or multi-step
+movement. Both extended forms stay **one recorded step**. They are implemented for
+the macOS backend; Linux and Windows accept the plain `drag <x2> <y2>` form only.
 
 **Examples:**
 
@@ -697,6 +704,10 @@ The actuation command language is the same across all three platforms. The contr
 1200 300 right          → Right-click at (1200, 300)
 500 400 double          → Double-click at (500, 400)
 100 100 drag 800 600    → Drag from (100,100) to (800,600)
+100 100 drag 800 600 dwell 150
+                        → Same drag, 150 ms pauses (slower, for finicky targets)
+100 100 drag via 400 300 via 700 500 to 900 700
+                        → Drag along a path through two waypoints
 here left               → Left-click at wherever cursor currently is
 960 540 scroll_down 5   → Scroll down 5 notches at center
 position                → Return current X and Y coordinates
@@ -718,6 +729,8 @@ position                → Return current X and Y coordinates
 | `{PgUp}`, `{PgDn}` | Page Up / Page Down |
 | `{F1}` – `{F12}` | Function keys |
 | `{Space}` | Space key |
+| `{Plus}` | The plus key — see the note on `+` below |
+| `{code:N}` | Press macOS virtual keycode N (0–127) directly — see below |
 
 **Modifier syntax** (same across all platforms):
 
@@ -727,6 +740,15 @@ position                → Return current X and Y coordinates
 | `+` | Shift |
 | `!` | Alt / Option |
 | `#` | Super / Win / Cmd |
+
+A modifier symbol is only read as a modifier in the **prefix** position, so
+punctuation after the prefix is an ordinary target key: `press ^-` is Ctrl+Minus.
+The one exception is `+`, which is always the Shift modifier — `press ^+` is
+Ctrl+Shift, and Ctrl+Plus must be written **`press ^{Plus}`**.
+
+Punctuation targets are supported on every platform. On Linux they are translated
+to X keysym names before reaching `xdotool`, which cannot resolve raw characters:
+`press ^,` is sent as `ctrl+comma`, not `ctrl+,`.
 
 **Examples:**
 
@@ -742,7 +764,46 @@ press ^!{Delete}        → Ctrl+Alt+Delete
 press ^+{Esc}           → Ctrl+Shift+Esc (Task Manager on Windows)
 #                       → Super key (opens Start / app launcher)
 #r                      → Super+R (Run dialog on Windows/Linux)
+press ^-                → Ctrl+Minus (zoom out)
+press ^{Plus}           → Ctrl+Plus (zoom in)
+press ^,                → Ctrl+Comma (preferences)
+press ^/                → Ctrl+Slash (toggle comment)
+press ^[                → Ctrl+[ (outdent)
+press #+4               → Cmd+Shift+4 (macOS region screenshot)
+press #+{code:21}       → Same, addressed by virtual keycode
 ```
+
+**macOS: modified digits and punctuation.** `cliclick`'s text primitive synthesizes a
+character event rather than a keycode carrying modifier flags, and macOS system
+hotkeys match on keycode + flags. Shortcuts such as ⇧⌘3/⇧⌘4/⇧⌘5 therefore reported
+success and did nothing. The controller now routes any **modified** digit or
+punctuation key through an AppleScript `key code`, using a US-ANSI layout map.
+Letters are unaffected and still take the original path.
+
+**Escape hatch.** That map is finite; `{code:N}` sends a virtual keycode directly, so
+a key it does not cover is a console command rather than a release. It composes with
+the normal modifier prefix — `press #+{code:21}` is ⇧⌘4. Values outside 0–127 are
+rejected rather than typed as text.
+
+### Unrecognised Commands
+
+By default an input matching no known verb is **rejected** rather than typed:
+
+```
+control-center> 1022 343left
+[✗] Unrecognised command: '1022 343left'
+    Did you mean: 1022 343 left
+    To type it literally: type 1022 343left
+    Pass --lenient to restore the old behaviour of typing unknown input.
+```
+
+`type <text>` is the only way to send text. This matters when a session is being
+recorded: the old fall-through typed the mistyped line into whatever had focus and
+stored it as a real step, so a dropped space became a spurious entry in the trace
+that had to be removed afterwards with everything renumbered.
+
+`--lenient` on `connect`, `execute` and `batch` restores the fall-through.
+`session-replay` always runs lenient, so it can reproduce a recording verbatim.
 
 **macOS Unicode modifier syntax** (also accepted):
 
@@ -779,6 +840,45 @@ To explicitly query the position without performing an action:
 control-center> position
 Position: X=960, Y=540
 ```
+
+**A reported coordinate is a verified one.** The agent reads the cursor back after
+actuating and compares it against the coordinate the command asked for. If they
+disagree it re-reads a few times, and if they still disagree it reports
+`position_captured: false` and no coordinate rather than a number it could not
+confirm. A bare readback cannot distinguish a good read from one that raced the
+synthetic event, or from a warp that silently did nothing — and that same value is
+both the signal used to gate the next step and the coordinate stored in a recording.
+
+Commands that name no coordinate (`here left`, `position`) have nothing to verify
+against and report their plain readback.
+
+> ⚠️ **Consumers must read `position_captured` first.** `mouse_x`/`mouse_y` are
+> non-optional integers, so an uncaptured position is carried as `(0, 0)` — itself a
+> valid screen coordinate. Without checking the flag, "the cursor was at the origin"
+> and "no position was captured" are indistinguishable.
+
+### Held Mouse Buttons
+
+`<x> <y> hold` presses a button and leaves it down until a matching `release`. The
+agent tracks outstanding holds and:
+
+- reports them on every subsequent command, so the console can warn once a button has
+  been down longer than a few seconds;
+- surfaces them on `position`, so a status check answers "is anything held";
+- releases them automatically when the agent exits — on `Ctrl+C`, on `SIGTERM`, and
+  when the server closes the stream.
+
+```
+control-center> 900 700 hold
+control-center> 400 300 move
+[!] left button still held at (900, 700) for 7s — issue `900 700 release`
+```
+
+A hold is never released on a timer: a long press is legitimate during a slow drag.
+The automatic release at shutdown is the one action the agent takes without being
+asked; it applies only to buttons it recorded going down, and it is logged at `warn`
+because it happens after the command stream has closed and therefore cannot appear in
+a recording.
 
 ### Platform Differences
 
@@ -1550,9 +1650,9 @@ includes text typed into the guest, so it is not safe to expose unauthenticated.
 | `success` | bool | Whether the command executed successfully |
 | `error_message` | string | Error description if `success` is false |
 | `execution_time_ms` | int32 | Wall-clock execution time in milliseconds |
-| `mouse_x` | int32 | Final cursor X coordinate (mouse commands only) |
-| `mouse_y` | int32 | Final cursor Y coordinate (mouse commands only) |
-| `position_captured` | bool | Whether position was successfully captured |
+| `mouse_x` | int32 | Final cursor X coordinate — **only meaningful when `position_captured` is true** |
+| `mouse_y` | int32 | Final cursor Y coordinate — **only meaningful when `position_captured` is true** |
+| `position_captured` | bool | Whether the coordinate was read back and matched the request. False for keyboard steps and for any mouse step whose position could not be verified; the coordinates are then `(0, 0)`, which is a valid screen position, so this flag is the only valid guard |
 | `is_heartbeat` | bool | True for keep-alive events, false for real commands |
 | `agent_alive` | bool | Always true while the stream is open |
 

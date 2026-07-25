@@ -35,6 +35,155 @@ pub enum Plan {
     },
 }
 
+/// The screen position a command asks the cursor to end at.
+///
+/// The agent reads the cursor back after actuating and reports it as the command's
+/// result. That readback is only trustworthy if something relates it to what was
+/// asked for: a read that races the synthetic event returns the *previous* position,
+/// and a warp that silently fails to take effect returns the position the cursor
+/// never left. Both are reported as authoritative without this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedPos {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// A mouse button press or release, for tracking buttons left held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+impl MouseButton {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MouseButton::Left => "left",
+            MouseButton::Middle => "middle",
+            MouseButton::Right => "right",
+        }
+    }
+}
+
+/// `true` = the button goes down and stays down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ButtonTransition {
+    pub button: MouseButton,
+    pub down: bool,
+}
+
+/// Coordinates parsed out of a `<prefix>:<x>,<y>` cliclick token.
+fn cliclick_token_pos(token: &str) -> Option<ExpectedPos> {
+    let (prefix, value) = token.split_once(':')?;
+    // `p:` queries the position rather than moving to it, so it predicts nothing.
+    if !matches!(prefix, "c" | "rc" | "dc" | "tc" | "mc" | "dd" | "du" | "m") {
+        return None;
+    }
+    let (x, y) = value.split_once(',')?;
+    Some(ExpectedPos {
+        x: x.parse().ok()?,
+        y: y.parse().ok()?,
+    })
+}
+
+impl Plan {
+    /// Where this command should leave the cursor, when it says.
+    ///
+    /// `None` for actions that operate wherever the cursor already is (`here …`,
+    /// `c:.`) and for actions that do not move it — those keep a plain readback,
+    /// since there is nothing to check it against.
+    ///
+    /// Reads only tokens the grammar above has already accepted, so it cannot
+    /// disagree with validation about what a token means.
+    pub fn expected_pos(&self) -> Option<ExpectedPos> {
+        match self {
+            // Windows carries the coordinate in the watcher-file content
+            // ("1022 343 left"), not in argv.
+            Plan::Write { path, content } => {
+                if !path.eq_ignore_ascii_case(r"C:\mouse_cmd.txt") {
+                    return None;
+                }
+                let mut tokens = content.split_whitespace();
+                let x: i32 = tokens.next()?.parse().ok()?;
+                let y: i32 = tokens.next()?.parse().ok()?;
+                Some(ExpectedPos { x, y })
+            }
+            Plan::Run { bin, args } => match bin {
+                // The last `mousemove X Y` wins, so "mousemove X Y click 1" predicts
+                // the click point.
+                Bin::Xdotool => args
+                    .windows(3)
+                    .rev()
+                    .find(|w| w[0] == "mousemove")
+                    .and_then(|w| {
+                        Some(ExpectedPos {
+                            x: w[1].parse().ok()?,
+                            y: w[2].parse().ok()?,
+                        })
+                    }),
+                // The last positional token wins, so a drag predicts its destination.
+                Bin::Cliclick => args.iter().rev().find_map(|t| cliclick_token_pos(t)),
+                // Keyboard only.
+                Bin::Osascript => None,
+            },
+            // The focus click is the only pointer movement in a scroll.
+            Plan::Scroll { click, .. } => cliclick_token_pos(click),
+        }
+    }
+
+    /// The button this command presses or releases, if any.
+    ///
+    /// Derived from the validated argv rather than the caller-supplied
+    /// `human_command`: the tracker drives an automatic release at shutdown, so it
+    /// must follow what was actually executed, not what a client said it was.
+    pub fn button_transition(&self) -> Option<ButtonTransition> {
+        match self {
+            Plan::Write { path, content } => {
+                if !path.eq_ignore_ascii_case(r"C:\mouse_cmd.txt") {
+                    return None;
+                }
+                // The AutoHotkey watcher only drives the left button.
+                let action = content.split_whitespace().last()?;
+                match action {
+                    "hold" => Some(ButtonTransition { button: MouseButton::Left, down: true }),
+                    "release" => Some(ButtonTransition { button: MouseButton::Left, down: false }),
+                    _ => None,
+                }
+            }
+            // The LAST transition in the command wins. A drag presses and releases
+            // within one argv (`dd:… m:… du:…`); taking the first would leave the
+            // tracker believing a button is down, which would produce a spurious
+            // console warning and, worse, a spurious uncommanded release at shutdown.
+            Plan::Run { bin, args } => match bin {
+                Bin::Xdotool => {
+                    let idx = args.iter().rposition(|a| a == "mousedown" || a == "mouseup")?;
+                    let down = args[idx] == "mousedown";
+                    // xdotool button numbers: 1 left, 2 middle, 3 right.
+                    let button = match args.get(idx + 1).map(|s| s.as_str()) {
+                        Some("1") => MouseButton::Left,
+                        Some("2") => MouseButton::Middle,
+                        Some("3") => MouseButton::Right,
+                        _ => return None,
+                    };
+                    Some(ButtonTransition { button, down })
+                }
+                // cliclick dd:/du: drive the left button only.
+                Bin::Cliclick => args.iter().rev().find_map(|t| {
+                    let prefix = t.split_once(':')?.0;
+                    match prefix {
+                        "dd" => Some(ButtonTransition { button: MouseButton::Left, down: true }),
+                        "du" => Some(ButtonTransition { button: MouseButton::Left, down: false }),
+                        _ => None,
+                    }
+                }),
+                Bin::Osascript => None,
+            },
+            Plan::Scroll { .. } => None,
+        }
+    }
+}
+
 const ALLOWED_WRITE_PATHS: &[&str] = &[r"C:\keyboard_cmd.txt", r"C:\mouse_cmd.txt"];
 
 /// AppleScript prefix shared by both accepted osascript templates.
@@ -356,6 +505,148 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    fn pos_of(parts: &[&str]) -> Option<ExpectedPos> {
+        validate(&argv(parts)).expect("should validate").expected_pos()
+    }
+
+    fn button_of(parts: &[&str]) -> Option<ButtonTransition> {
+        validate(&argv(parts))
+            .expect("should validate")
+            .button_transition()
+    }
+
+    // ---- expected end position ---------------------------------------------
+    // The agent compares its cursor readback against this. Getting it wrong in
+    // either direction is costly: too permissive and a stale read is reported as
+    // real (the bug), too strict and correct commands report no position at all.
+
+    #[test]
+    fn expected_pos_reads_the_requested_coordinate() {
+        // Linux: the controller emits mousemove alone, or chained with a click.
+        assert_eq!(pos_of(&["xdotool", "mousemove", "960", "540"]),
+                   Some(ExpectedPos { x: 960, y: 540 }));
+        assert_eq!(pos_of(&["xdotool", "mousemove", "960", "540", "click", "1"]),
+                   Some(ExpectedPos { x: 960, y: 540 }));
+        // macOS pointer actions.
+        assert_eq!(pos_of(&["cliclick", "c:960,540"]), Some(ExpectedPos { x: 960, y: 540 }));
+        assert_eq!(pos_of(&["cliclick", "m:12,34"]), Some(ExpectedPos { x: 12, y: 34 }));
+        assert_eq!(pos_of(&["cliclick", "rc:-5,-9"]), Some(ExpectedPos { x: -5, y: -9 }));
+        // Scroll: the focus click is the only movement.
+        assert_eq!(pos_of(&["__scroll__", "c:400,300", "125", "5"]),
+                   Some(ExpectedPos { x: 400, y: 300 }));
+        // Windows carries the coordinate in the watcher-file content.
+        assert_eq!(pos_of(&["__write__", r"C:\mouse_cmd.txt", "1022 343 left"]),
+                   Some(ExpectedPos { x: 1022, y: 343 }));
+    }
+
+    #[test]
+    fn drag_predicts_its_destination() {
+        // The last positional token wins, so the readback is checked against where
+        // the drag ended rather than where it started.
+        assert_eq!(
+            pos_of(&["cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700"]),
+            Some(ExpectedPos { x: 900, y: 700 })
+        );
+        assert_eq!(
+            pos_of(&[
+                "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
+                "m:700,500", "w:50", "m:900,700", "w:50", "du:900,700",
+            ]),
+            Some(ExpectedPos { x: 900, y: 700 })
+        );
+    }
+
+    #[test]
+    fn commands_that_name_no_coordinate_predict_nothing() {
+        // "here <action>" acts wherever the cursor is; there is nothing to verify
+        // against, so these must keep a plain readback rather than report false.
+        assert_eq!(pos_of(&["cliclick", "c:."]), None);
+        assert_eq!(pos_of(&["cliclick", "dd:."]), None);
+        assert_eq!(pos_of(&["xdotool", "click", "1"]), None);
+        assert_eq!(pos_of(&["xdotool", "click", "--repeat", "2", "1"]), None);
+        assert_eq!(pos_of(&["__scroll__", "c:.", "125", "5"]), None);
+        // A position query reads the cursor, it does not move it.
+        assert_eq!(pos_of(&["cliclick", "p:."]), None);
+        assert_eq!(pos_of(&["xdotool", "getmouselocation", "--shell"]), None);
+        // Keyboard actions never move the pointer.
+        assert_eq!(pos_of(&["xdotool", "key", "ctrl+c"]), None);
+        assert_eq!(
+            pos_of(&["osascript", "-e", "tell application \"System Events\" to key code 36"]),
+            None
+        );
+        // The keyboard watcher file is not a mouse command.
+        assert_eq!(pos_of(&["__write__", r"C:\keyboard_cmd.txt", "type hello"]), None);
+        // Windows mouse content without coordinates ("here left").
+        assert_eq!(pos_of(&["__write__", r"C:\mouse_cmd.txt", "here left"]), None);
+        assert_eq!(pos_of(&["__write__", r"C:\mouse_cmd.txt", "position"]), None);
+    }
+
+    // ---- held-button tracking ----------------------------------------------
+    #[test]
+    fn button_transitions_are_read_from_the_executed_argv() {
+        assert_eq!(
+            button_of(&["cliclick", "dd:900,700"]),
+            Some(ButtonTransition { button: MouseButton::Left, down: true })
+        );
+        assert_eq!(
+            button_of(&["cliclick", "du:900,700"]),
+            Some(ButtonTransition { button: MouseButton::Left, down: false })
+        );
+        assert_eq!(
+            button_of(&["xdotool", "mousemove", "9", "9", "mousedown", "1"]),
+            Some(ButtonTransition { button: MouseButton::Left, down: true })
+        );
+        assert_eq!(
+            button_of(&["xdotool", "mouseup", "3"]),
+            Some(ButtonTransition { button: MouseButton::Right, down: false })
+        );
+        assert_eq!(
+            button_of(&["__write__", r"C:\mouse_cmd.txt", "900 700 hold"]),
+            Some(ButtonTransition { button: MouseButton::Left, down: true })
+        );
+        assert_eq!(
+            button_of(&["__write__", r"C:\mouse_cmd.txt", "900 700 release"]),
+            Some(ButtonTransition { button: MouseButton::Left, down: false })
+        );
+    }
+
+    #[test]
+    fn a_drag_does_not_leave_a_button_held() {
+        // A drag presses and releases inside one argv. Reading the first transition
+        // would record a hold that never existed, and the agent would then issue an
+        // uncommanded release at shutdown for a button already up.
+        for drag in [
+            vec!["cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700"],
+            vec![
+                "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
+                "m:900,700", "w:50", "du:900,700",
+            ],
+            vec!["xdotool", "mousemove", "1", "1", "mousedown", "1",
+                 "mousemove", "9", "9", "mouseup", "1"],
+        ] {
+            assert_eq!(
+                button_of(&drag),
+                Some(ButtonTransition { button: MouseButton::Left, down: false }),
+                "{:?} ends with the button up",
+                drag,
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_actions_hold_no_button() {
+        for case in [
+            vec!["cliclick", "c:960,540"],
+            vec!["xdotool", "mousemove", "960", "540", "click", "1"],
+            vec!["xdotool", "key", "ctrl+c"],
+            vec!["__write__", r"C:\keyboard_cmd.txt", "type hi"],
+            vec!["__write__", r"C:\mouse_cmd.txt", "960 540 left"],
+            vec!["__scroll__", "c:400,300", "125", "5"],
+        ] {
+            assert_eq!(button_of(&case), None, "{:?} should hold no button", case);
+        }
+    }
+
     // ---- the escapes that motivated this module ----------------------------
 
     #[test]
@@ -539,6 +830,48 @@ mod tests {
         ] {
             let case = argv(&["osascript", "-e", body]);
             assert!(validate(&case).is_ok(), "should accept {:?}", body);
+        }
+    }
+
+    #[test]
+    fn key_code_reroute_and_passthrough_are_accepted() {
+        // Emitted by macos_actuation.py for modified digits/punctuation (⇧⌘4 and
+        // friends, which cliclick's t: could never trigger) and for the {code:N}
+        // passthrough. These must validate or the fix cannot reach the guest.
+        for body in [
+            // press #+4 / #+3 / #+5 — screenshot shortcuts
+            "tell application \"System Events\" to key code 21 using {command down, shift down}",
+            "tell application \"System Events\" to key code 20 using {command down, shift down}",
+            "tell application \"System Events\" to key code 23 using {command down, shift down}",
+            // press #- / #, — unshifted punctuation
+            "tell application \"System Events\" to key code 27 using {command down}",
+            "tell application \"System Events\" to key code 43 using {command down}",
+            // press {code:N} passthrough, bare and modified, at both bounds
+            "tell application \"System Events\" to key code 0",
+            "tell application \"System Events\" to key code 127",
+            "tell application \"System Events\" to key code 21 using {control down, option down, shift down}",
+        ] {
+            let case = argv(&["osascript", "-e", body]);
+            assert!(validate(&case).is_ok(), "should accept {:?}", body);
+        }
+    }
+
+    #[test]
+    fn drag_token_sequences_are_accepted() {
+        // The dwell/waypoint drag forms expand to a longer cliclick token run than
+        // the original fixed `dd w m w du`. The grammar has to accept the whole run.
+        for case in [
+            // 100 100 drag 900 700
+            argv(&["cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700"]),
+            // 100 100 drag 900 700 dwell 150
+            argv(&["cliclick", "dd:100,100", "w:150", "m:900,700", "w:150", "du:900,700"]),
+            // 100 100 drag via 400 300 via 700 500 to 900 700
+            argv(&[
+                "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
+                "m:700,500", "w:50", "m:900,700", "w:50", "du:900,700",
+            ]),
+        ] {
+            assert!(validate(&case).is_ok(), "should accept {:?}", case);
         }
     }
 

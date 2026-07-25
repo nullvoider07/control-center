@@ -4,6 +4,8 @@ import re
 import os
 from typing import Tuple, Optional, List
 
+from . import command_hints
+
 # LinuxActuation class definition
 class LinuxActuation:
     """Linux actuation controller with position tracking for all mouse actions"""
@@ -53,15 +55,52 @@ class LinuxActuation:
         '{ScrollLock}': 'Scroll_Lock',
         '{PrintScreen}': 'Print',
         '{Pause}': 'Pause',
+        # Explicit name for the plus key. A bare '+' in a press command is always
+        # read as the Shift modifier, so "^+" is Ctrl+Shift and Ctrl+Plus must be
+        # written "^{Plus}".
+        '{Plus}': 'plus',
     }
-    
+
+    # Punctuation → X keysym name.
+    #
+    # xdotool resolves key specs through keysym names, not characters: "ctrl+minus"
+    # works, "ctrl+-" does not. The two failure modes are both bad — '-', '[', '.'
+    # abort the whole sequence with "Invalid key sequence", while ',', '/', '=', ';'
+    # and friends exit 0 after logging "No such key name" and silently drop the
+    # target, delivering a bare modifier press that is reported as a success.
+    # Mapping the target here is what makes Ctrl+Minus, Ctrl+Comma, Ctrl+Slash and
+    # the bracket/indent shortcuts work at all.
+    #
+    # Shifted characters are included: xdotool applies Shift itself when the keysym
+    # is only reachable that way (e.g. "ctrl+plus" arrives as Ctrl+Shift+plus).
+    PUNCT_KEYSYM_MAP = {
+        '-': 'minus', '=': 'equal', ',': 'comma', '.': 'period',
+        '/': 'slash', ';': 'semicolon', "'": 'apostrophe',
+        '[': 'bracketleft', ']': 'bracketright', '\\': 'backslash',
+        '`': 'grave', ' ': 'space',
+        '_': 'underscore', '+': 'plus', '?': 'question', ':': 'colon',
+        '"': 'quotedbl', '~': 'asciitilde', '|': 'bar',
+        '{': 'braceleft', '}': 'braceright', '<': 'less', '>': 'greater',
+        '!': 'exclam', '@': 'at', '#': 'numbersign', '$': 'dollar',
+        '%': 'percent', '^': 'asciicircum', '&': 'ampersand',
+        '*': 'asterisk', '(': 'parenleft', ')': 'parenright',
+    }
+
     # Keyboard indicators (for detection)
     KEYBOARD_INDICATORS = set(SPECIAL_KEYS_MAP.keys())
     
-    def __init__(self, grpc_client):
-        """Initialize controller with gRPC client"""
+    # Class-level default so instances built without __init__ (tests, replay
+    # helpers) still have a defined policy rather than raising on attribute access.
+    strict = True
+
+    def __init__(self, grpc_client, strict: bool = True):
+        """Initialize controller with gRPC client.
+
+        strict: reject commands that match no known verb instead of typing them.
+        """
         self.grpc_client = grpc_client
         self.display = os.environ.get('DISPLAY', ':0')
+        self.strict = strict
     
     # Helper method to format key combinations for display in CLI output
     def _format_press_for_display(self, keys: str) -> str:
@@ -95,6 +134,7 @@ class LinuxActuation:
             '{F1}': 'F1', '{F2}': 'F2', '{F3}': 'F3', '{F4}': 'F4',
             '{F5}': 'F5', '{F6}': 'F6', '{F7}': 'F7', '{F8}': 'F8',
             '{F9}': 'F9', '{F10}': 'F10', '{F11}': 'F11', '{F12}': 'F12',
+            '{Plus}': 'Plus',
         }
         if keys in special_display:
             return special_display[keys]
@@ -124,12 +164,16 @@ class LinuxActuation:
         - Modifier prefixes: ^ (Ctrl), + (Shift), ! (Alt), # (Super)
         - Standalone modifiers: just ^ or # alone
         - Special keys in braces: {Enter}, {Tab}, etc.
-        
+        - Punctuation targets, via PUNCT_KEYSYM_MAP
+
         Examples:
             "#r" → "super+r"
             "#" → "super"  (standalone Super key)
             "^c" → "ctrl+c"
             "^" → "ctrl"  (standalone Ctrl key)
+            "^-" → "ctrl+minus"
+            "^," → "ctrl+comma"
+            "^{Plus}" → "ctrl+plus"
         """
         modifiers = []
         i = 0
@@ -152,7 +196,14 @@ class LinuxActuation:
         # Translate special keys in braces
         for ahk_key, xdo_key in self.SPECIAL_KEYS_MAP.items():
             key_part = key_part.replace(ahk_key, xdo_key)
-        
+
+        # Translate a bare punctuation target to its keysym name. Only a single
+        # character is remapped: brace translation above already yields keysym names,
+        # and a multi-character remainder is either a keysym name or malformed input
+        # that xdotool should reject rather than have guessed at.
+        if len(key_part) == 1 and key_part in self.PUNCT_KEYSYM_MAP:
+            key_part = self.PUNCT_KEYSYM_MAP[key_part]
+
         # Build the xdotool key combination
         if modifiers and key_part:
             # Modifiers + key: e.g., "ctrl+c", "super+r"
@@ -215,7 +266,10 @@ class LinuxActuation:
         if tokens[0] in self.MOUSE_ACTIONS:
             return 'mouse', command
         
-        # Default fallback
+        # Unrecognised. In strict mode this is refused; the legacy behaviour typed it
+        # into whatever had focus and recorded it as a real step (see command_hints).
+        if self.strict:
+            return 'invalid', command
         return 'keyboard', f"type {command}"
     
     # Build xdotool command for mouse actions
@@ -277,6 +331,14 @@ class LinuxActuation:
                 return out(['mousemove', str(x), str(y), 'click', '--repeat', '2', '1'])
             elif action == 'middle':
                 return out(['mousemove', str(x), str(y), 'click', '2'])
+            elif action == 'hold':
+                # Coordinate-based hold/release existed on macOS but not here, so
+                # "900 700 hold" failed to build on Linux while the same line worked
+                # on the guest. The button stays down until a matching release; the
+                # agent tracks it and releases it if the session ends first.
+                return out(['mousemove', str(x), str(y), 'mousedown', '1'])
+            elif action == 'release':
+                return out(['mousemove', str(x), str(y), 'mouseup', '1'])
             elif action == 'drag' and len(parts) >= 5:
                 x2, y2 = int(parts[3]), int(parts[4])
                 return out(['mousemove', str(x), str(y), 'mousedown', '1',
@@ -340,7 +402,8 @@ class LinuxActuation:
         cmd_type, processed_cmd = self.detect_command_type(command)
         
         if cmd_type == 'invalid':
-            print(f"[✗] Invalid command: {command}")
+            print(command_hints.rejection_message(
+                command, self.MOUSE_ACTIONS, self.KEYBOARD_ACTIONS))
             return False
         
         # Build the xdotool command as (argv, human_command)
@@ -367,8 +430,11 @@ class LinuxActuation:
             captured = result.get('position_captured', False)
             position_after = (mx, my) if captured and mx is not None and my is not None else None
         
-        # Handle position query result separately
+        # Handle position query result separately. The warning goes here too because
+        # this branch returns before the shared result-printing block below, and a
+        # status check is exactly when an operator wants to know a button is down.
         if processed_cmd == 'position' and result['success']:
+            command_hints.print_held_button_warnings(result.get('metadata'))
             mx = result.get('mouse_x')
             my = result.get('mouse_y')
             captured = result.get('position_captured', False)
@@ -379,6 +445,9 @@ class LinuxActuation:
         # Display result with position info for mouse actions
         if result['success']:
             ms = result['execution_time_ms']
+            # A button left down turns every later click or move into a drag-select,
+            # and nothing else in the output would say so.
+            command_hints.print_held_button_warnings(result.get('metadata'))
             if cmd_type == 'keyboard':
                 kb_action, _, kb_content = processed_cmd.partition(' ')
                 if kb_action == 'press':
@@ -459,9 +528,9 @@ class LinuxActuation:
             
             if result['success']:
                 success_count += 1
-                print(f"[{i}/{len(commands)}] ✓ {command}")
+                print(f"[{i}/{len(commands)}] ✓ {command_hints.redact(command)}")
             else:
-                print(f"[{i}/{len(commands)}] ✗ {command}: {result['message']}")
+                print(f"[{i}/{len(commands)}] ✗ {command_hints.redact(command)}: {result['message']}")
         
         print(f"\n[✓] Batch complete: {success_count}/{total_count} succeeded")
     

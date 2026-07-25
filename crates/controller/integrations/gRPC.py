@@ -372,6 +372,10 @@ class GRPCClient:
                 'mouse_x': response.mouse_x if response.HasField('mouse_x') else None,
                 'mouse_y': response.mouse_y if response.HasField('mouse_y') else None,
                 'position_captured': response.position_captured if response.HasField('position_captured') else False,
+                # Agent-side ground truth: the executed argv and any mouse button
+                # still held. Carried on the existing metadata map, so surfacing a
+                # held button needs no new RPC and no new scope check.
+                'metadata': dict(response.metadata),
             }
             
             return result
@@ -451,6 +455,10 @@ class GRPCClient:
                     'mouse_x': response.mouse_x if response.HasField('mouse_x') else None,
                     'mouse_y': response.mouse_y if response.HasField('mouse_y') else None,
                     'position_captured': response.position_captured if response.HasField('position_captured') else False,
+                # Agent-side ground truth: the executed argv and any mouse button
+                # still held. Carried on the existing metadata map, so surfacing a
+                # held button needs no new RPC and no new scope check.
+                'metadata': dict(response.metadata),
                 }
                 
         except grpc.RpcError as e:

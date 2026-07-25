@@ -368,10 +368,20 @@ message CommandEvent {
   string error_message = 11;      // Empty string if success=true
   int32 execution_time_ms = 12;
 
-  // Spatial — populated for mouse commands only
+  // Spatial — populated for mouse commands only.
+  //
+  // READ position_captured FIRST. These are non-optional int32, so an uncaptured
+  // position is carried as (0, 0) — which is itself a valid screen coordinate, the
+  // top-left corner. A consumer that reads mouse_x/mouse_y without checking the flag
+  // cannot tell "the cursor was at the origin" from "no position was captured".
+  //
+  // The agent reports position_captured=false whenever the cursor readback does not
+  // match the coordinate the command asked for, rather than emitting a value it
+  // could not verify. Expect false for every keyboard step, and for mouse steps
+  // whose position could not be confirmed.
   int32 mouse_x = 13;
   int32 mouse_y = 14;
-  bool position_captured = 15;    // true if mouse_x/mouse_y are real coordinates
+  bool position_captured = 15;    // true if mouse_x/mouse_y are verified coordinates
 
   // Health
   bool is_heartbeat = 16;         // true = keep-alive ping (every 5s when idle), false = real command

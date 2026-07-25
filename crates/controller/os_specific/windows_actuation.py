@@ -4,6 +4,8 @@ import re
 import time
 from typing import Tuple, Optional, List
 
+from . import command_hints
+
 # Windows actuation class definition
 class WindowsActuation:
     """Windows actuation controller with position tracking for all mouse actions"""
@@ -25,12 +27,25 @@ class WindowsActuation:
         '{Left}', '{Right}', '{Home}', '{End}', '{PgUp}',
         '{PgDn}', '{F1}', '{F2}', '{F3}', '{F4}', '{F5}',
         '{F6}', '{F7}', '{F8}', '{F9}', '{F10}', '{F11}', '{F12}',
-        '{LWin}', '{RWin}'
+        '{LWin}', '{RWin}', '{Plus}'
     }
-    
-    def __init__(self, grpc_client):
-        """Initialize controller with gRPC client"""
+
+    # Brace names that stand for a literal character, spelled as AutoHotkey's Send
+    # expects them. A bare '+' in a press command is always read as the Shift
+    # modifier, so Ctrl+Plus must be written "^{Plus}".
+    BRACE_CHAR_MAP = {'{Plus}': '{+}'}
+
+    # Class-level default so instances built without __init__ (tests, replay
+    # helpers) still have a defined policy rather than raising on attribute access.
+    strict = True
+
+    def __init__(self, grpc_client, strict: bool = True):
+        """Initialize controller with gRPC client.
+
+        strict: reject commands that match no known verb instead of typing them.
+        """
         self.grpc_client = grpc_client
+        self.strict = strict
     
     # Build command to get mouse position using PowerShell
     def _build_position_command(self) -> List[str]:
@@ -80,6 +95,7 @@ class WindowsActuation:
                 argv=self._build_position_command(), human_command='position',
             )
             
+            command_hints.print_held_button_warnings(result.get('metadata'))
             if result['success'] and result.get('position_captured'):
                 mx = result.get('mouse_x')
                 my = result.get('mouse_y')
@@ -159,13 +175,6 @@ class WindowsActuation:
         # e.g., "#r" (Win+R) stays as "#r"
         return command
 
-    # Helper method to escape cmd.exe special characters in keyboard commands
-    def _escape_cmd_special(self, text: str) -> str:
-        """Escape characters cmd.exe intercepts before they reach keyboard_cmd.txt."""
-        for ch in ['<', '>', '|', '&', '"']:
-            text = text.replace(ch, f'^{ch}')
-        return text
-
     def _format_press_for_display(self, keys: str) -> str:
         """
         Convert AHK key notation to a human-readable string for CLI output.
@@ -195,6 +204,7 @@ class WindowsActuation:
             '{F1}': 'F1', '{F2}': 'F2', '{F3}': 'F3', '{F4}': 'F4',
             '{F5}': 'F5', '{F6}': 'F6', '{F7}': 'F7', '{F8}': 'F8',
             '{F9}': 'F9', '{F10}': 'F10', '{F11}': 'F11', '{F12}': 'F12',
+            '{Plus}': 'Plus',
         }
 
         # Whole string is a standalone special key
@@ -226,18 +236,17 @@ class WindowsActuation:
         """
         Convert AHK modifier prefix notation to explicit {Key down}/{Key up} syntax.
 
-        The Rust agent calls ProcessCommand::new("cmd").arg("/c").arg(command),
-        which passes the command as a pre-tokenized argument. Windows CreateProcess
-        quotes it, so cmd.exe never runs its escape-character pass — meaning '^'
-        is never eaten and '^^' never collapses. Therefore '^' must be removed
-        from the echo string for 'press' commands entirely, by converting to
-        explicit AHK down/up syntax that contains no special characters at all.
+        The payload reaches the guest through a direct file write to
+        C:\\keyboard_cmd.txt and is consumed by keyboard_control.ahk's `Send`, so the
+        AHK metacharacters ^ + ! # are live in the key part. Converting the modifier
+        prefix to explicit down/up pairs leaves a key part that Send reads literally.
 
         Examples:
             "^t"        -> "{Ctrl down}t{Ctrl up}"
             "^+{Esc}"   -> "{Ctrl down}{Shift down}{Esc}{Shift up}{Ctrl up}"
             "!{Tab}"    -> "{Alt down}{Tab}{Alt up}"
             "#r"        -> "{LWin down}r{LWin up}"
+            "^{Plus}"   -> "{Ctrl down}{+}{Ctrl up}"
             "{F5}"      -> "{F5}"          (no modifier prefix, unchanged)
             "{LCtrl}"   -> "{LCtrl}"       (already explicit, unchanged)
         """
@@ -256,8 +265,11 @@ class WindowsActuation:
             prefix_up.insert(0, up)  # reverse order: last pressed, first released
             i += 1
         key_part = keys[i:]
+        # Brace names standing for a literal character, spelled the way Send expects.
+        # A bare '+' is always read as the Shift modifier, so Ctrl+Plus is "^{Plus}".
+        key_part = self.BRACE_CHAR_MAP.get(key_part, key_part)
         if not prefix_down:
-            return keys  # no modifier prefix — pass through unchanged
+            return key_part  # no modifier prefix — key part only
         return ''.join(prefix_down) + key_part + ''.join(prefix_up)
 
     # Method to detect command type (mouse/keyboard) with smart parsing
@@ -315,7 +327,10 @@ class WindowsActuation:
         if tokens[0] in self.MOUSE_ACTIONS:
             return 'mouse', command
         
-        # Default: assume it's text to type
+        # Unrecognised. In strict mode this is refused; the legacy behaviour typed it
+        # into whatever had focus and recorded it as a real step (see command_hints).
+        if self.strict:
+            return 'invalid', command
         return 'keyboard', f"type {command}"
     
     # Main method to execute command with position tracking for mouse actions
@@ -330,7 +345,8 @@ class WindowsActuation:
         cmd_type, processed_cmd = self.detect_command_type(command)
         
         if cmd_type == 'invalid':
-            print(f"[✗] Invalid command: {command}")
+            print(command_hints.rejection_message(
+                command, self.MOUSE_ACTIONS, self.KEYBOARD_ACTIONS))
             return False
         
         # Handle position command
@@ -357,11 +373,11 @@ class WindowsActuation:
                 kb_content = self._convert_modifiers_to_explicit(kb_content)
                 file_payload = f'press {kb_content}'
             else:
-                if '^' in kb_content:
-                    safe = kb_content.replace('^', '{U+005E}')
-                    file_payload = f'press {safe}'
-                else:
-                    file_payload = f'type {kb_content}'
+                # Typed text stays on the 'type' action, which keyboard_control.ahk
+                # dispatches to SendText — literal, with no metacharacter pass. It must
+                # never be rewritten to 'press': that routes the payload through Send,
+                # where ! + # { } become live, so "type a^b!c" would press Alt+C.
+                file_payload = f'type {kb_content}'
 
             # Write the AHK watcher file directly (agent uses fs, no cmd /c echo) — this
             # removes the `> file` / echo shell-injection surface and preserves special
@@ -387,6 +403,9 @@ class WindowsActuation:
         # Display results
         if result['success']:
             ms = result['execution_time_ms']
+            # A button left down turns every later click or move into a drag-select,
+            # and nothing else in the output would say so.
+            command_hints.print_held_button_warnings(result.get('metadata'))
             if cmd_type == 'keyboard':
                 if kb_action == 'press':
                     human = self._format_press_for_display(original_kb_content)
@@ -471,11 +490,7 @@ class WindowsActuation:
                             kb_content = self._convert_modifiers_to_explicit(kb_content)
                             file_payload = f'press {kb_content}'
                         else:
-                            if '^' in kb_content:
-                                safe = kb_content.replace('^', '{U+005E}')
-                                file_payload = f'press {safe}'
-                            else:
-                                file_payload = f'type {kb_content}'
+                            file_payload = f'type {kb_content}'
                         argv = ['__write__', r'C:\keyboard_cmd.txt', file_payload]
                     else:
                         argv = ['__write__', r'C:\mouse_cmd.txt', formatted_cmd]
@@ -491,9 +506,9 @@ class WindowsActuation:
             
             if result['success']:
                 success_count += 1
-                print(f"[{i}/{total}] ✓ {original_cmd}")
+                print(f"[{i}/{total}] ✓ {command_hints.redact(original_cmd)}")
             else:
-                print(f"[{i}/{total}] ✗ {original_cmd}: {result['message']}")
+                print(f"[{i}/{total}] ✗ {command_hints.redact(original_cmd)}: {result['message']}")
             
             # Small delay between commands
             if i < total:

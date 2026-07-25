@@ -3,6 +3,9 @@
 use tonic::{Request, Response, Status};
 use tracing::{info, warn, error, debug};
 use std::process::Command as ProcessCommand;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 #[cfg(any(target_os = "linux"))]
 use regex::Regex;
 
@@ -31,12 +34,36 @@ use proto::{
     OsType,
 };
 
+/// Re-reads allowed when the cursor readback disagrees with the requested position,
+/// and the pause between them. Bounded because the agent serves one command at a
+/// time — an unbounded settle loop would stall all actuation on a display where the
+/// cursor never reaches the requested point.
+const MAX_POSITION_REREADS: u32 = 3;
+const POSITION_REREAD_INTERVAL_MS: u64 = 50;
+
 // Mouse position data structure
 #[derive(Debug, Clone)]
 struct MousePosition {
     x: i32,
     y: i32,
     captured: bool,
+}
+
+/// A mouse button the agent has pressed and not yet released.
+///
+/// `X Y hold` issues a button-down with no timeout. Without this, an unmatched hold
+/// leaves the button physically down: every later click or move is interpreted as a
+/// drag-select, and the console reports plain success throughout.
+#[derive(Debug, Clone)]
+struct HeldButton {
+    /// Where the button went down, when the command named a coordinate.
+    ///
+    /// `here hold` names none. Substituting (0, 0) for "unknown" would make the
+    /// automatic release move the cursor to the top-left corner first — dragging
+    /// whatever is grabbed to the origin on the way out, which is worse than the
+    /// stuck button it is meant to fix. Unknown releases in place instead.
+    at: Option<(i32, i32)>,
+    since: std::time::Instant,
 }
 
 // Detailed action information
@@ -54,6 +81,10 @@ pub struct AgentServiceImpl {
     capabilities: Vec<String>,
     #[cfg(target_os = "macos")]
     cliclick_path: Option<String>,
+    /// Buttons pressed and not yet released, keyed by button name. Populated from
+    /// the validated argv, never from the caller-supplied human_command, because it
+    /// drives an automatic release at shutdown.
+    held_buttons: Arc<RwLock<HashMap<String, HeldButton>>>,
 }
 
 /// Core implementation of the AgentService
@@ -73,6 +104,7 @@ impl AgentServiceImpl {
             capabilities,
             #[cfg(target_os = "macos")]
             cliclick_path: Self::resolve_cliclick_path(),
+            held_buttons: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -291,6 +323,14 @@ impl AgentServiceImpl {
         if !key_part.is_empty() {
             if let Some(name) = special_name(key_part) {
                 parts.push(name.to_string());
+            } else if let Some(code) = key_part
+                .strip_prefix("{code:")
+                .and_then(|c| c.strip_suffix('}'))
+                .filter(|c| c.chars().all(|ch| ch.is_ascii_digit()) && !c.is_empty())
+            {
+                // Keycode passthrough. Rendering the raw "code:21" here would put it
+                // in the recorded step text, so give it a readable name.
+                parts.push(format!("Key {}", code));
             } else if key_part.starts_with('{') && key_part.ends_with('}') {
                 parts.push(key_part[1..key_part.len() - 1].to_string());
             } else if key_part.chars().count() == 1 {
@@ -511,24 +551,114 @@ impl AgentServiceImpl {
         }
     }
     
-    // Capture mouse position after a successful mouse action (shared by the argv
-    // and legacy execution paths).
-    async fn capture_position_if_mouse(&self, action: &ActionDetails, ok: bool) -> MousePosition {
-        if action.is_mouse && ok {
-            #[cfg(target_os = "windows")]
-            {
-                let wait_ms = if action.is_here_command { 10 } else { 20 };
-                tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
-                self.capture_mouse_position().await
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                self.capture_mouse_position().await
-            }
-        } else {
-            MousePosition { x: 0, y: 0, captured: false }
+    // Capture mouse position after a successful mouse action, verifying it against
+    // the position the command asked for.
+    //
+    // A bare readback is not evidence. It can return the position from before the
+    // command (the read raced the synthetic event) or the position the cursor never
+    // left (the warp silently failed — reproducible on an X display with no mapped
+    // window, where xdotool exits 0 and moves nothing). Either way the old code
+    // reported `captured: true`, and that one value is both the operator's
+    // step-gating signal and the coordinate stored in the training corpus.
+    //
+    // So: read, compare against the request, and re-read a bounded number of times
+    // before giving up. Never report a coordinate that disagrees with the command —
+    // `position_captured: false` is the honest answer and the schema already carries
+    // it. The loop is capped because the agent serves one command at a time.
+    async fn capture_position_if_mouse(
+        &self,
+        action: &ActionDetails,
+        ok: bool,
+        expected: Option<argv_policy::ExpectedPos>,
+        before: Option<MousePosition>,
+    ) -> MousePosition {
+        if !(action.is_mouse && ok) {
+            return MousePosition { x: 0, y: 0, captured: false };
         }
+
+        #[cfg(target_os = "windows")]
+        let settle_ms = if action.is_here_command { 10 } else { 20 };
+        #[cfg(not(target_os = "windows"))]
+        let settle_ms = 50;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(settle_ms)).await;
+        let mut position = self.capture_mouse_position().await;
+
+        // Commands that name no coordinate — "here left", "here hold", "position" —
+        // do not move the cursor. That invariant is what they can be checked against:
+        // a read taken before the command and one taken after must agree. If they do
+        // not, something moved the cursor across the sample and neither value
+        // describes the action, so report nothing rather than pick one.
+        //
+        // Without this these commands kept the old behaviour of publishing whatever
+        // the readback returned as `captured: true` — the same unverified report the
+        // coordinate path was fixed for, and `position` is exactly the command an
+        // operator runs to obtain coordinates for the next step.
+        let Some(want) = expected else {
+            let Some(before) = before.filter(|p| p.captured) else {
+                // No usable pre-read (the readback tool itself is failing). Nothing
+                // to verify against, so do not claim a capture.
+                return MousePosition { x: 0, y: 0, captured: false };
+            };
+            for _ in 0..MAX_POSITION_REREADS {
+                if position.captured && position.x == before.x && position.y == before.y {
+                    return position;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    POSITION_REREAD_INTERVAL_MS,
+                ))
+                .await;
+                position = self.capture_mouse_position().await;
+            }
+            if position.captured && position.x == before.x && position.y == before.y {
+                return position;
+            }
+            warn!(
+                "Cursor moved across a command that should not move it ({} at ({}, {}) \
+                 before, {} after). Reporting position_captured=false.",
+                action.action_type,
+                before.x,
+                before.y,
+                if position.captured {
+                    format!("({}, {})", position.x, position.y)
+                } else {
+                    "no read".to_string()
+                }
+            );
+            return MousePosition { x: 0, y: 0, captured: false };
+        };
+
+        for attempt in 0..MAX_POSITION_REREADS {
+            if position.captured && position.x == want.x && position.y == want.y {
+                return position;
+            }
+            debug!(
+                "Position readback {:?} != requested ({}, {}), re-read {}/{}",
+                (position.x, position.y), want.x, want.y, attempt + 1, MAX_POSITION_REREADS
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                POSITION_REREAD_INTERVAL_MS,
+            ))
+            .await;
+            position = self.capture_mouse_position().await;
+        }
+
+        if position.captured && position.x == want.x && position.y == want.y {
+            return position;
+        }
+
+        warn!(
+            "Position readback did not settle: requested ({}, {}), last read {}. \
+             Reporting position_captured=false rather than a coordinate that was not verified.",
+            want.x,
+            want.y,
+            if position.captured {
+                format!("({}, {})", position.x, position.y)
+            } else {
+                "none".to_string()
+            }
+        );
+        MousePosition { x: 0, y: 0, captured: false }
     }
 
     // Execute a structured argv command directly — no shell, so typed text can never
@@ -540,20 +670,170 @@ impl AgentServiceImpl {
         human_command: &str,
     ) -> (Result<String, String>, MousePosition, ActionDetails) {
         let action = self.parse_action_details(human_command);
-        let result = self.run_argv(argv).await;
-        let position = self.capture_position_if_mouse(&action, result.is_ok()).await;
+
+        // Validate once and keep the plan: the expected end position and any button
+        // transition are read from it, so neither can disagree with the grammar
+        // about what a token meant.
+        let plan = match argv_policy::validate(argv) {
+            Ok(plan) => plan,
+            Err(e) => {
+                warn!("Blocked command {:?}: {}", argv, e);
+                return (
+                    Err(e),
+                    MousePosition { x: 0, y: 0, captured: false },
+                    action,
+                );
+            }
+        };
+        let expected = plan.expected_pos();
+        let transition = plan.button_transition();
+
+        // A command that names no coordinate is verified against the cursor not
+        // having moved, so the "before" sample has to be taken before it runs.
+        let before = if action.is_mouse && expected.is_none() {
+            Some(self.capture_mouse_position().await)
+        } else {
+            None
+        };
+
+        let result = self.run_plan(plan).await;
+        if result.is_ok() {
+            self.record_button_transition(transition, expected).await;
+        }
+        let position = self
+            .capture_position_if_mouse(&action, result.is_ok(), expected, before)
+            .await;
         (result, position, action)
+    }
+
+    // Update the held-button tracker after a command executed successfully.
+    async fn record_button_transition(
+        &self,
+        transition: Option<argv_policy::ButtonTransition>,
+        at: Option<argv_policy::ExpectedPos>,
+    ) {
+        let Some(transition) = transition else { return };
+        let name = transition.button.as_str().to_string();
+        let mut held = self.held_buttons.write().await;
+        if transition.down {
+            let at = at.map(|p| (p.x, p.y));
+            held.insert(
+                name.clone(),
+                HeldButton { at, since: std::time::Instant::now() },
+            );
+            debug!("Tracking held {} button at {:?}", name, at);
+        } else {
+            held.remove(&name);
+        }
+    }
+
+    // Render outstanding holds for the response metadata: "left@900,700:7".
+    async fn held_buttons_summary(&self) -> String {
+        let held = self.held_buttons.read().await;
+        let mut entries: Vec<String> = held
+            .iter()
+            .map(|(name, b)| {
+                let at = match b.at {
+                    Some((x, y)) => format!("{},{}", x, y),
+                    None => "?".to_string(),
+                };
+                format!("{}@{}:{}", name, at, b.since.elapsed().as_secs())
+            })
+            .collect();
+        entries.sort();
+        entries.join(";")
+    }
+
+    // The argv that releases a button on this platform. Goes back through the
+    // grammar like any other action, so the shutdown path is not a way around it.
+    //
+    // With no recorded coordinate the release happens where the cursor already is.
+    // Both the macOS and Windows forms move before releasing, so substituting an
+    // origin would drag whatever is held to the corner.
+    fn release_argv(button: argv_policy::MouseButton, at: Option<(i32, i32)>) -> Vec<String> {
+        if cfg!(target_os = "macos") {
+            let target = match at {
+                Some((x, y)) => format!("du:{},{}", x, y),
+                None => "du:.".to_string(),
+            };
+            vec!["cliclick".to_string(), target]
+        } else if cfg!(target_os = "windows") {
+            let content = match at {
+                Some((x, y)) => format!("{} {} release", x, y),
+                None => "here release".to_string(),
+            };
+            vec![
+                "__write__".to_string(),
+                r"C:\mouse_cmd.txt".to_string(),
+                content,
+            ]
+        } else {
+            let n = match button {
+                argv_policy::MouseButton::Left => "1",
+                argv_policy::MouseButton::Middle => "2",
+                argv_policy::MouseButton::Right => "3",
+            };
+            vec!["xdotool".to_string(), "mouseup".to_string(), n.to_string()]
+        }
+    }
+
+    // Release every tracked button. Called on every agent-exit path.
+    //
+    // This is the one place the agent actuates without being asked. It releases only
+    // buttons it recorded going down, and it cannot be recorded as a step: by the
+    // time it runs the command stream is closed. That is a deliberate trade — a
+    // button left physically down corrupts every step of whatever runs next, while
+    // an unrecorded release happens after the session has already ended — so it is
+    // logged loudly instead.
+    async fn release_held_buttons(&self) {
+        let outstanding: Vec<(String, HeldButton)> = {
+            let held = self.held_buttons.read().await;
+            held.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        if outstanding.is_empty() {
+            return;
+        }
+
+        for (name, button) in outstanding {
+            let kind = match name.as_str() {
+                "middle" => argv_policy::MouseButton::Middle,
+                "right" => argv_policy::MouseButton::Right,
+                _ => argv_policy::MouseButton::Left,
+            };
+            let argv = Self::release_argv(kind, button.at);
+            let outcome = self.run_argv(&argv).await;
+            warn!(
+                "Auto-released {} button held at {} for {}s during shutdown \
+                 ({}). This release is NOT recorded — the command stream is closed.",
+                name,
+                match button.at {
+                    Some((x, y)) => format!("({}, {})", x, y),
+                    None => "the current position".to_string(),
+                },
+                button.since.elapsed().as_secs(),
+                match &outcome {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => format!("failed: {}", e),
+                }
+            );
+        }
+        self.held_buttons.write().await.clear();
     }
 
     // Run an argv vector directly (no shell). The vector is first checked against the
     // actuation grammar in argv_policy, which constrains sub-commands and arguments —
     // an argv[0] allow-list alone would still permit `xdotool exec` and free-form
-    // `osascript -e`.
+    // `osascript -e`. Used by paths that have not already validated, such as the
+    // shutdown auto-release.
     async fn run_argv(&self, argv: &[String]) -> Result<String, String> {
         let plan = argv_policy::validate(argv).inspect_err(|e| {
             warn!("Blocked command {:?}: {}", argv, e);
         })?;
+        self.run_plan(plan).await
+    }
 
+    // Execute an already-validated plan.
+    async fn run_plan(&self, plan: argv_policy::Plan) -> Result<String, String> {
         match plan {
             // Windows AutoHotkey file-drop: write content directly, no `cmd /c echo`.
             argv_policy::Plan::Write { path, content } => {
@@ -624,13 +904,23 @@ impl AgentServiceImpl {
             format!("Execution error: {}", e)
         })?;
 
-        if output.status.success() {
-            Ok(())
-        } else {
-            let err = String::from_utf8_lossy(&output.stderr).to_string();
-            error!("Command failed: {}", err);
-            Err(err)
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if !output.status.success() {
+            error!("Command failed: {}", stderr);
+            return Err(stderr);
         }
+
+        // xdotool exits 0 after dropping a key it cannot resolve, logging only
+        // "No such key name '<x>'. Ignoring it." on stderr. The remaining modifiers
+        // are still delivered, so the caller sees a successful command that did
+        // something other than what was asked. Treat the warning as a failure.
+        if stderr.contains("No such key name") {
+            error!("Command dropped a key: {}", stderr);
+            return Err(stderr.trim().to_string());
+        }
+
+        Ok(())
     }
 }
 
@@ -812,17 +1102,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Agent running. Press Ctrl+C to stop.");
             info!("Listening for commands from server...");
             info!("Full tracking enabled (commands, uptime, execution times)");
-            
+
+            // No button state carries into a freshly registered session. Redundant in
+            // a process that connects once, but it keeps the invariant explicit if a
+            // reconnect loop is ever added around this block.
+            service.held_buttons.write().await.clear();
+
+
+            // Both interactive (SIGINT) and supervised (SIGTERM) shutdowns have to
+            // reach the cleanup below. SIGTERM is what a service manager, a container
+            // stop and `Popen.terminate()` send; leaving it to the default handler
+            // killed the process outright, so a button held at that moment stayed
+            // physically down.
+            let mut shutdown_signal = Box::pin(async {
+                #[cfg(unix)]
+                {
+                    match tokio::signal::unix::signal(
+                        tokio::signal::unix::SignalKind::terminate(),
+                    ) {
+                        Ok(mut sigterm) => tokio::select! {
+                            _ = tokio::signal::ctrl_c() => "SIGINT",
+                            _ = sigterm.recv() => "SIGTERM",
+                        },
+                        Err(e) => {
+                            warn!("Could not install SIGTERM handler: {}", e);
+                            let _ = tokio::signal::ctrl_c().await;
+                            "SIGINT"
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                    "Ctrl+C"
+                }
+            });
+
             // Main command loop - listen for messages from server
             loop {
                 tokio::select! {
-                    // Handle Ctrl+C
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Received Ctrl+C, shutting down...");
-                        
+                    // Handle an interactive or supervised shutdown
+                    signal = &mut shutdown_signal => {
+                        info!("Received {}, shutting down...", signal);
+
                         // Send disconnect message
                         let disconnect = proto::DisconnectNotice {
-                            reason: "User requested shutdown".to_string(),
+                            reason: format!("Agent received {}", signal),
                             timestamp: chrono::Utc::now().timestamp(),
                             graceful: true,
                         };
@@ -884,6 +1209,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         executed_meta.insert(
                                             "argv".to_string(),
                                             cmd_req.argv.join("\u{1f}"),
+                                        );
+                                        // Buttons still down, so the console can warn
+                                        // rather than let a hold go unnoticed. Uses the
+                                        // existing metadata map — no new RPC, and so no
+                                        // new authorisation decision.
+                                        executed_meta.insert(
+                                            "held_buttons".to_string(),
+                                            service.held_buttons_summary().await,
                                         );
 
                                         // Build response and update counters
@@ -987,6 +1320,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             
+            // Every exit path from the command loop lands here — Ctrl+C, a server
+            // disconnect notice, the stream closing, and a stream error — so this is
+            // the single place a button left down can be cleaned up.
+            service.release_held_buttons().await;
+
             // Print final statistics on shutdown
             let final_executed = *commands_executed.read().await;
             let final_failed = *commands_failed.read().await;

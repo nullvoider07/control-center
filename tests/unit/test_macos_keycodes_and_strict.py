@@ -1,0 +1,286 @@
+"""Unit tests for the macOS keycode reroute, strict mode, keycode passthrough and drag.
+
+Each group guards a defect that reported success while doing the wrong thing — the
+failure class that costs a corpus take, because the on-screen artifact and every
+self-reporting signal look fine and only the stored record or a missing screenshot
+gives it away.
+"""
+import pytest
+
+from controller.os_specific import command_hints
+from controller.os_specific.linux_actuation import LinuxActuation
+from controller.os_specific.macos_actuation import MacOSActuation
+from controller.os_specific.windows_actuation import WindowsActuation
+
+
+def macos(strict: bool = True):
+    ma = MacOSActuation.__new__(MacOSActuation)
+    ma.cliclick_path = "cliclick"
+    ma.strict = strict
+    return ma
+
+
+def script(command: str):
+    """Return the single AppleScript body a press command produces."""
+    built = macos().parse_keyboard_command(command)
+    assert built is not None, f"{command!r} was rejected"
+    argv, _ = built
+    assert argv[0] == "osascript" and argv[1] == "-e" and len(argv) == 3, argv
+    return argv[2]
+
+
+PREFIX = 'tell application "System Events" to '
+
+
+# ---- Task 2: modified digits and punctuation need a keycode ----------------
+# cliclick's t: synthesizes a character event; macOS hotkeys match on keycode +
+# modifier flags, so ⇧⌘4 never fired and reported success with no screenshot taken.
+@pytest.mark.parametrize("keys,expected", [
+    ("#+4", "key code 21 using {command down, shift down}"),   # region capture
+    ("#+3", "key code 20 using {command down, shift down}"),   # full screen
+    ("#+5", "key code 23 using {command down, shift down}"),   # screenshot toolbar
+    ("#+1", "key code 18 using {command down, shift down}"),
+    ("#+0", "key code 29 using {command down, shift down}"),
+    ("#-", "key code 27 using {command down}"),
+    ("#,", "key code 43 using {command down}"),
+    ("#/", "key code 44 using {command down}"),
+    ("#[", "key code 33 using {command down}"),
+    ("^`", "key code 50 using {control down}"),
+])
+def test_modified_digit_and_punctuation_use_key_codes(keys, expected):
+    assert script(f"press {keys}") == PREFIX + expected
+
+
+def test_shifted_glyph_supplies_its_own_shift():
+    """'$' is Shift+4. Writing it directly must still hold Shift."""
+    assert script("press #$") == \
+        PREFIX + "key code 21 using {command down, shift down}"
+    assert script("press #_") == \
+        PREFIX + "key code 27 using {command down, shift down}"
+
+
+def test_shift_is_not_duplicated_when_already_present():
+    body = script("press #+$")
+    assert body.count("shift down") == 1, body
+
+
+# ---- Task 2 regression lock: paths that already worked --------------------
+@pytest.mark.parametrize("keys,expected", [
+    ("#q", ["cliclick", "kd:cmd", "t:q", "ku:cmd"]),
+    ("#+g", ["cliclick", "kd:cmd,shift", "t:g", "ku:cmd,shift"]),
+    ("#{Space}", ["cliclick", "kd:cmd", "kp:space", "ku:cmd"]),
+    ("{F5}", ["cliclick", "kp:f5"]),
+    ("#", ["cliclick", "kd:cmd", "w:50", "ku:cmd"]),
+    ("4", ["cliclick", "t:4"]),          # unmodified: no hotkey to match
+])
+def test_working_press_paths_are_unchanged(keys, expected):
+    argv, _ = macos().parse_keyboard_command(f"press {keys}")
+    assert argv == expected
+
+
+def test_navigation_keys_still_use_their_own_key_codes():
+    assert script("press ^+{Left}") == \
+        PREFIX + "key code 123 using {control down, shift down}"
+
+
+# ---- Task 4: {code:N} passthrough -----------------------------------------
+def test_keycode_passthrough():
+    assert script("press {code:21}") == PREFIX + "key code 21"
+    assert script("press #+{code:21}") == \
+        PREFIX + "key code 21 using {command down, shift down}"
+    assert script("press {code:0}") == PREFIX + "key code 0"
+    assert script("press {code:127}") == PREFIX + "key code 127"
+
+
+@pytest.mark.parametrize("keys", ["{code:128}", "{code:200}", "{code:x}", "{code:}"])
+def test_malformed_keycode_is_rejected_not_typed(keys):
+    """A silent fall-through would type the literal '{code:200}' into whatever has
+    focus and record it as a successful step — the S019 failure in miniature."""
+    assert macos().parse_keyboard_command(f"press {keys}") is None
+
+
+# ---- Task 5: drag dwell and waypoints -------------------------------------
+def drag(command: str):
+    built = macos().build_mouse_command(command)
+    return built[0] if built else None
+
+
+def test_plain_drag_is_unchanged():
+    assert drag("100 100 drag 900 700") == [
+        "cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700",
+    ]
+
+
+def test_drag_dwell_override():
+    assert drag("100 100 drag 900 700 dwell 150") == [
+        "cliclick", "dd:100,100", "w:150", "m:900,700", "w:150", "du:900,700",
+    ]
+
+
+def test_drag_waypoints():
+    assert drag("100 100 drag via 400 300 via 700 500 to 900 700") == [
+        "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
+        "m:700,500", "w:50", "m:900,700", "w:50", "du:900,700",
+    ]
+
+
+def test_drag_waypoints_with_dwell():
+    assert drag("100 100 drag via 400 300 to 900 700 dwell 200") == [
+        "cliclick", "dd:100,100", "w:200", "m:400,300", "w:200",
+        "m:900,700", "w:200", "du:900,700",
+    ]
+
+
+@pytest.mark.parametrize("command", [
+    "100 100 drag 900 700 dwell 0",
+    "100 100 drag 900 700 dwell 5001",
+    "100 100 drag 900 700 dwell abc",
+    "100 100 drag via 400 300 900 700",       # missing 'to'
+    "100 100 drag 900 700 999",               # trailing junk
+    "100 100 drag via 400 to 900 700",        # waypoint missing a coordinate
+])
+def test_malformed_drag_is_rejected(command):
+    assert drag(command) is None
+
+
+def test_drag_waypoint_limit():
+    via = " ".join("via 10 10" for _ in range(17))
+    assert drag(f"100 100 drag {via} to 900 700") is None
+
+
+def test_drag_stays_one_recorded_step():
+    """human_command is the original line, so ma-core records one step however many
+    cliclick tokens the drag expands to."""
+    command = "100 100 drag via 400 300 to 900 700 dwell 120"
+    _, human = macos().build_mouse_command(command)
+    assert human == command
+
+
+# ---- Task 3: strict mode --------------------------------------------------
+UNRECOGNISED = ["1022 343left", "foo bar", "hello world!", "typehello", "343left"]
+
+
+@pytest.mark.parametrize("cls", [MacOSActuation, LinuxActuation, WindowsActuation])
+@pytest.mark.parametrize("command", UNRECOGNISED)
+def test_strict_mode_rejects_unrecognised_commands(cls, command):
+    inst = cls.__new__(cls)
+    inst.strict = True
+    assert inst.detect_command_type(command)[0] == "invalid"
+
+
+@pytest.mark.parametrize("cls", [MacOSActuation, LinuxActuation, WindowsActuation])
+@pytest.mark.parametrize("command", UNRECOGNISED)
+def test_lenient_mode_preserves_the_old_fall_through(cls, command):
+    inst = cls.__new__(cls)
+    inst.strict = False
+    kind, processed = inst.detect_command_type(command)
+    assert kind == "keyboard"
+    assert processed == f"type {command}"
+
+
+@pytest.mark.parametrize("cls", [MacOSActuation, LinuxActuation, WindowsActuation])
+@pytest.mark.parametrize("command", [
+    "type 1022 343left", "type hello world!", "1022 343 left", "press ^c", "here left",
+])
+def test_strict_mode_accepts_valid_commands(cls, command):
+    inst = cls.__new__(cls)
+    inst.strict = True
+    assert inst.detect_command_type(command)[0] != "invalid"
+
+
+def test_strict_is_on_by_default():
+    assert MacOSActuation.strict is True
+    assert LinuxActuation.strict is True
+    assert WindowsActuation.strict is True
+
+
+def test_bare_modifier_symbol_inside_text_is_not_a_keypress():
+    """MODIFIER_MAP holds the bare symbols ^ + ! #, and the old membership test was
+    `in command`, so any text merely containing one was rerouted to a keypress."""
+    inst = macos(strict=False)
+    for command in ["hello world!", "2 + 2", "issue #12", "a^b"]:
+        _, processed = inst.detect_command_type(command)
+        assert processed != f"press {command}", \
+            f"{command!r} was rerouted to a keypress"
+
+
+def test_modifier_symbol_in_prefix_position_is_still_a_keypress():
+    inst = macos()
+    for command in ["^c", "#q", "+{Tab}", "!{Tab}"]:
+        kind, processed = inst.detect_command_type(command)
+        assert kind == "keyboard"
+        assert processed == f"press {command}"
+
+
+# ---- Record fidelity: human_command must leave the builder untouched -------
+# The integration suite proves the record survives the wire, but its agent runs on
+# Linux. This is the macOS half: the value the controller puts in
+# CommandRequest.human_command is what ends up in every stored file, so the builder
+# must not transform it. The v1.0.0 agent derived it from the escaped shell string
+# instead and truncated at the first escaped quote (S011/S013/S026).
+RECORD_PAYLOADS = [
+    'printf "hello world"',
+    'osascript -e "tell application \\"System Events\\" to get name"',
+    "sed -i '' 's/a/b/g' file.txt",
+    'mix "double" and \'single\' and back\\slash',
+    'osascript -e "tell application "System Events" to set picture of every '
+    'desktop to "/Users/agentuser/corpus-seed/wall-A.jpg""',
+]
+
+
+@pytest.mark.parametrize("payload", RECORD_PAYLOADS)
+def test_macos_type_leaves_the_human_command_verbatim(payload):
+    line = f"type {payload}"
+    _, human = macos().parse_keyboard_command(line)
+    assert human == line
+
+
+@pytest.mark.parametrize("payload", RECORD_PAYLOADS)
+def test_macos_type_payload_is_one_argv_element(payload):
+    """The payload is embedded in the AppleScript as a closed string literal and
+    handed to osascript as a single argv element — no shell, so no re-escaping pass
+    can lose or reinterpret part of it."""
+    argv, _ = macos().parse_keyboard_command(f"type {payload}")
+    assert argv[0] == "osascript" and argv[1] == "-e" and len(argv) == 3
+    assert argv[2].startswith(PREFIX + 'keystroke "')
+    assert argv[2].endswith('"')
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("^c", "press ^c"),
+    ("#+4", "press #+4"),
+    ("#+{code:21}", "press #+{code:21}"),
+])
+def test_macos_press_leaves_the_human_command_verbatim(keys, expected):
+    _, human = macos().parse_keyboard_command(f"press {keys}")
+    assert human == expected
+
+
+# ---- Task 3: repair hints -------------------------------------------------
+@pytest.mark.parametrize("command,expected", [
+    ("1022 343left", "1022 343 left"),
+    ("500 200right", "500 200 right"),
+    ("typehello", "type hello"),
+    ("presstab", "press tab"),
+])
+def test_suggestion_finds_the_dropped_space(command, expected):
+    assert command_hints.suggest(
+        command, MacOSActuation.MOUSE_ACTIONS, MacOSActuation.KEYBOARD_ACTIONS
+    ) == expected
+
+
+def test_no_suggestion_when_nothing_plausible():
+    assert command_hints.suggest(
+        "foo bar", MacOSActuation.MOUSE_ACTIONS, MacOSActuation.KEYBOARD_ACTIONS
+    ) is None
+
+
+def test_rejection_message_always_offers_the_literal_escape():
+    message = command_hints.rejection_message(
+        "1022 343left", MacOSActuation.MOUSE_ACTIONS, MacOSActuation.KEYBOARD_ACTIONS
+    )
+    assert "Did you mean: 1022 343 left" in message
+    # The escape is named as a form, not by echoing the command back a second time —
+    # see tests/unit/test_typed_text_not_echoed.py.
+    assert "type <text>" in message
+    assert "--lenient" in message

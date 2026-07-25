@@ -34,6 +34,7 @@ from controller.core.metrics import MetricsCollector
 from controller.os_specific.windows_actuation import WindowsActuation
 from controller.os_specific.macos_actuation import MacOSActuation
 from controller.os_specific.linux_actuation import LinuxActuation
+from controller.os_specific import command_hints
 from controller.management.monitoring import monitoring
 from controller.management.agent import AgentManager, AgentInfo
 from controller.utils.logger import setup_logger, get_audit_logger
@@ -247,13 +248,20 @@ def cli(debug):
 @click.option('--port', type=int, help='Server gRPC port (default: 50051)')
 @click.option('--token', envvar='CONTROL_CENTER_TOKEN', help='API token')
 @click.option('--ssl', is_flag=True, help='Use SSL/TLS connection')
-def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl: bool):
+@click.option('--lenient', is_flag=True,
+              help='Type unrecognised commands as text instead of rejecting them')
+def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl: bool,
+            lenient: bool):
     """Connect to server with PERSISTENT connection and enter interactive mode
-    
+
     This establishes a persistent connection that stays active until you
     exit with 'exit' or 'quit' command. The connection and OS-specific
     actuation logic are initialized once at the start.
-    
+
+    Commands that match no known verb are rejected by default. Use `type <text>`
+    to send text deliberately; --lenient restores the old behaviour of typing
+    anything unrecognised, which is how a mistyped command becomes a recorded step.
+
     Examples:
         control-center connect --host 192.168.1.100 --token abc123
         export CONTROL_CENTER_TOKEN=abc123
@@ -357,12 +365,13 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
         os_type = agent_info['os_type']
         logger.info(f"Detected OS: {os_type}")
         
+        strict = not lenient
         if os_type == 'WINDOWS':
-            ctx.controller = WindowsActuation(ctx.client)
+            ctx.controller = WindowsActuation(ctx.client, strict=strict)
         elif os_type == 'MACOS':
-            ctx.controller = MacOSActuation(ctx.client)
+            ctx.controller = MacOSActuation(ctx.client, strict=strict)
         elif os_type == 'LINUX':
-            ctx.controller = LinuxActuation(ctx.client)
+            ctx.controller = LinuxActuation(ctx.client, strict=strict)
         else:
             logger.error(f"Unsupported OS type: {os_type}")
             sys.exit(1)
@@ -722,7 +731,10 @@ def _interactive_mode(controller):
 @click.option('--token', envvar='CONTROL_CENTER_TOKEN', help='API token')
 @click.option('--command', '-c', required=True, help='Single command to execute')
 @click.option('--ssl', is_flag=True, help='Use SSL/TLS')
-def execute(host: Optional[str], port: Optional[int], token: Optional[str], command: str, ssl: bool):
+@click.option('--lenient', is_flag=True,
+              help='Type an unrecognised command as text instead of rejecting it')
+def execute(host: Optional[str], port: Optional[int], token: Optional[str], command: str,
+            ssl: bool, lenient: bool):
     """Execute a single command WITHOUT persistent connection (one-off execution)
     
     This connects, executes one command, and immediately disconnects.
@@ -766,11 +778,11 @@ def execute(host: Optional[str], port: Optional[int], token: Optional[str], comm
         os_type = agent_info['os_type']
         
         if os_type == 'WINDOWS':
-            controller = WindowsActuation(ctx.client)
+            controller = WindowsActuation(ctx.client, strict=not lenient)
         elif os_type == 'MACOS':
-            controller = MacOSActuation(ctx.client)
+            controller = MacOSActuation(ctx.client, strict=not lenient)
         elif os_type == 'LINUX':
-            controller = LinuxActuation(ctx.client)
+            controller = LinuxActuation(ctx.client, strict=not lenient)
         else:
             sys.exit(1)
         
@@ -894,7 +906,9 @@ def watch(host: Optional[str], port: Optional[int], ssl: bool, fmt: str):
               help='Stop batch execution on first failed command')
 @click.option('--output', '-o', default=None,
               help='Write results to this JSON file')
-def batch(host, port, token, ssl, input_file, fmt, delay, stop_on_error, output):
+@click.option('--lenient', is_flag=True,
+              help='Type unrecognised commands as text instead of rejecting them')
+def batch(host, port, token, ssl, input_file, fmt, delay, stop_on_error, output, lenient):
     """Execute a batch of commands from a file
     
     Supported file formats:
@@ -929,12 +943,12 @@ def batch(host, port, token, ssl, input_file, fmt, delay, stop_on_error, output)
         
         os_type = agent_info['os_type']
         if os_type == 'WINDOWS':
-            controller = WindowsActuation(ctx.client)
+            controller = WindowsActuation(ctx.client, strict=not lenient)
         elif os_type == 'MACOS':
-            controller = MacOSActuation(ctx.client)
+            controller = MacOSActuation(ctx.client, strict=not lenient)
         else:
-            controller = LinuxActuation(ctx.client)
-        
+            controller = LinuxActuation(ctx.client, strict=not lenient)
+
         # Detect format from extension if 'auto'
         ext = Path(input_file).suffix.lower().lstrip('.')
         resolved_fmt = ext if fmt == 'auto' else fmt
@@ -1010,7 +1024,7 @@ def batch(host, port, token, ssl, input_file, fmt, delay, stop_on_error, output)
         fail_count = 0
         
         for i, cmd in enumerate(commands, 1):
-            click.echo(f"[{i}/{len(commands)}] {cmd}")
+            click.echo(f"[{i}/{len(commands)}] {command_hints.redact(cmd)}")
             try:
                 ok = controller.execute_command(cmd)
                 status = "OK" if ok else "FAIL"
@@ -1058,7 +1072,10 @@ def batch(host, port, token, ssl, input_file, fmt, delay, stop_on_error, output)
                 'failed': fail_count,
                 'results': results,
             }
-            Path(output).write_text(json.dumps(summary, indent=2))
+            # Owner-only: results carry each command verbatim, so a batch containing
+            # a `type` step writes that text to disk. Same treatment as the session
+            # and metrics exports, which also record command history.
+            _secure_write(output, json.dumps(summary, indent=2))
             click.echo(f"[*] Results written to {output}")
         
         sys.exit(0 if fail_count == 0 else 1)
@@ -1437,11 +1454,14 @@ def session_replay(host, port, token, failed_only, delay, dry_run):
             sys.exit(1)
         os_type = agent_info['os_type']
         if os_type == 'WINDOWS':
-            controller = WindowsActuation(ctx.client)
+            # Replay reproduces a recorded session verbatim, including any step a
+            # lenient-mode capture typed as text. Re-validating here would refuse
+            # commands the recording already contains.
+            controller = WindowsActuation(ctx.client, strict=False)
         elif os_type == 'MACOS':
-            controller = MacOSActuation(ctx.client)
+            controller = MacOSActuation(ctx.client, strict=False)
         else:
-            controller = LinuxActuation(ctx.client)
+            controller = LinuxActuation(ctx.client, strict=False)
 
         for i, cmd in enumerate(history, 1):
             command_str = cmd.get('command', '')

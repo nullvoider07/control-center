@@ -13,9 +13,72 @@ permissions:
 
 jobs:
   # ============================================================================
+  # JOB 0: TEST GATE
+  # ============================================================================
+  # Every build job depends on this, so a tag cannot publish binaries that were
+  # never tested. ci.yml runs the same checks on push but skips tags, which is why
+  # the gate is repeated here rather than assumed.
+  test:
+    name: Test suite (release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool python3-tk protobuf-compiler libssl-dev pkg-config
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install grpcio grpcio-tools protobuf click requests cryptography keyring pytest
+
+      - name: Generate Protobuf Files
+        run: |
+          mkdir -p crates/controller/integrations/proto
+          python -m grpc_tools.protoc \
+            -IProto \
+            --python_out=crates/controller/integrations/proto \
+            --grpc_python_out=crates/controller/integrations/proto \
+            Proto/control_center.proto
+          cat > crates/controller/integrations/proto/__init__.py << 'EOF'
+          from .control_center_pb2 import *
+          from .control_center_pb2_grpc import *
+          EOF
+
+      - name: Build workspace (debug binaries drive the integration harness)
+        run: cargo build --workspace
+
+      - name: Check test preconditions
+        run: |
+          set -e
+          for b in control-center-server control-center-agent generate-token; do
+            test -x "target/debug/$b" || { echo "::error::missing target/debug/$b"; exit 1; }
+          done
+          command -v Xvfb   >/dev/null || { echo "::error::Xvfb not installed";   exit 1; }
+          command -v xdotool >/dev/null || { echo "::error::xdotool not installed"; exit 1; }
+          python -c "import tkinter" || { echo "::error::tkinter not installed"; exit 1; }
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Python tests
+        run: python -m pytest tests/ -q -rs
+
+  # ============================================================================
   # JOB 1: LINUX BUILD (x64)
   # ============================================================================
   build-linux-x64:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,6 +206,7 @@ jobs:
   # JOB 2: LINUX BUILD (ARM64)
   # ============================================================================
   build-linux-arm64:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -270,6 +334,7 @@ jobs:
   # JOB 3: MACOS BUILD (Apple Silicon / ARM64)
   # ============================================================================
   build-macos-arm64:
+    needs: test
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -401,6 +466,7 @@ jobs:
   # JOB 4: MACOS BUILD (Intel / x64)
   # ============================================================================
   build-macos-x64:
+    needs: test
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
@@ -534,6 +600,7 @@ jobs:
   # JOB 5: WINDOWS BUILD (x64)
   # ============================================================================
   build-windows-x64:
+    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -684,7 +751,79 @@ jobs:
 
             **Unified package: Rust binaries + Python CLI in one download**
 
-            ## ✨ What's New in v1.1.0
+            ## ✨ What's New in v1.2.0
+
+            Reporting fidelity and held-button safety:
+
+            - **Fixed** — A mouse command's reported coordinate could disagree with
+              the coordinate requested, while the action itself landed correctly. The
+              agent read the cursor back and reported whatever it got as
+              authoritative, so a read that raced the synthetic event — or a warp that
+              silently did nothing — was published as the result. That value is not
+              only echoed to the operator: it is the same field the server stores as
+              `mouse_x`/`mouse_y`, so a wrong read was simultaneously a bad
+              step-gating signal and corrupt recorded data. The readback is now
+              compared against the coordinate the command asked for, re-read a bounded
+              number of times, and reported as `position_captured: false` rather than
+              emitted unverified.
+            - **Added** — The agent tracks mouse buttons left down by `<x> <y> hold`.
+              Outstanding holds are reported on every subsequent command and on
+              `position`, the console warns once a button has been down more than a
+              few seconds, and the agent releases tracked buttons when it exits. An
+              unmatched hold previously left the button physically down with no
+              indication, turning every later click or move into a drag-select.
+            - **Fixed** — The agent now shuts down cleanly on `SIGTERM` as well as
+              `SIGINT`. Previously the normal stop signal killed the process outright,
+              skipping cleanup.
+            - **Fixed** — `<x> <y> hold` and `<x> <y> release` now work on Linux; they
+              had only ever been accepted in their `here` form there, while macOS
+              accepted both.
+
+            > ⚠️ Consumers of the command stream must read `position_captured` before
+            > `mouse_x`/`mouse_y`. An uncaptured position is carried as `(0, 0)`,
+            > which is itself a valid screen coordinate.
+
+            ## ✨ Previously in v1.1.1
+
+            Actuation and recording fidelity:
+
+            - **Fixed** — Recorded steps no longer truncate at the first quote. A
+              `type` command containing double quotes actuated correctly but every
+              stored record stopped at the first escaped quote, because the agent
+              re-derived the display string from the escaped shell command. The
+              structured-argv rework removed that derivation; the controller now
+              supplies the recorded text directly and a regression test asserts on
+              the stored record rather than the console echo.
+            - **Fixed** — macOS shift+digit and shift+punctuation shortcuts
+              (⇧⌘3/⇧⌘4/⇧⌘5) reported success and did nothing. They were sent as typed
+              characters rather than keycodes with modifier flags, which system
+              hotkeys cannot match. Modified digits and punctuation now go through an
+              AppleScript `key code`. Letter shortcuts are unchanged.
+            - **Fixed** — Linux punctuation shortcuts (Ctrl+Minus, Ctrl+Comma,
+              Ctrl+Slash, Ctrl+`[`/`]`) never worked: the raw character was passed to
+              `xdotool`, which either refused the sequence or dropped the target
+              silently while still exiting 0. They are now translated to X keysym
+              names, and the agent treats a dropped key as a failed command instead of
+              a success.
+            - **Fixed** — Windows `type` payloads containing `^` were rerouted through
+              AutoHotkey's `Send`, making every other metacharacter live: `type a^b!c`
+              pressed Alt+C. Typed text now always uses `SendText`.
+            - **Fixed** — macOS `press #` (a standalone modifier tap) held Cmd while
+              typing `#`.
+            - **Changed** — Commands matching no known verb are now **rejected** rather
+              than typed into the guest. `type <text>` remains the way to send text;
+              `--lenient` restores the old behaviour. A mistyped command previously
+              typed itself into whatever had focus and was recorded as a real step.
+            - **Added** — `press {code:N}` sends a macOS virtual keycode directly, so a
+              key the built-in maps do not cover needs no release.
+            - **Added** — `drag … dwell <ms>` and `drag via <x> <y> … to <x> <y>` for
+              drag-and-drop targets that need slower or multi-step movement (macOS).
+            - **Added** — `{Plus}` names the plus key on all platforms, since a bare `+`
+              is always the Shift modifier.
+
+            > ⚠️ Server, agent and CLI must be deployed together, as in v1.1.0.
+
+            ## ✨ Previously in v1.1.0
 
             Interactive `connect` console upgrades:
 

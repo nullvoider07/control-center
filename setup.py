@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="control-center",
-    version="1.1.0",
+    version="1.2.0",
     description="Unified multi-OS control center for CUA actuation",
     author="Kartik A (NullVoider)",
     license="GPL-3.0",

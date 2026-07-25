@@ -3,6 +3,8 @@
 import re
 from typing import Tuple, Optional, List
 
+from . import command_hints
+
 # macOS actuation class definition
 class MacOSActuation:
     """macOS actuation controller with position tracking for all mouse actions"""
@@ -61,11 +63,76 @@ class MacOSActuation:
         '{Shift}': 'shift',
         '{Fn}': 'fn'
     }
-    
-    def __init__(self, grpc_client):
-        """Initialize controller with gRPC client"""
+
+    # Brace names that stand for a literal character. The modifier symbols are
+    # consumed by the prefix parser and can never appear as a target key, so these
+    # names are the only way to reach them: "#{Plus}" is Cmd+Plus, where "#+" would
+    # be Cmd+Shift.
+    BRACE_CHAR_MAP = {
+        '{Plus}': '+', '{Minus}': '-', '{Hash}': '#',
+        '{Bang}': '!', '{Caret}': '^',
+    }
+
+    # Character → (US-ANSI virtual keycode, whether Shift is needed for the glyph).
+    #
+    # cliclick's t: primitive types text: it synthesizes the character as a Unicode
+    # keyboard event, not a keycode carrying modifier flags. macOS system hotkeys
+    # match on keycode + flags, so a shifted glyph typed this way never matches —
+    # "press #+4" reported success and took no screenshot. Routing these through
+    # AppleScript "key code N using {…}" produces the event the OS expects.
+    #
+    # Letters are deliberately absent: their shifted form is just uppercase, the t:
+    # path works for them today (⌘Q, ⇧⌘G), and this map exists to fix a broken case
+    # rather than to relocate a working one.
+    #
+    # Values are the Carbon HIToolbox Events.h kVK_ANSI_* constants.
+    CHAR_KEYCODE_MAP = {
+        # Digit row, unshifted
+        '0': (29, False), '1': (18, False), '2': (19, False), '3': (20, False),
+        '4': (21, False), '5': (23, False), '6': (22, False), '7': (26, False),
+        '8': (28, False), '9': (25, False),
+        # Punctuation, unshifted
+        '-': (27, False), '=': (24, False), '[': (33, False), ']': (30, False),
+        '\\': (42, False), ';': (41, False), "'": (39, False), ',': (43, False),
+        '.': (47, False), '/': (44, False), '`': (50, False),
+        # Shifted glyphs: same physical key, Shift supplied by the emitter
+        ')': (29, True), '!': (18, True), '@': (19, True), '#': (20, True),
+        '$': (21, True), '%': (23, True), '^': (22, True), '&': (26, True),
+        '*': (28, True), '(': (25, True), '_': (27, True), '+': (24, True),
+        '{': (33, True), '}': (30, True), '|': (42, True), ':': (41, True),
+        '"': (39, True), '<': (43, True), '>': (47, True), '?': (44, True),
+        '~': (50, True),
+    }
+
+    # cliclick modifier name → AppleScript "using" clause element.
+    OSA_MODIFIERS = {
+        'cmd': 'command down', 'alt': 'option down',
+        'ctrl': 'control down', 'shift': 'shift down',
+    }
+
+    # Highest valid macOS virtual keycode.
+    MAX_KEYCODE = 127
+
+    # Drag pacing. The dwell is the pause after the press and after each move; the
+    # bounds keep a mistyped value from stalling the agent, which serves one command
+    # at a time.
+    DEFAULT_DRAG_DWELL_MS = 50
+    MIN_DRAG_DWELL_MS = 1
+    MAX_DRAG_DWELL_MS = 5000
+    MAX_DRAG_WAYPOINTS = 16
+
+    # Class-level default so instances built without __init__ (tests, replay
+    # helpers) still have a defined policy rather than raising on attribute access.
+    strict = True
+
+    def __init__(self, grpc_client, strict: bool = True):
+        """Initialize controller with gRPC client.
+
+        strict: reject commands that match no known verb instead of typing them.
+        """
         self.grpc_client = grpc_client
         self.cliclick_path = "cliclick"
+        self.strict = strict
     
     # Helper method to get current mouse position using cliclick
     def _get_mouse_position(self) -> Optional[Tuple[int, int]]:
@@ -81,6 +148,7 @@ class MacOSActuation:
                 argv=[self.cliclick_path, "p:."], human_command="position",
             )
             
+            command_hints.print_held_button_warnings(result.get('metadata'))
             if result['success'] and result.get('position_captured'):
                 mx = result.get('mouse_x')
                 my = result.get('mouse_y')
@@ -123,6 +191,7 @@ class MacOSActuation:
             '{F1}': 'F1', '{F2}': 'F2', '{F3}': 'F3', '{F4}': 'F4',
             '{F5}': 'F5', '{F6}': 'F6', '{F7}': 'F7', '{F8}': 'F8',
             '{F9}': 'F9', '{F10}': 'F10', '{F11}': 'F11', '{F12}': 'F12',
+            '{Plus}': 'Plus',
         }
         if keys in special_display:
             return special_display[keys]
@@ -142,6 +211,43 @@ class MacOSActuation:
             else:
                 parts.append(key_part)
         return '+'.join(parts) if parts else keys
+
+    # Helper method to build an osascript "key code" argv
+    def _key_code_argv(self, code: int, modifiers: List[str],
+                       command: str) -> Tuple[List[str], str]:
+        """Build the argv for a virtual-keycode press.
+
+        The whole AppleScript is one argv element to osascript, so there is no shell
+        and the modifier list cannot be anything but the fixed clause built here.
+        """
+        body = f'tell application "System Events" to key code {code}'
+        mod_list = [self.OSA_MODIFIERS[md] for md in modifiers if md in self.OSA_MODIFIERS]
+        if mod_list:
+            body += f' using {{{", ".join(mod_list)}}}'
+        return (['osascript', '-e', body], command)
+
+    # Helper method to parse the "{code:N}" passthrough form
+    def _parse_keycode_brace(self, key: str) -> Optional[int]:
+        """Return N for a well-formed "{code:N}".
+
+        Raises ValueError when the key is a "{code:…}" form but N is malformed or out
+        of range. A silent fall-through would type the literal text "{code:200}" into
+        whatever has focus and record it as a successful step — the failure mode that
+        spoiled S019. Returns None only when this is not a keycode form at all.
+        """
+        if not key.startswith('{code:'):
+            return None
+        match = re.fullmatch(r'\{code:(\d{1,3})\}', key)
+        if not match:
+            raise ValueError(
+                f"invalid keycode form {key!r}: expected {{code:N}} with N a number"
+            )
+        code = int(match.group(1))
+        if not 0 <= code <= self.MAX_KEYCODE:
+            raise ValueError(
+                f"keycode {code} out of range 0-{self.MAX_KEYCODE}"
+            )
+        return code
 
     # Helper method to extract coordinates from command (if present)
     def _extract_coordinates_from_command(self, command: str) -> Optional[Tuple[int, int]]:
@@ -212,17 +318,28 @@ class MacOSActuation:
         if re.match(modifier_pattern, command):
             return 'keyboard', f"press {command}"
         
-        # Check for special keys OR modifiers
-        if any(key in command for key in self.SPECIAL_KEYS.keys()) or any(key in command for key in self.MODIFIER_MAP.keys()):
+        # Check for special keys, or a brace-form modifier name.
+        #
+        # Only brace names are matched by substring. The bare MODIFIER_MAP symbols
+        # (^ + ! #) are excluded here because a substring test on them rerouted any
+        # command merely *containing* one — "hello world!" became a keypress rather
+        # than text. Symbols in the prefix position are already handled by
+        # modifier_pattern above, which is the only position where they are modifiers.
+        brace_names = [k for k in list(self.SPECIAL_KEYS) + list(self.MODIFIER_MAP)
+                       if k.startswith('{')]
+        if any(key in command for key in brace_names):
             if not command.startswith(tuple(self.KEYBOARD_ACTIONS)):
                 return 'keyboard', f"press {command}"
             return 'keyboard', command
-        
+
         # If first token is mouse action
         if tokens[0] in self.MOUSE_ACTIONS:
             return 'mouse', command
-        
-        # Default: assume it's text to type
+
+        # Unrecognised. In strict mode this is refused; the legacy behaviour typed it
+        # into whatever had focus and recorded it as a real step (see command_hints).
+        if self.strict:
+            return 'invalid', command
         return 'keyboard', f"type {command}"
     
     # Helper method to build the scroll argv
@@ -252,6 +369,67 @@ class MacOSActuation:
         click = f"c:{x},{y}" if x is not None and y is not None else "c:."
         return ['__scroll__', click, str(key_code), str(amount)]
     
+    # Helper method to build the cliclick token sequence for a drag
+    def _build_drag_spec(self, x: int, y: int, rest: List[str]) -> str:
+        """Build the drag token sequence from the tokens following "drag".
+
+        Accepted forms (dwell is optional on both):
+            <x2> <y2> [dwell <ms>]
+            via <ax> <ay> [via …] to <x2> <y2> [dwell <ms>]
+
+        The single hardcoded 50 ms dwell and single intermediate point are enough for
+        a selection drag but not for drag-and-drop or overlay UIs, which need slower
+        movement or a real path. Raises ValueError with an operator-readable message
+        rather than degrading silently — a drag that lands wrong still records as a
+        successful step.
+        """
+        tokens = list(rest)
+
+        dwell = self.DEFAULT_DRAG_DWELL_MS
+        if len(tokens) >= 2 and tokens[-2] == 'dwell':
+            try:
+                dwell = int(tokens[-1])
+            except ValueError:
+                raise ValueError(f"drag dwell must be a number, got {tokens[-1]!r}")
+            if not self.MIN_DRAG_DWELL_MS <= dwell <= self.MAX_DRAG_DWELL_MS:
+                raise ValueError(
+                    f"drag dwell {dwell} out of range "
+                    f"{self.MIN_DRAG_DWELL_MS}-{self.MAX_DRAG_DWELL_MS} ms"
+                )
+            tokens = tokens[:-2]
+
+        def point(pair: List[str]) -> str:
+            try:
+                return f"{int(pair[0])},{int(pair[1])}"
+            except (ValueError, IndexError):
+                raise ValueError(f"drag needs a pair of integer coordinates, got {pair!r}")
+
+        waypoints: List[str] = []
+        if tokens and tokens[0] == 'via':
+            while tokens and tokens[0] == 'via':
+                waypoints.append(point(tokens[1:3]))
+                tokens = tokens[3:]
+            if len(waypoints) > self.MAX_DRAG_WAYPOINTS:
+                raise ValueError(
+                    f"drag accepts at most {self.MAX_DRAG_WAYPOINTS} waypoints, "
+                    f"got {len(waypoints)}"
+                )
+            if not tokens or tokens[0] != 'to':
+                raise ValueError("drag with 'via' waypoints must end with 'to <x> <y>'")
+            tokens = tokens[1:]
+
+        destination = point(tokens[0:2])
+        if len(tokens) > 2:
+            raise ValueError(f"unexpected tokens after drag destination: {tokens[2:]}")
+
+        # Press, then step through each waypoint, then release at the destination.
+        # A dwell after every move is what gives the target time to track the drag.
+        parts = [f"dd:{x},{y}", f"w:{dwell}"]
+        for wp in waypoints + [destination]:
+            parts.extend([f"m:{wp}", f"w:{dwell}"])
+        parts.append(f"du:{destination}")
+        return ' '.join(parts)
+
     # Method to build mouse command based on parsed input
     def build_mouse_command(self, command: str) -> Optional[Tuple[List[str], str]]:
         """Build (argv, human_command) for a mouse action.
@@ -307,8 +485,12 @@ class MacOSActuation:
             if action in coord_map:
                 return m(f"{cli} {coord_map[action]}:{x},{y}")
             elif action == 'drag' and len(tokens) >= 5:
-                x2, y2 = int(tokens[3]), int(tokens[4])
-                return m(f"{cli} dd:{x},{y} w:50 m:{x2},{y2} w:50 du:{x2},{y2}")
+                try:
+                    spec = self._build_drag_spec(x, y, tokens[3:])
+                except ValueError as e:
+                    print(f"[✗] {e}")
+                    return None
+                return m(f"{cli} {spec}")
             elif 'scroll' in action:
                 amount = int(tokens[3]) if len(tokens) > 3 else 5
                 return scroll(x, y, action, amount)
@@ -381,40 +563,59 @@ class MacOSActuation:
                 else:
                     main_key = text[i:]
                     break
-            
+            else:
+                # The loop consumed the whole string, so there is no target key —
+                # "press #" is a standalone Cmd tap. main_key must be cleared for the
+                # modifiers-only branch below to be reachable; leaving it at its
+                # initial value of `text` made "press #" send Cmd while typing "#".
+                main_key = ''
+
+            # Resolve brace names that stand for a literal character, so they take the
+            # single-character path below instead of falling through to the t: fallback.
+            main_key = self.BRACE_CHAR_MAP.get(main_key, main_key)
+
+            # Explicit keycode passthrough: "press {code:21}", "press #+{code:21}".
+            # The fixed maps below cannot cover every key on every layout; this makes a
+            # missing key a console command rather than a release.
+            try:
+                explicit_code = self._parse_keycode_brace(main_key)
+            except ValueError as e:
+                print(f"[✗] {e}")
+                return None
+            if explicit_code is not None:
+                return self._key_code_argv(explicit_code, modifiers, command)
+
             # Map for osascript key codes
             osascript_map = {
                 'return': 36, 'tab': 48, 'delete': 51, 'fwd-delete': 117,
                 'page-up': 116, 'page-down': 121, 'home': 115, 'end': 119,
                 'arrow-left': 123, 'arrow-right': 124, 'arrow-down': 125, 'arrow-up': 126,
             }
-            
+
             # Normalize special key
             normalized_key = main_key
             if main_key in self.SPECIAL_KEYS:
                 normalized_key = self.SPECIAL_KEYS[main_key]
-            
+
             # Check against keys that need osascript
             target_keys = [
-                'return', 'tab', 'delete', 'fwd-delete', 
+                'return', 'tab', 'delete', 'fwd-delete',
                 'page-up', 'page-down', 'home', 'end',
                 'arrow-left', 'arrow-right', 'arrow-down', 'arrow-up',
             ]
-            
-            if normalized_key in target_keys:
-                code = osascript_map[normalized_key]
 
-                # Build the AppleScript body (a single argv element to osascript).
-                body = f'tell application "System Events" to key code {code}'
-                if modifiers:
-                    osa_mods = {
-                        'cmd': 'command down', 'alt': 'option down',
-                        'ctrl': 'control down', 'shift': 'shift down'
-                    }
-                    mod_list = [osa_mods[md] for md in modifiers if md in osa_mods]
-                    if mod_list:
-                        body += f' using {{{", ".join(mod_list)}}}'
-                return (['osascript', '-e', body], command)
+            if normalized_key in target_keys:
+                return self._key_code_argv(osascript_map[normalized_key], modifiers, command)
+
+            # Modified digit or punctuation: must be a keycode event, not typed text,
+            # or macOS hotkeys such as ⇧⌘4 never match. Unmodified single characters
+            # keep the t: path — there is no hotkey to match and t: types them fine.
+            if modifiers and main_key in self.CHAR_KEYCODE_MAP:
+                code, needs_shift = self.CHAR_KEYCODE_MAP[main_key]
+                mods = list(modifiers)
+                if needs_shift and 'shift' not in mods:
+                    mods.append('shift')
+                return self._key_code_argv(code, mods, command)
 
             # Handle Special Keys (cliclick fallback)
             if main_key in self.SPECIAL_KEYS:
@@ -469,7 +670,8 @@ class MacOSActuation:
         cmd_type, processed_cmd = self.detect_command_type(command)
         
         if cmd_type == 'invalid':
-            print(f"[✗] Invalid command: {command}")
+            print(command_hints.rejection_message(
+                command, self.MOUSE_ACTIONS, self.KEYBOARD_ACTIONS))
             return False
         
         # Handle position command
@@ -513,6 +715,9 @@ class MacOSActuation:
         # Display results with position data
         if result['success']:
             ms = result['execution_time_ms']
+            # A button left down turns every later click or move into a drag-select,
+            # and nothing else in the output would say so.
+            command_hints.print_held_button_warnings(result.get('metadata'))
             if cmd_type == 'keyboard':
                 kb_action, _, kb_content = processed_cmd.partition(' ')
                 if kb_action in ('press', 'key'):
@@ -595,9 +800,9 @@ class MacOSActuation:
             
             if result['success']:
                 success_count += 1
-                print(f"[{i}/{len(commands)}] ✓ {command}")
+                print(f"[{i}/{len(commands)}] ✓ {command_hints.redact(command)}")
             else:
-                print(f"[{i}/{len(commands)}] ✗ {command}: {result['message']}")
+                print(f"[{i}/{len(commands)}] ✗ {command_hints.redact(command)}: {result['message']}")
         
         print(f"\n[✓] Batch complete: {success_count}/{total_count} succeeded")
     
@@ -619,6 +824,8 @@ class MacOSActuation:
 ║ <x> <y> scroll_up [n]  → Move and scroll up (n notches)  ║
 ║ <x> <y> scroll_down [n]→ Move and scroll down            ║
 ║ <x> <y> drag <x2> <y2> → Drag from (x,y) to (x2,y2)      ║
+║   … dwell <ms>         → Slower drag (1-5000ms, def 50)  ║
+║   … via <x> <y> to …   → Drag along a path (max 16)      ║
 ║ here <action>          → Action at current position      ║
 ║ position               → Get current mouse position      ║
 ╠══════════════════════════════════════════════════════════╣
@@ -633,6 +840,8 @@ class MacOSActuation:
 ║ Modifiers: ^ (Ctrl), + (Shift), ! (Alt/Option), # (Cmd)  ║
 ║ Unicode: ⌃ (Ctrl), ⇧ (Shift), ⌥ (Option), ⌘ (Cmd)        ║
 ║ Special: {Enter}, {Tab}, {F1}-{F16}, media keys          ║
+║ {Plus} is the + key ('+' alone is always Shift)          ║
+║ {code:N} presses virtual keycode N (0-127) directly      ║
 ╠══════════════════════════════════════════════════════════╣
 ║ EXAMPLES                                                 ║
 ╠══════════════════════════════════════════════════════════╣
@@ -640,9 +849,13 @@ class MacOSActuation:
 ║ here left              → Left-click at current pos       ║
 ║ type Hello World       → Type text                       ║
 ║ press #v               → Paste (Cmd+V)                   ║
+║ press #+4              → Screenshot region (Cmd+Shift+4) ║
+║ press #+{code:21}      → Same, by virtual keycode        ║
 ║ #c                     → Copy (auto-detected)            ║
 ║ {F11}                  → Press F11 key                   ║
 ║ 200 200 drag 800 600   → Drag operation                  ║
+║ 200 200 drag 800 600 dwell 150                           ║
+║                        → Slower drag for fussy targets   ║
 ║ 500 500 scroll_down 10 → Scroll down 10 notches          ║
 ║ position               → Get mouse coordinates           ║
 ╠══════════════════════════════════════════════════════════╣
