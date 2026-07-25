@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "control-center-agent"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "control-center-auth"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "control-center-common"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "jsonwebtoken",
  "serde",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "control-center-server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2579,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "control-center-common",
  "jsonwebtoken",

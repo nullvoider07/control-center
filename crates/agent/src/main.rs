@@ -676,7 +676,7 @@ impl AgentService for AgentServiceImpl {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     
-    info!("Control Center Agent v1.0.0 (WITH POSITION TRACKING)");
+    info!("Control Center Agent v{}", env!("CARGO_PKG_VERSION"));
     info!("Starting Agent...");
     
     // Create agent service (keeps all execution logic)

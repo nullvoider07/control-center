@@ -901,7 +901,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_level(true)
         .init();
 
-    info!("Control Center Server v1.0.0");
+    info!("Control Center Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Starting gRPC server with JWT authentication...");
 
     // Load configuration from environment
