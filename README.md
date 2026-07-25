@@ -1,8 +1,8 @@
 # Control Center - Desktop Actuation Tool
 
 **Version:** 1.0.0  
-**Last Updated:** February 2026  
-**Developer:** Kartik (NullVoider)
+**Last Updated:** July 2026  
+**Developer:** Kartik A (NullVoider)
 
 ---
 
@@ -24,17 +24,23 @@
    - [JWT Tokens](#jwt-tokens)
    - [Token Scopes](#token-scopes)
    - [Environment Variables](#environment-variables)
-8. [Command Syntax Reference](#command-syntax-reference)
+8. [Security Model](#security-model)
+   - [Transport Security (TLS)](#transport-security-tls)
+   - [Structured Commands: No Shell Anywhere](#structured-commands-no-shell-anywhere)
+   - [Agent Identity and Stream Binding](#agent-identity-and-stream-binding)
+   - [Local Data at Rest](#local-data-at-rest)
+   - [Threat Model and Non-Goals](#threat-model-and-non-goals)
+9. [Command Syntax Reference](#command-syntax-reference)
    - [Mouse Commands](#mouse-commands)
    - [Keyboard Commands](#keyboard-commands)
    - [Position Tracking](#position-tracking)
    - [Platform Differences](#platform-differences)
-9. [Usage Modes](#usage-modes)
-   - [Interactive Mode](#interactive-mode)
-   - [Single Execute Mode](#single-execute-mode)
-   - [Batch Mode](#batch-mode)
-   - [Watch Mode](#watch-mode)
-10. [CLI Command Reference](#cli-command-reference)
+10. [Usage Modes](#usage-modes)
+    - [Interactive Mode](#interactive-mode)
+    - [Single Execute Mode](#single-execute-mode)
+    - [Batch Mode](#batch-mode)
+    - [Watch Mode](#watch-mode)
+11. [CLI Command Reference](#cli-command-reference)
     - [server](#server)
     - [agent](#agent)
     - [connect](#connect)
@@ -46,17 +52,19 @@
     - [export](#export)
     - [audit](#audit)
     - [token](#token)
+    - [gen-certs](#gen-certs)
     - [config](#config)
     - [version / doctor / update / uninstall](#version--doctor--update--uninstall)
-11. [Configuration](#configuration)
-12. [Session Management](#session-management)
-13. [Metrics and Monitoring](#metrics-and-monitoring)
-14. [Export System](#export-system)
-15. [Audit Logging](#audit-logging)
-16. [WatchCommands Stream](#watchcommands-stream)
-17. [Troubleshooting](#troubleshooting)
-18. [License](#license)
-19. [About This Project](#about-this-project)
+12. [Configuration](#configuration)
+13. [Session Management](#session-management)
+14. [Metrics and Monitoring](#metrics-and-monitoring)
+15. [Export System](#export-system)
+16. [Audit Logging](#audit-logging)
+17. [WatchCommands Stream](#watchcommands-stream)
+18. [Troubleshooting](#troubleshooting)
+19. [Deployment Notes](#deployment-notes)
+20. [License](#license)
+21. [About This Project](#about-this-project)
 
 ---
 
@@ -83,11 +91,14 @@ Control Center consists of three components:
 
 - ✅ **Cross-Platform Actuation**: Windows, macOS, and Linux (X11) support from a single command interface
 - ✅ **Three Usage Modes**: Interactive shell, single-command execution, and batch file execution
-- ✅ **Line Editing & History**: The interactive console supports readline line editing (arrow-key cursor movement) and per-session up/down command history (in-memory, survives `clear`)
+- ✅ **Line Editing & History**: The interactive console supports readline line editing (arrow-key cursor movement) and up/down command history that persists across `connect` sessions, is cleared when the server restarts, and is encrypted at rest (key in the OS keyring)
 - ✅ **Live Command Streaming**: WatchCommands gRPC stream for real-time event observation by external tools
 - ✅ **Auto OS Detection**: Server detects connected agent OS and dispatches commands to the correct backend automatically
 - ✅ **Position Tracking**: All mouse commands automatically report final cursor coordinates after execution
-- ✅ **JWT Authentication**: Scope-based token authentication for all privileged operations
+- ✅ **TLS by Default**: All gRPC traffic is encrypted; the server refuses to start without a certificate unless insecure mode is explicitly requested. `control-center gen-certs` generates local development material
+- ✅ **JWT Authentication**: Scope-based token authentication on every RPC that returns data or acts (`Ping` is the sole liveness exception)
+- ✅ **Shell-Free Actuation**: Commands travel as a structured argument vector and are executed directly. The agent never invokes a shell, and every argument is validated against an actuation grammar before a process is spawned
+- ✅ **Bound Agent Identity**: Agents authenticate with an `agent`-scoped token, and the command stream is bound to the agent that registered it
 - ✅ **Session Persistence**: Sessions are saved to disk and accessible after disconnect
 - ✅ **Reconnection Logic**: Interactive mode automatically attempts reconnection on connection loss
 - ✅ **Batch File Support**: Execute commands from txt, JSON, NDJSON, YAML, or CSV files
@@ -116,19 +127,25 @@ The Control Center Server is a Rust-based gRPC service that acts as the command 
 
 **gRPC Service Endpoints:**
 
-| RPC | Auth Required | Description |
-|-----|--------------|-------------|
-| `ExecuteCommand` | Yes (`execute` scope) | Execute a single command on the agent |
-| `ExecuteCommandStream` | Yes (`execute` scope) | Execute a command and stream partial responses |
-| `GetAgentInfo` | Yes (`monitor` scope) | Get agent OS, version, and capability info |
-| `QueryConnections` | No | List currently connected agents |
-| `QueryServers` | No | List server identity and status |
-| `GetServerIdentity` | No | Get server ID, hostname, version, and uptime |
-| `Ping` | No | Round-trip liveness check |
-| `GetMetrics` | Yes (`metrics` scope) | Prometheus-style performance metrics |
-| `DisconnectAgent` | Yes (`admin` scope) | Send graceful disconnect signal to agent |
-| `GetConnectionHistory` | No | Retrieve historical connection records |
-| `WatchCommands` | No | Stream live command events (read-only) |
+Every RPC below requires a valid JWT except `Ping`. A token that authenticates but
+lacks the listed scope is rejected with `PERMISSION_DENIED`.
+
+| RPC | Required Scope | Description |
+|-----|---------------|-------------|
+| `ExecuteCommand` | `execute` | Execute a single command on the agent |
+| `DisconnectAgent` | `admin` | Send graceful disconnect signal to agent |
+| `RegisterAgent` | `agent` | Agent announces itself and receives a connection ID |
+| `AgentStream` | `agent` | Bidirectional command stream, bound to the registering agent |
+| `GetAgentInfo` | `monitor` | Get agent OS, version, and capability info |
+| `QueryConnections` | `monitor` | List currently connected agents |
+| `QueryServers` | `monitor` | List server identity and status |
+| `GetServerIdentity` | `monitor` | Get server ID, hostname, version, and uptime |
+| `GetConnectionHistory` | `monitor` | Retrieve historical connection records |
+| `MonitorConnection` | `monitor` | Stream connection-state changes |
+| `WatchCommands` | `monitor` | Stream live command events (read-only) |
+| `GetMetrics` | `metrics` | Prometheus-style performance metrics |
+| `Ping` | none | Round-trip liveness check (returns no data) |
+| `Execute` | — | **Retired.** Carried an unstructured shell string; returns `UNIMPLEMENTED`. Use `ExecuteCommand` |
 
 ### Agent Capabilities
 
@@ -144,11 +161,12 @@ The Control Center Agent is a Rust binary that runs on the target machine and ex
 
 **Core Functions:**
 
-- Registers with the server on startup with OS type, version, and capabilities
-- Receives and executes command strings from the server
+- Authenticates to the server with an `agent`-scoped JWT and registers its OS type, version, and capabilities
+- Connects over TLS, verifying the server against a configured CA
+- Receives a structured argument vector per command and executes it directly — no shell is involved at any point
+- Validates every argument against an actuation grammar and refuses anything outside it
 - Captures mouse position after every mouse action
-- Responds to the server's Ping RPC for liveness checks
-- Reports execution success/failure and timing back with each command result
+- Reports execution success/failure, timing, and the argv actually executed with each result
 - Sends keepalive signals to maintain server connection
 - Detects and reports capabilities available on the host (e.g., `cliclick`, `xdotool`)
 
@@ -158,9 +176,10 @@ The Python controller provides the CLI and `GRPCClient` class used to interact w
 
 **Core Functions:**
 
-- Connects to the server over gRPC (plaintext or SSL)
-- Manages JWT authentication and token resolution (flag → env var → config file)
+- Connects to the server over TLS by default, trusting a private CA via `CC_TLS_CA`
+- Manages JWT authentication and token resolution (flag → env var → config file), reading tokens from a no-echo prompt rather than argv
 - Auto-detects agent OS and initializes the appropriate actuation controller
+- Translates each human command into a structured argument vector; no shell string is ever constructed
 - Provides three command execution modes: interactive, execute, and batch
 - Streams live command events from WatchCommands
 - Manages session lifecycle and persists session data between runs
@@ -209,28 +228,31 @@ The Python controller provides the CLI and `GRPCClient` class used to interact w
 #### Data Flow
 
 1. **Command Input**: User types a command in interactive mode, or `execute`/`batch` is called
-2. **Actuation Layer**: Python controller translates the human command into the OS-specific format
-3. **gRPC Call**: `ExecuteCommand` RPC is sent to the server with the translated command string
-4. **Validation**: Server validates the JWT token and scope
-5. **Dispatch**: Server forwards the command to the connected Rust agent
-6. **Execution**: Agent runs the command via the platform backend (AHK / cliclick / xdotool)
-7. **Position Capture**: Agent captures final mouse coordinates after mouse commands
-8. **Response**: Result, position, and timing are returned up the chain
-9. **Broadcast**: Server broadcasts a `CommandEvent` to all WatchCommands subscribers
+2. **Actuation Layer**: Python controller translates the human command into a structured argument vector (`argv`) for the target platform, plus the original text as `human_command` for the record
+3. **gRPC Call**: `ExecuteCommand` is sent to the server over TLS with `argv` and `human_command`
+4. **Validation**: Server verifies the JWT, enforces the `execute` scope, applies the rate limit, and rejects any request that omits `argv`
+5. **Dispatch**: Server forwards the command to the connected Rust agent over the bound agent stream
+6. **Grammar Check**: Agent validates `argv` against the actuation grammar — the binary, its sub-command, and every argument — and refuses anything outside it
+7. **Execution**: Agent spawns the platform backend directly (AHK file-drop / cliclick / osascript / xdotool). No shell is involved
+8. **Position Capture**: Agent captures final mouse coordinates after mouse commands
+9. **Response**: Result, position, timing, and the argv actually executed are returned up the chain
+10. **Broadcast**: Server broadcasts a `CommandEvent` to all `monitor`-scoped WatchCommands subscribers
 
 ### Platform Backends
 
 **Windows — AutoHotkey v2**
 
-Commands are written to `C:\mouse_cmd.txt` and `C:\keyboard_cmd.txt` and executed by a persistent AHK v2 script running on the agent machine. This approach avoids spawning a new AHK process per command, which gives lower latency.
+Commands are written to `C:\mouse_cmd.txt` and `C:\keyboard_cmd.txt` and picked up by a persistent AHK v2 script running on the agent machine. This avoids spawning a new AHK process per command, which gives lower latency. The agent writes these two files directly through the filesystem — the write target is restricted to exactly those two paths.
 
 **macOS — cliclick + osascript**
 
-Mouse commands use `cliclick` (a command-line tool for simulating mouse events). Keyboard commands — including `type` and all modifier+key combinations — use `osascript` with AppleScript's `keystroke` and `key code` commands. Commands containing `&&` or `t:"` (cliclick type syntax) are run via `sh -c` to allow compound execution.
+Mouse commands use `cliclick` (a command-line tool for simulating mouse events). Keyboard commands — including `type` and all modifier+key combinations — use `osascript` with AppleScript's `keystroke` and `key code` commands, each passed as a single argument. Accepted AppleScript is restricted to those two forms; a free-form script is refused.
+
+Scrolling is the one action needing two binaries (a `cliclick` focus click followed by an AppleScript key-repeat loop). It is sent as a bounded `__scroll__` instruction that the agent expands itself, so the two programs run in sequence without a shell and the action is still recorded as a single event.
 
 **Linux — xdotool**
 
-Both mouse and keyboard commands are executed via `xdotool` through `sh -c`. The `DISPLAY` environment variable must be set. On headless systems, Xvfb can provide a virtual display.
+Both mouse and keyboard commands are executed by spawning `xdotool` directly with a validated argument list. The `DISPLAY` environment variable is supplied by the agent. On headless systems, Xvfb can provide a virtual display.
 
 ---
 
@@ -379,26 +401,57 @@ pip install -e crates/controller
 export CC_JWT_SECRET='your-secret-at-least-64-characters-long'
 ```
 
-### 2. Start the Server
+The server refuses to start if the secret is shorter than 32 characters.
+
+### 2. Generate TLS Material
+
+TLS is mandatory. For local development, generate a self-signed CA and server
+certificate:
+
+```bash
+control-center gen-certs
+```
+
+This writes `ca.crt`, `server.crt`, and `server.key` to
+`~/.config/control-center/tls/` (keys `0600`) and prints the variables to export.
+For production, supply your own certificate instead.
+
+```bash
+export CC_TLS_CERT=~/.config/control-center/tls/server.crt   # server
+export CC_TLS_KEY=~/.config/control-center/tls/server.key    # server
+export CC_TLS_CA=~/.config/control-center/tls/ca.crt         # CLI
+```
+
+### 3. Start the Server
 
 ```bash
 control-center server start
 ```
 
-### 3. Generate a Token
+### 4. Generate Tokens
+
+The operator and the agent need separate tokens with different scopes:
 
 ```bash
+# Operator: run commands and read monitoring data
 export CONTROL_CENTER_TOKEN=$(control-center token generate --user me --scopes execute monitor)
+
+# Agent: register and serve the command stream, nothing else
+control-center token generate --user guest-vm --scopes agent -o agent.token
 ```
 
-### 4. Start the Agent on the Target Machine
+### 5. Start the Agent on the Target Machine
 
 ```bash
 # On the target machine (or same machine for local testing)
+export AGENT_TLS_CA=/path/to/ca.crt
+export CONTROL_CENTER_TOKEN=$(cat agent.token)
 control-center agent start --server-host 127.0.0.1
 ```
 
-### 5. Connect and Start Controlling
+The agent will not connect without both the CA and an `agent`-scoped token.
+
+### 6. Connect and Start Controlling
 
 ```bash
 control-center connect --host 127.0.0.1
@@ -433,14 +486,25 @@ The controller resolves the token in this priority order: `--token` flag → `CO
 
 ### Token Scopes
 
-| Scope | Permitted RPCs |
-|-------|---------------|
-| `execute` | `ExecuteCommand`, `ExecuteCommandStream` |
-| `monitor` | `GetAgentInfo`, `QueryConnections`, `QueryServers` |
-| `metrics` | `GetMetrics` |
-| `admin` | `DisconnectAgent`, all admin operations |
+| Scope | Permitted RPCs | Typically held by |
+|-------|---------------|-------------------|
+| `execute` | `ExecuteCommand` | Operators and automation drivers |
+| `monitor` | `GetAgentInfo`, `QueryConnections`, `QueryServers`, `GetServerIdentity`, `GetConnectionHistory`, `MonitorConnection`, `WatchCommands` | Operators, dashboards, recording consumers |
+| `admin` | `DisconnectAgent` | Administrators only |
+| `agent` | `RegisterAgent`, `AgentStream` | The agent binary only — never an operator |
+| `metrics` | `GetMetrics` | Scrapers such as Prometheus |
 
-RPCs marked "No auth required" (`QueryConnections`, `QueryServers`, `Ping`, `GetConnectionHistory`, `WatchCommands`) do not require a token.
+Scopes are additive: an operator token is normally minted with `execute monitor`.
+Grant `admin` separately and sparingly, since it can forcibly disconnect a live agent.
+
+Every RPC other than `Ping` requires a token, and a token lacking the required scope
+is rejected with `PERMISSION_DENIED` even though it authenticated successfully. The
+`agent` scope is deliberately disjoint from the operator scopes: an agent token cannot
+issue commands, and an operator token cannot impersonate an agent.
+
+**A note on the `monitor` scope:** the `WatchCommands` stream carries `raw_command`,
+which includes text typed into the guest. Treat a `monitor` token as sensitive and
+issue it only to consumers that are entitled to see keystroke content.
 
 ### Environment Variables
 
@@ -450,13 +514,159 @@ RPCs marked "No auth required" (`QueryConnections`, `QueryServers`, `Ping`, `Get
 | `JWT_SECRET` | Server binary | JWT secret as read directly by the Rust server |
 | `JWT_AUDIENCE` | Controller + Server | JWT audience claim (default: `control-center`) |
 | `JWT_ISSUER` | Controller | JWT issuer claim (default: `control-center-auth`) |
-| `CONTROL_CENTER_TOKEN` | Controller | API token for authenticated commands |
+| `CONTROL_CENTER_TOKEN` | Controller + Agent | API token. For the agent this must carry the `agent` scope |
 | `AGENT_SERVER_HOST` | Agent binary | Server host the agent connects to |
 | `AGENT_SERVER_PORT` | Agent binary | Server port the agent connects to |
 | `SERVER_ADDR` | Server binary | Bind address for the server (e.g., `0.0.0.0:50051`) |
 | `SINGLE_AGENT_MODE` | Server binary | `true` = only one agent allowed (default), `false` = multi-agent |
 | `CONTROL_CENTER_NETWORK` | Server binary | Network label for this server instance |
 | `RUST_LOG` | Agent + Server | Log level for Rust binaries (e.g., `info`, `debug`) |
+
+**TLS variables:**
+
+| Variable | Used By | Description |
+|----------|---------|-------------|
+| `CC_TLS_CERT` | Server binary | Path to the server certificate (PEM). Required unless `CC_ALLOW_INSECURE` |
+| `CC_TLS_KEY` | Server binary | Path to the server private key (PEM). Required unless `CC_ALLOW_INSECURE` |
+| `CC_TLS_CA` | Controller | CA certificate used to verify the server. Omit to use system roots |
+| `CC_TLS_SERVER_NAME` | Controller | Override the name verified against the certificate (for connecting by IP to a DNS-SAN cert) |
+| `AGENT_TLS_CA` | Agent binary | CA certificate the agent uses to verify the server |
+| `CC_ALLOW_INSECURE` | Controller + Server | `true` disables TLS. **Development only** |
+| `AGENT_ALLOW_INSECURE` | Agent binary | `true` lets the agent connect without TLS. **Development only** |
+
+Both insecure switches exist so a local loop can be run without certificates. They are
+off by default, and the server refuses to start rather than silently downgrading: if
+`CC_TLS_CERT`/`CC_TLS_KEY` are unset and `CC_ALLOW_INSECURE` is not `true`, startup
+fails with an explanatory error.
+
+**Setting `RUST_LOG=debug` causes the agent and server to log `human_command`, which
+for a `type` command contains the typed text.** Avoid debug logging during sessions
+where credentials are entered.
+
+---
+
+## Security Model
+
+Control Center grants remote keyboard and mouse control over a desktop, so the
+security boundary that matters is this: **a token that can actuate must be able to
+actuate and nothing else.** The design below exists to hold that line.
+
+### Transport Security (TLS)
+
+All gRPC traffic — commands, tokens, and the live command stream — is carried over
+one-way TLS. The server presents a certificate; controllers and agents verify it
+against a configured CA.
+
+- The server **refuses to start** without `CC_TLS_CERT`/`CC_TLS_KEY` unless
+  `CC_ALLOW_INSECURE=true` is set explicitly. There is no silent fallback to plaintext.
+- The agent **refuses to connect** without `AGENT_TLS_CA` unless
+  `AGENT_ALLOW_INSECURE=true` is set explicitly.
+- The CLI defaults to TLS; `CC_ALLOW_INSECURE` opts out for local development.
+- `control-center gen-certs` produces a self-signed CA and server certificate
+  (RSA-4096, SHA-256, SANs for `localhost`, the loopback addresses, and this host)
+  for development. Use real certificates in production.
+
+Client certificates (mutual TLS) are **not** implemented. Callers are identified by
+JWT, not by certificate.
+
+### Structured Commands: No Shell Anywhere
+
+Actuation commands are transmitted as a structured argument vector, never as a shell
+string, and **the agent invokes no shell at any point**. This is enforced at three
+independent layers:
+
+1. **The controller** builds an `argv` list. Typed text becomes a single list element,
+   so quoting and escaping never enter the picture.
+2. **The server** rejects any `ExecuteCommand` without `argv`. The legacy
+   `CommandRequest.command` shell-string field and the old `Execute` RPC are refused
+   outright, so no request can reach an interpreter.
+3. **The agent** validates `argv` against a deny-by-default actuation grammar before
+   spawning anything, then executes the binary directly.
+
+The grammar constrains far more than the program name, because several actuation
+binaries can launch other programs if handed arbitrary arguments:
+
+| Binary | What is accepted |
+|--------|------------------|
+| `xdotool` | Only the sub-commands `type`, `key`, `click`, `mousemove`, `mousedown`, `mouseup`, `getmouselocation`, with per-sub-command argument shapes. `exec`, `spawn`, and `behave` have no accepting branch |
+| `cliclick` | Only `prefix:value` action tokens from a fixed prefix set, so no option flags can be passed |
+| `osascript` | Only `-e` pairs whose script matches one of two anchored templates (`keystroke "<literal>"` and `key code <n> [using {…}]`). Free-form scripts, and therefore `do shell script`, are refused |
+| `__write__` | Writes only to `C:\keyboard_cmd.txt` or `C:\mouse_cmd.txt` (Windows AHK input files) |
+| `__scroll__` | A bounded scroll instruction the agent expands into a fixed cliclick + AppleScript sequence |
+
+Two subtleties worth knowing, because they are easy to get wrong:
+
+- **Typed text is data, never syntax.** A payload such as
+  `type hello$(id)` is typed literally — there is no interpreter for it to reach.
+- **An allow-listed binary's own option parser is part of the attack surface.**
+  `xdotool type` parses options with `getopt_long`, so a payload in `--opt=value` form
+  is read as an option even though it is a single argument — and `--file=PATH` would
+  type the contents of that file. The agent therefore inserts a `--` terminator before
+  the payload, so it is always treated as text. Any binary added to the grammar in
+  future needs the same review of its full option list.
+
+Caller-supplied waits and delays are bounded (60 s) so a single command cannot stall
+actuation.
+
+### Agent Identity and Stream Binding
+
+Agents are authenticated, not merely accepted:
+
+- `RegisterAgent` requires a JWT carrying the `agent` scope; the registering subject
+  is recorded on the connection.
+- `AgentStream` requires the same scope **and** is bound to the subject that
+  registered. A different `agent`-token holder cannot attach to a live connection, and
+  a connection that already has a stream cannot acquire a second one.
+
+This matters because the command stream carries the operator's typed text and its
+responses become the recorded command history. Without binding, any holder of any
+`agent`-scoped token could attach a second handler, race the shared command queue,
+read keystrokes, and return forged results.
+
+Because the agent token is typically baked into a guest image, treat it as a
+credential that will eventually leak: scope it to `agent` only, and rotate it when the
+image is redistributed.
+
+### Local Data at Rest
+
+- **Command history** persists across `connect` sessions and is cleared when the
+  server restarts. It is encrypted with Fernet using a key held in the OS keyring. If
+  no keyring backend is available it stays in memory for that session rather than
+  being written under weaker protection.
+- **Session, export, and token files** are written owner-only (`0600`, in `0700`
+  directories).
+- **Tokens are never passed on the command line.** `token inspect`, `token validate`,
+  and `config set-token` read from a no-echo prompt when the argument is omitted,
+  because argv is visible in the process list and shell history. Passing one anyway
+  prints a warning.
+
+### Threat Model and Non-Goals
+
+**Defended against:**
+
+- Network eavesdropping and tampering on the command path (TLS)
+- An unauthenticated party issuing commands, reading the command stream, or
+  impersonating an agent (JWT + scopes + stream binding)
+- Privilege escalation from actuation to arbitrary code execution on the guest
+  (structured argv, grammar validation, no shell)
+- A narrow token reading data it was not granted (per-RPC scope checks)
+- Credential exposure through argv, shell history, or world-readable local files
+
+**Explicitly not defended against:**
+
+- **A compromised operator with `execute` scope.** Keyboard control is inherently
+  powerful: anyone who can synthesise keystrokes can drive whatever the desktop
+  session can do, including opening a terminal. The grammar prevents the *agent
+  process* from being turned into a shell; it cannot prevent a legitimate keystroke
+  stream from being used maliciously. Scope tokens tightly and keep the audit log.
+- **A compromised guest.** An agent host under attacker control can report whatever it
+  likes; the server trusts a registered, authenticated agent's responses.
+- **Denial of service.** Rate limiting (100 requests/60 s per token subject) blunts
+  casual abuse, but the single-agent model means a determined authorised caller can
+  monopolise actuation.
+- **Client certificates / mutual TLS.** Not implemented; identity comes from JWT.
+- **Secrets in the corpus.** The recording path stores `raw_command` by design. If
+  credentials are typed during a recorded session, they are in the recording.
 
 ---
 
@@ -599,7 +809,7 @@ control-center connect --host 192.168.1.100 --token YOUR_TOKEN
 
 - Persistent connection — no per-command connection overhead
 - Line editing: move the cursor with the left/right arrow keys and edit the current line (readline-backed; on Windows the native console provides editing)
-- Command history: recall previous commands with the up/down arrow keys. History is per-session and held in memory only — it is never written to disk and it survives `clear`
+- Command history: recall previous commands with the up/down arrow keys. History **persists across `connect` sessions** and is cleared when the **server restarts** (it is keyed to the server's process-start time). It is **encrypted at rest** — stored under `~/.config/control-center/history/` with a key held in your OS keyring (0600), capped at ~5000 entries, and it survives `clear`. When no keyring backend is available it falls back to in-memory-only for that session
 - Live reconnection: if the connection drops, the session automatically attempts to reconnect (up to the configured retry limit)
 - VM shutdown detection: if the target machine powers off, the session is gracefully terminated with a clear notification
 - Agent-disconnect detection: if the agent disconnects while you are idle at the prompt, the session is terminated promptly without needing a keypress
@@ -1116,6 +1326,36 @@ Exits with code 0 if valid, 1 if expired or invalid.
 
 ---
 
+### gen-certs
+
+Generate a self-signed CA and server certificate for local or development TLS.
+Requires the `cryptography` package.
+
+```bash
+control-center gen-certs [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--out-dir` | `~/.config/control-center/tls` | Output directory |
+| `--host` | — | Additional DNS name or IP SAN (repeatable) |
+| `--days` | `825` | Certificate validity in days |
+
+Writes `ca.crt`, `server.crt`, and `server.key` (keys `0600`, directory `0700`), and
+prints the environment variables to export for the server, CLI, and agent. SANs always
+include `localhost`, the loopback addresses, and this host's name and primary IP.
+
+```bash
+# Local development
+control-center gen-certs
+
+# Include the LAN address agents will dial
+control-center gen-certs --host 192.168.1.50 --host cc.internal
+```
+
+This is a convenience for development and self-hosted setups. In production, supply a
+certificate from your own CA and point `CC_TLS_CERT` / `CC_TLS_KEY` at it.
+
 ### config
 
 Manage the local configuration file.
@@ -1279,11 +1519,16 @@ The audit log is append-only and rotated by date. Use `control-center audit tail
 
 ## WatchCommands Stream
 
-`WatchCommands` is a server-side streaming gRPC RPC that broadcasts all command events in real-time. It requires no authentication, making it safe to expose to read-only observers.
+`WatchCommands` is a server-side streaming gRPC RPC that broadcasts all command events
+in real-time, intended for read-only observers such as a recording consumer.
+
+**It requires a `monitor`-scoped token.** The stream carries `raw_command`, which
+includes text typed into the guest, so it is not safe to expose unauthenticated. Issue
+`monitor` tokens only to consumers entitled to see keystroke content.
 
 **Key properties:**
 
-- Opens immediately with an empty `WatchRequest`
+- Opens with an empty `WatchRequest` and a `monitor` token in the request metadata
 - Emits one `CommandEvent` per command executed by the agent
 - Emits a heartbeat event every 5 seconds when no commands are executing
 - Stream closes automatically when the agent disconnects from the server
@@ -1314,10 +1559,13 @@ The audit log is append-only and rotated by date. Use `control-center audit tail
 **Consuming the stream programmatically:**
 
 ```python
-from controller.integrations.grpc_client import GRPCClient
+import os
+from controller.integrations.gRPC import GRPCClient
 
-client = GRPCClient(host="192.168.1.100", port=50051)
-# No token needed for WatchCommands
+# CC_TLS_CA must point at the server's CA so the channel can verify it.
+client = GRPCClient(host="192.168.1.100", port=50051, use_ssl=True)
+client.connect()
+client.set_token(os.environ["CONTROL_CENTER_TOKEN"])  # needs the `monitor` scope
 
 for event in client.watch_commands():
     if event['is_heartbeat']:
@@ -1346,8 +1594,50 @@ Check that:
 1. The server is running: `control-center server start`
 2. The host and port are correct: `control-center config show`
 3. `JWT_SECRET` is set before starting the server
-4. The port is not blocked by a firewall
-5. The agent is running on the target machine: `control-center agent start`
+4. `CC_TLS_CA` points at the CA that signed the server certificate
+5. The port is not blocked by a firewall
+6. The agent is running on the target machine: `control-center agent start`
+
+### TLS errors
+
+```
+TLS is required: set CC_TLS_CERT and CC_TLS_KEY, or set CC_ALLOW_INSECURE=true
+```
+
+The server will not start without a certificate. Run `control-center gen-certs` and
+export the printed variables, or set `CC_ALLOW_INSECURE=true` for a local plaintext
+loop.
+
+```
+CERTIFICATE_VERIFY_FAILED / handshake failure
+```
+
+The client does not trust the server's certificate. Point `CC_TLS_CA` (CLI) or
+`AGENT_TLS_CA` (agent) at the CA file. If the certificate has a DNS SAN but you are
+connecting by IP, set `CC_TLS_SERVER_NAME` to the name in the certificate, or reissue
+with `control-center gen-certs --host <ip>`.
+
+```
+TLS required: set AGENT_TLS_CA ...
+```
+
+The agent has no CA configured. Export `AGENT_TLS_CA`, or `AGENT_ALLOW_INSECURE=true`
+for local testing against a plaintext server.
+
+### Command rejected: "is not an allowed actuation binary"
+
+The agent validates every command against the actuation grammar (see
+[Security Model](#security-model)). This error means the argument vector fell outside
+it. When using the CLI this should not happen — report it as a bug with the command
+you typed. When driving `GRPCClient` directly, check that `argv[0]` is one of
+`xdotool`, `cliclick`, `osascript`, `__write__`, or `__scroll__`, and that the
+sub-command and arguments match an accepted shape.
+
+### Command rejected: "argv is required"
+
+The server no longer accepts the legacy `command` shell string, and the `Execute` RPC
+is retired. Send `argv` plus `human_command` via `ExecuteCommand`. This usually means a
+client older than the server, or a server older than the client — deploy them together.
 
 ### Token rejected / authentication failed
 
@@ -1429,6 +1719,33 @@ control-center --debug connect --host 192.168.1.100
 
 ---
 
+## Deployment Notes
+
+**The server, agent, and CLI must be deployed together.** They share a wire contract
+that changed with the introduction of TLS, per-RPC scopes, and structured argv: an old
+agent cannot serve a new server, and an old client cannot drive one. Rolling out only
+the CLI will fail closed, not degrade gracefully.
+
+A deployment needs, in order:
+
+1. **TLS material** — a certificate and key for the server, and the CA distributed to
+   every controller (`CC_TLS_CA`) and agent (`AGENT_TLS_CA`).
+2. **A shared `JWT_SECRET`** of at least 32 characters, available to the server and to
+   whatever mints tokens.
+3. **An `agent`-scoped token** provisioned to each agent host. Where the agent is baked
+   into a VM or container image, the token ships with the image — scope it to `agent`
+   only and rotate it whenever the image is redistributed.
+4. **A `monitor`-scoped token** for any consumer of `WatchCommands`, `QueryConnections`,
+   or the other read RPCs. These previously needed no token; they are now refused
+   without one.
+5. **Operator tokens** with `execute monitor`, and `admin` only where forced disconnect
+   is genuinely required.
+
+Because the agent binary changes, `agent_version` changes with it. Schedule the
+rollout during a pause in any recording or capture activity rather than mid-session.
+
+---
+
 ## Support
 
 - **Issues:** [GitHub Issues](https://github.com/nullvoider07/control-center/issues)
@@ -1436,14 +1753,14 @@ control-center --debug connect --host 192.168.1.100
 
 ---
 
-**Last Updated:** February 2026  
-**Developer:** Kartik (NullVoider)
+**Last Updated:** July 2026  
+**Developer:** Kartik A (NullVoider)
 
 ---
 
 ## License
 
-Copyright (C) 2026 Kartik (NullVoider)
+Copyright (C) 2026 Kartik A (NullVoider)
 
 This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License version 3** as published by the Free Software Foundation.
 

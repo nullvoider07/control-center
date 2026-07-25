@@ -37,7 +37,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt cryptography keyring
 
       - name: Generate Protobuf Files
         run: |
@@ -66,6 +66,9 @@ jobs:
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
             --hidden-import=readline \
+            --hidden-import=cryptography \
+            --hidden-import=keyring \
+            --hidden-import=keyring.backends \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -161,7 +164,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt cryptography keyring
 
       - name: Generate Protobuf Files
         run: |
@@ -190,6 +193,9 @@ jobs:
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
             --hidden-import=readline \
+            --hidden-import=cryptography \
+            --hidden-import=keyring \
+            --hidden-import=keyring.backends \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -283,7 +289,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt cryptography keyring
 
       - name: Generate Protobuf Files
         run: |
@@ -312,6 +318,9 @@ jobs:
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
             --hidden-import=readline \
+            --hidden-import=cryptography \
+            --hidden-import=keyring \
+            --hidden-import=keyring.backends \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -413,7 +422,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt cryptography keyring
 
       - name: Generate Protobuf Files
         run: |
@@ -442,6 +451,9 @@ jobs:
             --hidden-import=psutil \
             --hidden-import=google.protobuf \
             --hidden-import=readline \
+            --hidden-import=cryptography \
+            --hidden-import=keyring \
+            --hidden-import=keyring.backends \
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -541,7 +553,7 @@ jobs:
 
       - name: Install PyInstaller and dependencies
         run: |
-          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt
+          pip install pyinstaller click grpcio grpcio-tools protobuf pyyaml requests psutil pyjwt cryptography keyring
 
       - name: Generate Protobuf Files
         shell: bash
@@ -570,6 +582,9 @@ jobs:
             --hidden-import=yaml `
             --hidden-import=psutil `
             --hidden-import=google.protobuf `
+            --hidden-import=cryptography `
+            --hidden-import=keyring `
+            --hidden-import=keyring.backends `
             crates/controller/management/cli.py
 
       - name: Get Version
@@ -675,16 +690,43 @@ jobs:
 
             - **Added** — Line editing at the `control-center>` prompt: left/right
               cursor movement and standard readline editing (via a bundled `readline`).
-            - **Added** — Per-session command history: recall previous commands with the
-              up/down arrows. History is in-memory only (not written to disk) and
-              survives `clear`.
+            - **Added** — Command history: recall previous commands with the up/down
+              arrows. History **persists across `connect` sessions** and is cleared when
+              the **server restarts** (keyed to the server's process-start time). It is
+              **encrypted at rest** with a key held in your OS keyring, capped at ~5000
+              entries, and survives `clear`. Where no keyring backend is available it
+              stays in-memory only for that session.
             - **Fixed** — Left/right arrow keys no longer insert raw escape sequences
               into the prompt.
             - **Changed** — The interactive input path was reworked from a stdin poll to
               a blocking readline reader; agent-disconnect-while-idle detection is
               preserved (an idle session still terminates promptly on disconnect).
 
-            _CLI only; the server and agent binaries are unchanged in this release._
+            ### 🔒 Security hardening
+
+            Client:
+            - Tokens are no longer required on the command line: `token inspect`,
+              `token validate`, and `config set-token` now read from a no-echo prompt
+              when omitted (argv is visible in the process list / shell history).
+            - Local files that can contain command history (`last_session.json`, session/
+              metrics exports, token-to-file output) are now written owner-only (0600).
+            - Typed text is no longer echoed to stdout/logs during actuation.
+            - TLS is on by default; `control-center gen-certs` generates local dev
+              material and `CC_TLS_CA` trusts a private CA.
+
+            Server and agent:
+            - Transport is TLS-only (`CC_TLS_CERT`/`CC_TLS_KEY`, `AGENT_TLS_CA`).
+            - Every RPC enforces a scope: `execute`, `admin` for disconnect, `monitor`
+              for the query/watch feed, `agent` for registration and the command stream.
+            - Commands are delivered as a structured argv validated against an actuation
+              grammar and executed without a shell; the legacy shell-string field is
+              rejected outright.
+            - The agent command stream is bound to the agent that registered it.
+
+            > ⚠️ **This release is not CLI-only.** The server and agent binaries changed
+            > and must be deployed together with the CLI: an old server or agent will not
+            > interoperate. Provision the CA, an `agent`-scoped token for the agent, and a
+            > `monitor`-scoped token for any monitoring consumer before upgrading.
 
             ## 📦 What's Included
             
