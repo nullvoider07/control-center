@@ -2,7 +2,7 @@
 
 import re
 import time
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 # Windows actuation class definition
 class WindowsActuation:
@@ -33,17 +33,16 @@ class WindowsActuation:
         self.grpc_client = grpc_client
     
     # Build command to get mouse position using PowerShell
-    def _build_position_command(self) -> str:
+    def _build_position_command(self) -> List[str]:
         """
-        Build the command to query mouse position.
+        Build the argv to query mouse position.
 
         Sends "position" through the same mouse_cmd.txt path as every other
-        mouse command.  The AHK v2 script running on the agent side handles
-        "position", and the Rust agent captures the coordinates via AHK v2
-        after execution and returns them in mouse_x / mouse_y.
+        mouse command via a direct file write (no shell).  The AHK v2 script on
+        the agent side handles "position", and the Rust agent captures the
+        coordinates and returns them in mouse_x / mouse_y.
         """
-        
-        return r'cmd /c echo position > C:\mouse_cmd.txt'
+        return ['__write__', r'C:\mouse_cmd.txt', 'position']
     
     # Parse the output from position command
     def _parse_position_output(self, output: str) -> Optional[Tuple[int, int]]:
@@ -77,8 +76,9 @@ class WindowsActuation:
             Tuple of (x, y) or None if failed
         """
         try:
-            pos_cmd = self._build_position_command()
-            result = self.grpc_client.execute_command(pos_cmd)
+            result = self.grpc_client.execute_command(
+                argv=self._build_position_command(), human_command='position',
+            )
             
             if result['success'] and result.get('position_captured'):
                 mx = result.get('mouse_x')
@@ -355,22 +355,27 @@ class WindowsActuation:
 
             if kb_action == 'press':
                 kb_content = self._convert_modifiers_to_explicit(kb_content)
-                echo_payload = f'press {kb_content}'
+                file_payload = f'press {kb_content}'
             else:
                 if '^' in kb_content:
                     safe = kb_content.replace('^', '{U+005E}')
-                    echo_payload = f'press {safe}'
+                    file_payload = f'press {safe}'
                 else:
-                    echo_payload = f'type {kb_content}'
+                    file_payload = f'type {kb_content}'
 
-            shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
+            # Write the AHK watcher file directly (agent uses fs, no cmd /c echo) — this
+            # removes the `> file` / echo shell-injection surface and preserves special
+            # characters verbatim (F5).
+            argv = ['__write__', r'C:\keyboard_cmd.txt', file_payload]
+            human_command = file_payload
         else:
-            shell_cmd = f'cmd /c echo {processed_cmd} > C:\\mouse_cmd.txt'
-        
+            argv = ['__write__', r'C:\mouse_cmd.txt', processed_cmd]
+            human_command = processed_cmd
+
         position_after = None
-        
-        # Send to server via gRPC
-        result = self.grpc_client.execute_command(shell_cmd)
+
+        # Send to server via gRPC (structured argv — no shell)
+        result = self.grpc_client.execute_command(argv=argv, human_command=human_command)
         
         # For mouse commands: Get position after action
         if cmd_type == 'mouse' and result['success']:
@@ -387,7 +392,8 @@ class WindowsActuation:
                     human = self._format_press_for_display(original_kb_content)
                     print(f"Pressed: {human}, time taken: {ms}ms")
                 else:
-                    print(f"Typed: {original_kb_content}, time taken: {ms}ms")
+                    # Do not echo typed content — it may contain secrets.
+                    print(f"Typed: {len(original_kb_content)} chars, time taken: {ms}ms")
             else:
                 # Mouse
                 tokens = command.strip().split()
@@ -453,7 +459,7 @@ class WindowsActuation:
         
         print(f"\n[*] Batch mode: Executing {len(commands)} commands...")
         
-        # Generator to yield formatted commands with progress info
+        # Generator to yield (argv, human_command) with progress info
         def command_generator():
             for i, command in enumerate(commands, 1):
                 cmd_type, formatted_cmd = self.detect_command_type(command)
@@ -463,23 +469,24 @@ class WindowsActuation:
                         kb_action, _, kb_content = formatted_cmd.partition(' ')
                         if kb_action == 'press':
                             kb_content = self._convert_modifiers_to_explicit(kb_content)
-                            echo_payload = f'press {kb_content}'
+                            file_payload = f'press {kb_content}'
                         else:
                             if '^' in kb_content:
                                 safe = kb_content.replace('^', '{U+005E}')
-                                echo_payload = f'press {safe}'
+                                file_payload = f'press {safe}'
                             else:
-                                echo_payload = f'type {kb_content}'
-                        shell_cmd = f'cmd /c echo {echo_payload} > C:\\keyboard_cmd.txt'
+                                file_payload = f'type {kb_content}'
+                        argv = ['__write__', r'C:\keyboard_cmd.txt', file_payload]
                     else:
-                        shell_cmd = f'cmd /c echo {formatted_cmd} > C:\\mouse_cmd.txt'
-                    yield shell_cmd, i, len(commands), command
-        
+                        argv = ['__write__', r'C:\mouse_cmd.txt', formatted_cmd]
+                        file_payload = formatted_cmd
+                    yield argv, file_payload, i, len(commands), command
+
         success_count = 0
         total_count = 0
-        
-        for formatted_cmd, i, total, original_cmd in command_generator():
-            result = self.grpc_client.execute_command(formatted_cmd)
+
+        for argv, human_command, i, total, original_cmd in command_generator():
+            result = self.grpc_client.execute_command(argv=argv, human_command=human_command)
             total_count += 1
             
             if result['success']:

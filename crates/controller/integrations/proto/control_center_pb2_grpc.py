@@ -5,7 +5,7 @@ import warnings
 
 import control_center_pb2 as control__center__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class ControlServiceStub(object):
+class ControlServiceStub:
     """============================================================================
     SERVICE DEFINITIONS
     ============================================================================
@@ -111,7 +111,7 @@ class ControlServiceStub(object):
                 _registered_method=True)
 
 
-class ControlServiceServicer(object):
+class ControlServiceServicer:
     """============================================================================
     SERVICE DEFINITIONS
     ============================================================================
@@ -298,7 +298,7 @@ def add_ControlServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class ControlService(object):
+class ControlService:
     """============================================================================
     SERVICE DEFINITIONS
     ============================================================================
@@ -685,7 +685,7 @@ class ControlService(object):
             _registered_method=True)
 
 
-class AgentServiceStub(object):
+class AgentServiceStub:
     """Agent service (agent-side) - kept for backwards compatibility if needed
     """
 
@@ -712,7 +712,7 @@ class AgentServiceStub(object):
                 _registered_method=True)
 
 
-class AgentServiceServicer(object):
+class AgentServiceServicer:
     """Agent service (agent-side) - kept for backwards compatibility if needed
     """
 
@@ -760,7 +760,7 @@ def add_AgentServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class AgentService(object):
+class AgentService:
     """Agent service (agent-side) - kept for backwards compatibility if needed
     """
 

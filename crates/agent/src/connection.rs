@@ -1,7 +1,7 @@
 // crates/agent/src/connection.rs
 // Agent Connection Management - Connect to server, register, maintain connection
 
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Certificate, ClientTlsConfig};
 use tonic::Request;
 use tracing::{info, warn, error};
 use tokio::time::{interval, Duration};
@@ -33,6 +33,9 @@ pub enum ConnectionStatus {
 /// Agent connection manager
 pub struct ConnectionManager {
     server_url: String,
+    server_host: String,
+    tls_ca: Option<Vec<u8>>,
+    allow_insecure: bool,
     agent_identity: crate::proto::AgentIdentity,
     auth_token: Option<String>,
     connection_id: Arc<RwLock<Option<String>>>,
@@ -52,14 +55,33 @@ impl ConnectionManager {
         agent_identity: crate::proto::AgentIdentity,
         auth_token: Option<String>,
     ) -> Self {
-        let server_url = format!("http://{}:{}", server_host, server_port);
-        
+        // Transport security (F1): use TLS when a CA is provided via AGENT_TLS_CA;
+        // otherwise refuse to connect unless AGENT_ALLOW_INSECURE is set (dev only).
+        let tls_ca = std::env::var("AGENT_TLS_CA").ok().and_then(|p| {
+            match std::fs::read(&p) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    warn!("Failed to read AGENT_TLS_CA '{}': {}", p, e);
+                    None
+                }
+            }
+        });
+        let allow_insecure = std::env::var("AGENT_ALLOW_INSECURE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let scheme = if tls_ca.is_some() { "https" } else { "http" };
+        let server_url = format!("{}://{}:{}", scheme, server_host, server_port);
+
         info!("Connection manager initialized");
         info!("  Server URL: {}", server_url);
+        info!("  TLS: {}", if tls_ca.is_some() { "enabled" } else { "disabled" });
         info!("  Agent ID: {}", agent_identity.agent_id);
-        
+
         Self {
             server_url,
+            server_host,
+            tls_ca,
+            allow_insecure,
             agent_identity,
             auth_token,
             connection_id: Arc::new(RwLock::new(None)),
@@ -129,9 +151,21 @@ impl ConnectionManager {
         loop {
             attempt += 1;
             
-            match Channel::from_shared(self.server_url.clone())?
-                .connect()
-                .await
+            let mut endpoint = Channel::from_shared(self.server_url.clone())?;
+            if let Some(ca) = &self.tls_ca {
+                let tls = ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(ca.clone()))
+                    .domain_name(self.server_host.clone());
+                endpoint = endpoint.tls_config(tls)?;
+            } else if !self.allow_insecure {
+                return Err(
+                    "TLS required: set AGENT_TLS_CA to the server CA cert, or set \
+                     AGENT_ALLOW_INSECURE=true to connect without TLS (development only)."
+                        .into(),
+                );
+            }
+
+            match endpoint.connect().await
             {
                 Ok(channel) => return Ok(channel),
                 Err(e) => {

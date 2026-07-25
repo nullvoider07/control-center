@@ -1,7 +1,7 @@
 """macOS-specific actuation with position tracking - Enhanced Implementation"""
 
 import re
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 # macOS actuation class definition
 class MacOSActuation:
@@ -76,9 +76,10 @@ class MacOSActuation:
             Tuple of (x, y) or None if failed
         """
         try:
-            # Use cliclick to get position
-            pos_cmd = f"{self.cliclick_path} p:."
-            result = self.grpc_client.execute_command(pos_cmd)
+            # Use cliclick to get position (argv — no shell)
+            result = self.grpc_client.execute_command(
+                argv=[self.cliclick_path, "p:."], human_command="position",
+            )
             
             if result['success'] and result.get('position_captured'):
                 mx = result.get('mouse_x')
@@ -224,10 +225,16 @@ class MacOSActuation:
         # Default: assume it's text to type
         return 'keyboard', f"type {command}"
     
-    # Helper method to build scroll command using AppleScript repeat loop
-    def build_scroll_command(self, x: Optional[int], y: Optional[int], 
-                              direction: str, amount: int) -> str:
-        """Build scroll command using AppleScript repeat loop"""
+    # Helper method to build the scroll argv
+    def build_scroll_command(self, x: Optional[int], y: Optional[int],
+                              direction: str, amount: int) -> Optional[List[str]]:
+        """Build the `__scroll__` argv for a scroll action.
+
+        Scrolling is the one action needing two binaries (a cliclick focus click, then
+        an AppleScript key-repeat loop), so it is sent as a sentinel the agent expands
+        itself rather than as a compound shell string. The agent authors both scripts;
+        only the bounded parameters below cross the wire.
+        """
         # Map direction to AppleScript Key Codes
         # 126=Up, 125=Down, 123=Left, 124=Right
         if direction in ['scroll_up', 'scroll-up', 'scrollup']:
@@ -239,121 +246,118 @@ class MacOSActuation:
         elif direction in ['scroll_right', 'scroll-right', 'scrollright']:
             key_code = 124
         else:
-            return ""
-        
-        # Build Focus Command (Click to ensure window receives keys)
-        if x is not None and y is not None:
-            focus_cmd = f"{self.cliclick_path} c:{x},{y} w:50"
-        else:
-            focus_cmd = f"{self.cliclick_path} c:. w:50"
-        
-        scroll_cmd = (
-            f"osascript -e 'tell application \"System Events\" to "
-            f"repeat {amount} times' "
-            f"-e 'key code {key_code}' "
-            f"-e 'delay 0.02' "
-            f"-e 'end repeat'"
-        )
-        return f"{focus_cmd} && {scroll_cmd}"
+            return None
+
+        # Focus click (ensures the window receives the keys), then the repeat count.
+        click = f"c:{x},{y}" if x is not None and y is not None else "c:."
+        return ['__scroll__', click, str(key_code), str(amount)]
     
     # Method to build mouse command based on parsed input
-    def build_mouse_command(self, command: str) -> str:
-        """Build command for mouse actions"""
+    def build_mouse_command(self, command: str) -> Optional[Tuple[List[str], str]]:
+        """Build (argv, human_command) for a mouse action.
+
+        cliclick actions carry no free-text, so argv = the cliclick tokens (executed
+        directly, no shell). Scroll uses the `__scroll__` sentinel.
+        """
         tokens = command.strip().split()
-        
+
         if not tokens:
-            return ""
-        
+            return None
+
         cli = self.cliclick_path
-        
+
+        def m(cli_str: str) -> Tuple[List[str], str]:
+            # cliclick args contain no whitespace/free-text, so split() is exact.
+            return (cli_str.split(), command)
+
+        def scroll(x, y, action, amount) -> Optional[Tuple[List[str], str]]:
+            argv = self.build_scroll_command(x, y, action, amount)
+            return (argv, command) if argv else None
+
         # Position command - Returns current coordinates
         if tokens[0] == 'position':
-            return f"{cli} p:."
-        
+            return m(f"{cli} p:.")
+
         # CASE A: "here <action> [amount]"
         if tokens[0] == 'here':
             action = tokens[1] if len(tokens) > 1 else 'left'
-            
-            # Simple clicks
-            if action in ['left', 'click']: return f"{cli} c:."
-            elif action == 'right':         return f"{cli} rc:."
-            elif action == 'double':        return f"{cli} dc:."
-            elif action == 'triple':        return f"{cli} tc:."
-            elif action == 'middle':        return f"{cli} mc:."
-            elif action == 'hold':          return f"{cli} dd:."
-            elif action == 'release':       return f"{cli} du:."
-            
-            # Scrolling (No coords needed)
+
+            here_map = {
+                'left': 'c:.', 'click': 'c:.', 'right': 'rc:.', 'double': 'dc:.',
+                'triple': 'tc:.', 'middle': 'mc:.', 'hold': 'dd:.', 'release': 'du:.',
+            }
+            if action in here_map:
+                return m(f"{cli} {here_map[action]}")
             elif 'scroll' in action:
                 amount = int(tokens[2]) if len(tokens) > 2 else 5
-                return self.build_scroll_command(None, None, action, amount)
-            return ""
-        
+                return scroll(None, None, action, amount)
+            return None
+
         # CASE B: "x y <action> [amount]"
         try:
             x, y = int(tokens[0]), int(tokens[1])
             if len(tokens) == 2:
-                return f"{cli} m:{x},{y}"
-            
+                return m(f"{cli} m:{x},{y}")
+
             action = tokens[2]
-            if action == 'move':
-                return f"{cli} m:{x},{y}"
-            elif action in ['left', 'click']:
-                return f"{cli} c:{x},{y}"
-            elif action == 'right':
-                return f"{cli} rc:{x},{y}"
-            elif action == 'double':
-                return f"{cli} dc:{x},{y}"
-            elif action == 'triple':
-                return f"{cli} tc:{x},{y}"
-            elif action == 'middle':
-                return f"{cli} mc:{x},{y}"
-            elif action == 'hold':
-                return f"{cli} dd:{x},{y}"
-            elif action == 'release':
-                return f"{cli} du:{x},{y}"
+            coord_map = {
+                'move': 'm', 'left': 'c', 'click': 'c', 'right': 'rc',
+                'double': 'dc', 'triple': 'tc', 'middle': 'mc', 'hold': 'dd', 'release': 'du',
+            }
+            if action in coord_map:
+                return m(f"{cli} {coord_map[action]}:{x},{y}")
             elif action == 'drag' and len(tokens) >= 5:
                 x2, y2 = int(tokens[3]), int(tokens[4])
-                return f"{cli} dd:{x},{y} w:50 m:{x2},{y2} w:50 du:{x2},{y2}"
+                return m(f"{cli} dd:{x},{y} w:50 m:{x2},{y2} w:50 du:{x2},{y2}")
             elif 'scroll' in action:
                 amount = int(tokens[3]) if len(tokens) > 3 else 5
-                return self.build_scroll_command(x, y, action, amount)
+                return scroll(x, y, action, amount)
         except (ValueError, IndexError):
             pass
-        
+
         # CASE C: Standalone actions
         action = tokens[0]
-        if action in ['left', 'click']:     return f"{cli} c:."
-        elif action == 'right':             return f"{cli} rc:."
-        elif action == 'double':            return f"{cli} dc:."
-        elif action == 'triple':            return f"{cli} tc:."
-        elif action == 'middle':            return f"{cli} mc:."
-        elif action == 'hold':              return f"{cli} dd:."
-        elif action == 'release':           return f"{cli} du:."
+        standalone_map = {
+            'left': 'c:.', 'click': 'c:.', 'right': 'rc:.', 'double': 'dc:.',
+            'triple': 'tc:.', 'middle': 'mc:.', 'hold': 'dd:.', 'release': 'du:.',
+        }
+        if action in standalone_map:
+            return m(f"{cli} {standalone_map[action]}")
         elif 'scroll' in action:
             amount = int(tokens[1]) if len(tokens) > 1 else 5
-            return self.build_scroll_command(None, None, action, amount)
-        
-        return ""
+            return scroll(None, None, action, amount)
+
+        return None
     
     # Method to parse keyboard command and build appropriate cliclick or osascript command
-    def parse_keyboard_command(self, command: str) -> str:
-        """Parse keyboard command"""
+    def parse_keyboard_command(self, command: str) -> Optional[Tuple[List[str], str]]:
+        """Parse a keyboard command into (argv, human_command).
+
+        For 'type', the text is embedded in the AppleScript passed as a single argv
+        element to osascript — no shell, so no shell escaping and no injection (F5).
+        cliclick key actions carry no free-text, so argv = the cliclick tokens.
+        """
         tokens = command.strip().split(maxsplit=1)
-        
+
         if len(tokens) < 2:
-            return ""
-        
+            return None
+
         action = tokens[0]
         text = tokens[1]
-        
+
         cli = self.cliclick_path
-        
+
+        def m(cli_str: str) -> Tuple[List[str], str]:
+            return (cli_str.split(), command)
+
         # CASE 1: type <text>
         if action == 'type':
-            escaped = text.replace('\\', '\\\\').replace('"', '\\"')
-            escaped_sh = escaped.replace("'", "'\"'\"'")
-            return f'osascript -e \'tell application "System Events" to keystroke "{escaped_sh}"\''
+            # AppleScript-level escaping only (backslash, double-quote). The script is
+            # one argv element to osascript; there is no shell, so no shell escaping.
+            applescript = text.replace('\\', '\\\\').replace('"', '\\"')
+            argv = ['osascript', '-e',
+                    f'tell application "System Events" to keystroke "{applescript}"']
+            return (argv, command)
         
         # CASE 2: press <keys>
         elif action in ['press', 'key']:
@@ -399,63 +403,59 @@ class MacOSActuation:
             
             if normalized_key in target_keys:
                 code = osascript_map[normalized_key]
-                
-                # Build AppleScript command
-                cmd = f'osascript -e \'tell application "System Events" to key code {code}'
-                
+
+                # Build the AppleScript body (a single argv element to osascript).
+                body = f'tell application "System Events" to key code {code}'
                 if modifiers:
-                    # Map cliclick modifiers to AppleScript syntax
                     osa_mods = {
                         'cmd': 'command down', 'alt': 'option down',
                         'ctrl': 'control down', 'shift': 'shift down'
                     }
-                    mod_list = [osa_mods[m] for m in modifiers if m in osa_mods]
+                    mod_list = [osa_mods[md] for md in modifiers if md in osa_mods]
                     if mod_list:
-                        cmd += f' using {{{", ".join(mod_list)}}}'
-                
-                cmd += "'"
-                return cmd
+                        body += f' using {{{", ".join(mod_list)}}}'
+                return (['osascript', '-e', body], command)
 
             # Handle Special Keys (cliclick fallback)
             if main_key in self.SPECIAL_KEYS:
                 key_code = self.SPECIAL_KEYS[main_key]
-                
+
                 if modifiers:
                     mod_str = ','.join(modifiers)
-                    return f"{cli} kd:{mod_str} kp:{key_code} ku:{mod_str}"
+                    return m(f"{cli} kd:{mod_str} kp:{key_code} ku:{mod_str}")
                 else:
-                    return f"{cli} kp:{key_code}"
-            
+                    return m(f"{cli} kp:{key_code}")
+
             # Handle Single Characters
             if len(main_key) == 1:
                 if modifiers:
                     mod_str = ','.join(modifiers)
-                    return f"{cli} kd:{mod_str} t:{main_key} ku:{mod_str}"
+                    return m(f"{cli} kd:{mod_str} t:{main_key} ku:{mod_str}")
                 else:
-                    return f"{cli} t:{main_key}"
-            
+                    return m(f"{cli} t:{main_key}")
+
             # Handle "space" as special case
             if main_key.lower() == 'space':
                 if modifiers:
                     mod_str = ','.join(modifiers)
-                    return f"{cli} kd:{mod_str} kp:space ku:{mod_str}"
+                    return m(f"{cli} kd:{mod_str} kp:space ku:{mod_str}")
                 else:
-                    return f"{cli} kp:space"
-            
+                    return m(f"{cli} kp:space")
+
             # Only Modifiers
             if not main_key and modifiers:
                 mod_str = ','.join(modifiers)
-                return f"{cli} kd:{mod_str} w:50 ku:{mod_str}"
-            
+                return m(f"{cli} kd:{mod_str} w:50 ku:{mod_str}")
+
             # Fallback
             if main_key:
                 if modifiers:
                     mod_str = ','.join(modifiers)
-                    return f"{cli} kd:{mod_str} t:{main_key} ku:{mod_str}"
+                    return m(f"{cli} kd:{mod_str} t:{main_key} ku:{mod_str}")
                 else:
-                    return f"{cli} t:{main_key}"
-        
-        return ""
+                    return m(f"{cli} t:{main_key}")
+
+        return None
     
     # Method to execute command via gRPC with position tracking
     def execute_command(self, command: str) -> bool:
@@ -483,27 +483,25 @@ class MacOSActuation:
                 print("[✗] Failed to get mouse position")
                 return False
         
-        # Build the cliclick command
+        # Build the command as (argv, human_command)
         if cmd_type == 'mouse':
-            cliclick_cmd = self.build_mouse_command(processed_cmd)
+            built = self.build_mouse_command(processed_cmd)
         else:
-            cliclick_cmd = self.parse_keyboard_command(processed_cmd)
-        
-        if not cliclick_cmd:
+            built = self.parse_keyboard_command(processed_cmd)
+
+        if not built:
             print(f"[✗] Failed to build command: {command}")
             return False
-        
-        # For mouse commands: Track position before and after
-        position_before = None
+
+        argv, human_command = built
+
+        # For mouse commands: Track position after the action
         position_after = None
-        target_coords = None
-        
-        if cmd_type == 'mouse':
-            # Extract target coordinates from original command (if present)
-            target_coords = self._extract_coordinates_from_command(command)
-        
-        # Send to server via gRPC
-        result = self.grpc_client.execute_command(cliclick_cmd)
+
+        # Send to server via gRPC (structured argv — executed without a shell).
+        result = self.grpc_client.execute_command(
+            argv=argv, human_command=human_command,
+        )
         
         # For mouse commands: Get position after action
         if cmd_type == 'mouse' and result['success']:
@@ -521,7 +519,8 @@ class MacOSActuation:
                     human = self._format_press_for_display(kb_content)
                     print(f"Pressed: {human}, time taken: {ms}ms")
                 else:
-                    print(f"Typed: {kb_content}, time taken: {ms}ms")
+                    # Do not echo typed content — it may contain secrets.
+                    print(f"Typed: {len(kb_content)} chars, time taken: {ms}ms")
             else:
                 tokens = command.strip().split()
                 is_here = tokens[0] == 'here'
@@ -579,16 +578,19 @@ class MacOSActuation:
             if cmd_type == 'invalid':
                 continue
             
-            # Build cliclick command
+            # Build command as (argv, human_command)
             if cmd_type == 'mouse':
-                cliclick_cmd = self.build_mouse_command(processed_cmd)
+                built = self.build_mouse_command(processed_cmd)
             else:
-                cliclick_cmd = self.parse_keyboard_command(processed_cmd)
-            
-            if not cliclick_cmd:
+                built = self.parse_keyboard_command(processed_cmd)
+
+            if not built:
                 continue
-            
-            result = self.grpc_client.execute_command(cliclick_cmd)
+
+            argv, human_command = built
+            result = self.grpc_client.execute_command(
+                argv=argv, human_command=human_command,
+            )
             total_count += 1
             
             if result['success']:

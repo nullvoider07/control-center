@@ -2,6 +2,7 @@
 // gRPC Server with JWT Token Validation
 
 use tonic::{transport::Server, Request, Response, Status, metadata::MetadataMap};
+use tonic::transport::{Identity, ServerTlsConfig};
 use std::sync::Arc;
 use tracing::{info, warn, debug};
 use std::collections::HashMap;
@@ -27,6 +28,19 @@ use proto::{
 // Single canonical Claims definition — shared across all crates.
 // Do NOT define a local Claims struct here.
 use control_center_common::Claims;
+
+/// Require that a validated token carries a specific scope.
+fn require_scope(claims: &Claims, scope: &str) -> Result<(), Status> {
+    if claims.scopes.iter().any(|s| s == scope) {
+        Ok(())
+    } else {
+        warn!("User '{}' missing required scope '{}'", claims.sub, scope);
+        Err(Status::permission_denied(format!(
+            "Missing required scope: {}",
+            scope
+        )))
+    }
+}
 
 /// Rate limiter for preventing abuse
 struct RateLimiter {
@@ -133,9 +147,33 @@ impl ControlCenterService {
         }
     }
     
-    /// Validate JWT token from metadata
+    /// Validate a raw JWT string (audience/issuer/expiry + HS256 signature).
+    fn validate_jwt(&self, token: &str) -> Result<Claims, Status> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_audience(&[&self.jwt_audience]);
+        validation.set_issuer(&[&self.jwt_issuer]);
+        // jsonwebtoken defaults validate_nbf to false; the OAuth flow issues nbf, so
+        // honour it rather than accepting a token before its validity window opens.
+        validation.validate_nbf = true;
+
+        match decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
+            &validation,
+        ) {
+            Ok(data) => {
+                debug!("Token validated for user: {}", data.claims.sub);
+                Ok(data.claims)
+            }
+            Err(e) => {
+                warn!("JWT validation failed: {}", e);
+                Err(Status::unauthenticated(format!("Invalid token: {}", e)))
+            }
+        }
+    }
+
+    /// Validate the JWT carried in the `authorization: Bearer <token>` metadata.
     async fn validate_token(&self, metadata: &MetadataMap) -> Result<Claims, Status> {
-        // Extract Authorization header
         let auth_header = metadata
             .get("authorization")
             .ok_or_else(|| {
@@ -148,7 +186,6 @@ impl ControlCenterService {
                 Status::unauthenticated("Invalid authorization header")
             })?;
 
-        // Extract Bearer token
         let token = auth_header
             .strip_prefix("Bearer ")
             .ok_or_else(|| {
@@ -156,25 +193,7 @@ impl ControlCenterService {
                 Status::unauthenticated("Invalid authorization format. Expected: Bearer <token>")
             })?;
 
-        // Validate JWT
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_audience(&[&self.jwt_audience]);
-        validation.set_issuer(&[&self.jwt_issuer]);
-
-        let token_data = match decode::<Claims>(
-            token,
-            &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
-            &validation,
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!("JWT validation failed: {}", e);
-                return Err(Status::unauthenticated(format!("Invalid token: {}", e)));
-            }
-        };
-
-        debug!("Token validated for user: {}", token_data.claims.sub);
-        Ok(token_data.claims)
+        self.validate_jwt(token)
     }
 
     async fn check_rate_limit(&self, user_id: &str) -> Result<(), Status> {
@@ -324,15 +343,21 @@ impl ControlService for ControlCenterService {
         request: Request<proto::RegistrationRequest>,
     ) -> Result<Response<proto::RegistrationResponse>, Status> {
         let registration_req = request.into_inner();
-        
+
+        // Authenticate the agent: the auth_token must be a valid JWT carrying the
+        // `agent` scope. (Previously this field was accepted but never checked.)
+        let agent_claims = self.validate_jwt(&registration_req.auth_token)?;
+        require_scope(&agent_claims, "agent")?;
+
         let agent_identity = registration_req.agent_identity
             .ok_or_else(|| Status::invalid_argument("Agent identity required"))?;
-        
+
         info!(
-            "Agent registration request: {} (Hostname: {}, IP: {})",
+            "Agent registration request: {} (Hostname: {}, IP: {}) authenticated as '{}'",
             agent_identity.agent_id,
             agent_identity.hostname,
-            agent_identity.ip_address
+            agent_identity.ip_address,
+            agent_claims.sub
         );
         
         // Generate connection ID
@@ -342,7 +367,8 @@ impl ControlService for ControlCenterService {
         match self.registry.register_agent(
             &agent_identity,
             connection_id.clone(),
-            agent_identity.ip_address.clone()
+            agent_identity.ip_address.clone(),
+            agent_claims.sub.clone(),
         ).await {
             Ok(_) => {
                 let server_identity = identity::build_server_identity(
@@ -372,11 +398,15 @@ impl ControlService for ControlCenterService {
         &self,
         request: Request<tonic::Streaming<proto::AgentMessage>>,
     ) -> Result<Response<Self::AgentStreamStream>, Status> {
-        info!("Agent stream connection received");
-        
+        // Authenticate the stream opener: require a valid `agent`-scoped JWT in the
+        // request metadata so an unauthenticated peer cannot hijack the command feed.
+        let agent_claims = self.validate_token(request.metadata()).await?;
+        require_scope(&agent_claims, "agent")?;
+        info!("Agent stream connection received (authenticated as '{}')", agent_claims.sub);
+
         // Get agent stream from request
         let agent_stream = request.into_inner();
-        
+
         // Get the current connection (we're in single-agent mode)
         let connection_id = {
             let current = self.registry.get_current_connection().await;
@@ -387,7 +417,15 @@ impl ControlService for ControlCenterService {
                 }
             }
         };
-        
+
+        // Bind the stream to the agent that registered it. Scope alone is not enough:
+        // any holder of an `agent` token could otherwise attach a second handler and
+        // race the shared command queue for the operator's typed text.
+        self.registry
+            .bind_stream(&connection_id, &agent_claims.sub)
+            .await
+            .map_err(Status::permission_denied)?;
+
         info!("Starting bidirectional stream for connection: {}", connection_id);
         
         // Handle the stream
@@ -405,22 +443,28 @@ impl ControlService for ControlCenterService {
         &self,
         request: Request<proto::ConnectionQuery>,
     ) -> Result<Response<proto::ConnectionStatusResponse>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "monitor")?;
         self.monitoring.handle_connection_query(request).await
     }
-    
+
     /// Query servers (monitoring API)
     async fn query_servers(
         &self,
         request: Request<proto::ServerStatusQuery>,
     ) -> Result<Response<proto::ServerStatusResponse>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "monitor")?;
         self.monitoring.handle_server_status_query(request).await
     }
-    
+
     /// Get server identity
     async fn get_server_identity(
         &self,
-        _request: Request<proto::InfoRequest>,
+        request: Request<proto::InfoRequest>,
     ) -> Result<Response<proto::ServerIdentity>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "monitor")?;
         let server_identity = identity::build_server_identity(
             &self.server_identity,
             "0.0.0.0:50051".to_string(), // TODO: Get actual listen address
@@ -430,41 +474,21 @@ impl ControlService for ControlCenterService {
         Ok(Response::new(server_identity))
     }
     
-    /// Legacy execute (compatibility)
+    /// Retired. ExecuteRequest carries only a shell string, which the agent no longer
+    /// accepts; routing it would reintroduce the shell path. Callers must use
+    /// ExecuteCommand with a structured argv.
     async fn execute(
         &self,
         request: Request<proto::ExecuteRequest>,
     ) -> Result<Response<proto::ExecuteResponse>, Status> {
-        // Clone metadata before consuming request
-        let metadata = request.metadata().clone();
-        let claims = self.validate_token(&metadata).await?;
-        self.check_rate_limit(&claims.sub).await?;
-        
-        // Convert ExecuteRequest to CommandRequest and call execute_command
-        let exec_req = request.into_inner();
-        
-        let cmd_request = proto::CommandRequest {
-            id: exec_req.id.clone(),
-            command: exec_req.command,
-            user_id: Some(exec_req.user_id.clone().unwrap_or_else(|| claims.sub.clone())),
-            timestamp: chrono::Utc::now().timestamp(),
-        };
-
-        let mut new_request = Request::new(cmd_request);
-        *new_request.metadata_mut() = metadata;
-        
-        let cmd_response = self.execute_command(new_request).await?;
-        let response = cmd_response.into_inner();
-        
-        Ok(Response::new(proto::ExecuteResponse {
-            id: response.id,
-            success: response.success,
-            message: response.message,
-            execution_time_ms: response.execution_time_ms,
-            mouse_x: response.mouse_x,
-            mouse_y: response.mouse_y,
-            position_captured: response.position_captured,
-        }))
+        let claims = self.validate_token(request.metadata()).await?;
+        warn!(
+            "User '{}' called the retired Execute RPC; rejecting",
+            claims.sub
+        );
+        Err(Status::unimplemented(
+            "Execute is retired: use ExecuteCommand with a structured argv",
+        ))
     }
     
     /// Ping (health check)
@@ -477,12 +501,15 @@ impl ControlService for ControlCenterService {
         }))
     }
     
-    /// Get agent info
+    /// Get agent info. Requires the `monitor` scope: the response fingerprints the
+    /// guest (OS, version, capabilities), which is reconnaissance for an attacker
+    /// holding only a narrow token.
     async fn get_agent_info(
         &self,
         request: Request<proto::AgentInfoRequest>,
     ) -> Result<Response<proto::AgentInfo>, Status> {
         let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "monitor")?;
         self.check_rate_limit(&claims.sub).await?;
         let agent = self.registry.get_current_connection().await
             .ok_or_else(|| Status::unavailable("No agent connected"))?;
@@ -509,9 +536,10 @@ impl ControlService for ControlCenterService {
         // Validate JWT token
         let start_time = std::time::Instant::now();
         let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "execute")?;
 
         self.check_rate_limit(&claims.sub).await?;
-        
+
         // Check if agent is connected
         if !self.registry.is_agent_connected().await {
             let mut metrics = self.metrics.write().await;
@@ -522,12 +550,26 @@ impl ControlService for ControlCenterService {
         
         let cmd_req = request.into_inner();
         let command_id = cmd_req.id.clone();
-        let command = cmd_req.command.clone();
-        
+
+        // Structured argv is the only accepted form. The legacy `command` shell string
+        // is rejected outright so no request can reach a shell on the agent, and
+        // human_command must be supplied explicitly rather than derived from it.
+        if cmd_req.argv.is_empty() {
+            return Err(Status::invalid_argument(
+                "argv is required: the legacy shell command field is no longer accepted",
+            ));
+        }
+        if cmd_req.human_command.is_empty() {
+            return Err(Status::invalid_argument(
+                "human_command is required alongside argv",
+            ));
+        }
+        let human_command = cmd_req.human_command.clone();
+
         debug!(
             "Executing command {} via agent: {}",
             command_id,
-            command
+            human_command
         );
         
         // Queue command and wait for response
@@ -563,7 +605,7 @@ impl ControlService for ControlCenterService {
         }
         
         // Broadcast CommandEvent to WatchCommands subscribers
-        let (action_type, action_subtype, is_here_command) = Self::parse_command_meta(&command);
+        let (action_type, action_subtype, is_here_command) = Self::parse_command_meta(&human_command);
         let agent = self.registry.get_current_connection().await;
         let event = proto::CommandEvent {
             session_id: agent.as_ref().map(|a| a.connection_id.clone()).unwrap_or_default(),
@@ -580,7 +622,7 @@ impl ControlService for ControlCenterService {
                 .ok()
                 .map(|r| r.message.clone())
                 .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| command.clone()),
+                .unwrap_or_else(|| human_command.clone()),
             action_type,
             action_subtype,
             is_here_command,
@@ -609,6 +651,7 @@ impl ControlService for ControlCenterService {
         request: Request<proto::MonitorRequest>,
     ) -> Result<Response<Self::MonitorConnectionStream>, Status> {
         let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "monitor")?;
         self.check_rate_limit(&claims.sub).await?;
         let registry = self.registry.clone();
         info!("Connection monitoring started by user: {}", claims.sub);
@@ -697,12 +740,13 @@ impl ControlService for ControlCenterService {
     /// Forcefully disconnect the currently connected agent.
     /// Sets a signal that the stream handler picks up on its next heartbeat
     /// tick (within 30 s), sends a graceful DisconnectNotice, then cleans up.
-    /// Requires a valid JWT token; any authenticated user may call this.
+    /// Requires a valid JWT token carrying the `admin` scope.
     async fn disconnect_agent(
         &self,
         request: Request<proto::DisconnectAgentRequest>,
     ) -> Result<Response<proto::DisconnectAgentResponse>, Status> {
         let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "admin")?;
         self.check_rate_limit(&claims.sub).await?;
 
         let req = request.into_inner();
@@ -736,11 +780,13 @@ impl ControlService for ControlCenterService {
     }
 
     /// Return connection history stored in the registry.
-    /// No JWT required — this is read-only operational metadata.
+    /// Requires a valid JWT carrying the `monitor` scope.
     async fn get_connection_history(
         &self,
         request: Request<proto::ConnectionHistoryRequest>,
     ) -> Result<Response<proto::ConnectionHistoryResponse>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "monitor")?;
         let req = request.into_inner();
 
         // Default 50, clamp to max 500
@@ -778,12 +824,15 @@ impl ControlService for ControlCenterService {
         }))
     }
 
-    /// WatchCommands stream — no auth required, read-only live feed for Memory Archive
+    /// WatchCommands stream — live command feed for Memory Archive. Requires a valid
+    /// JWT carrying the `monitor` scope (the stream carries raw typed command text).
     type WatchCommandsStream = tokio_stream::wrappers::ReceiverStream<Result<proto::CommandEvent, Status>>;
     async fn watch_commands(
         &self,
-        _request: Request<proto::WatchRequest>,
+        request: Request<proto::WatchRequest>,
     ) -> Result<Response<Self::WatchCommandsStream>, Status> {
+        let claims = self.validate_token(request.metadata()).await?;
+        require_scope(&claims, "monitor")?;
         let mut rx = self.event_tx.subscribe();
         let registry = self.registry.clone();
         let (tx, stream_rx) = tokio::sync::mpsc::channel(64);
@@ -927,7 +976,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Server will listen on {}", addr);
     info!("Ready to accept authenticated requests");
 
-    Server::builder()
+    // Transport security (F1). TLS is required unless explicitly disabled for local
+    // development via CC_ALLOW_INSECURE=true.
+    let tls_cert = std::env::var("CC_TLS_CERT").ok();
+    let tls_key = std::env::var("CC_TLS_KEY").ok();
+    let allow_insecure = std::env::var("CC_ALLOW_INSECURE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let mut builder = Server::builder();
+
+    match (tls_cert, tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert = std::fs::read(&cert_path)
+                .map_err(|e| format!("Failed to read CC_TLS_CERT '{}': {}", cert_path, e))?;
+            let key = std::fs::read(&key_path)
+                .map_err(|e| format!("Failed to read CC_TLS_KEY '{}': {}", key_path, e))?;
+            let identity = Identity::from_pem(cert, key);
+            builder = builder.tls_config(ServerTlsConfig::new().identity(identity))?;
+            info!("TLS enabled (cert: {})", cert_path);
+        }
+        _ => {
+            if !allow_insecure {
+                return Err(
+                    "TLS is required: set CC_TLS_CERT and CC_TLS_KEY, or set \
+                     CC_ALLOW_INSECURE=true to run without TLS (development only)."
+                        .into(),
+                );
+            }
+            warn!("CC_ALLOW_INSECURE set — serving WITHOUT TLS (development only)");
+        }
+    }
+
+    builder
         .add_service(ControlServiceServer::new(service))
         .serve(addr)
         .await?;

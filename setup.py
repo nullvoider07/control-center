@@ -13,6 +13,8 @@ setup(
         "protobuf>=4.25.0",
         "click>=8.1.0",
         "requests>=2.31.0",
+        "cryptography>=42.0.0",
+        "keyring>=24.0.0",
     ],
     entry_points={
         'console_scripts': [

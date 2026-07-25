@@ -112,25 +112,81 @@ def _resolve_token(token):
     """Resolve token: CLI flag > CONTROL_CENTER_TOKEN env > config file. Returns None if absent."""
     return ctx.config_manager.get_token(cli_token=token)
 
+# Secure token entry: a token passed as an argv argument is visible in the process
+# list and shell history. Prefer a no-echo prompt; warn if one was passed on argv.
+def _read_token_arg(token_value: Optional[str], prompt: str = "Token: ") -> str:
+    """Return a token, reading it via a no-echo prompt when not supplied on argv.
+
+    If the token was passed as an argument, warn that argv is exposed via ps and
+    shell history and recommend the prompt / env / config paths instead.
+    """
+    if token_value:
+        click.echo(
+            "[!] Warning: passing a token as a command argument exposes it in the "
+            "process list and shell history. Prefer the interactive prompt, the "
+            "CONTROL_CENTER_TOKEN env var, or 'config set-token'.",
+            err=True,
+        )
+        return token_value
+    import getpass
+    return getpass.getpass(prompt)
+
+# Transport security: TLS is the default. CC_ALLOW_INSECURE=true opts out for local
+# development (mirrors the server's CC_ALLOW_INSECURE and the agent's
+# AGENT_ALLOW_INSECURE). Point CC_TLS_CA at the server CA to trust a self-signed cert.
+def _resolve_use_ssl() -> bool:
+    return os.environ.get('CC_ALLOW_INSECURE', '').lower() not in ('1', 'true')
+
 # Client builders
 def _get_no_auth_client(host: str, port: int, timeout: int = 10) -> GRPCClient:
-    """Build a GRPCClient with channel + stub but NO authentication call.
+    """Build a GRPCClient (channel + stub) without calling connect().
 
-    Used for no-auth RPCs: QueryConnections, QueryServers, GetServerIdentity,
-    Ping, GetConnectionHistory.  Skips connect() so it works without a token.
+    Attaches a configured token when available so the monitoring/query RPCs — which
+    now require the `monitor` scope — work; Ping needs no token. Skips connect() so
+    it does not require a live auth handshake.
     """
     from controller.integrations.proto import control_center_pb2_grpc
-    client = GRPCClient(host=host, port=port, timeout=timeout)
+    client = GRPCClient(host=host, port=port, timeout=timeout, use_ssl=_resolve_use_ssl())
     client.channel = client._create_channel()
     client.stub = control_center_pb2_grpc.ControlServiceStub(client.channel)
+    try:
+        token = ctx.config_manager.get_token()
+        if token:
+            client.set_token(token)
+    except Exception:
+        pass
     return client
 
 def _get_auth_client(host: str, port: int, token: str, timeout: int = 10) -> GRPCClient:
     """Build a fully-authenticated GRPCClient (calls connect() + validates token)."""
-    client = GRPCClient(host=host, port=port, timeout=timeout)
+    client = GRPCClient(host=host, port=port, timeout=timeout, use_ssl=_resolve_use_ssl())
     client.set_token(token)
     client.connect()
     return client
+
+# Secure file handling: session/audit/export data can contain command history
+# (which may include text typed into the guest). Restrict to the owner (0700 dir /
+# 0600 file), mirroring ConfigManager's handling of the token in config.json.
+def _restrict_perms(path: Union[str, Path]) -> None:
+    """Restrict a file (and its parent dir) to owner-only. No-op on Windows/error."""
+    if os.name == 'nt':
+        return
+    p = Path(path)
+    try:
+        os.chmod(p.parent, 0o700)
+    except Exception:
+        pass
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+def _secure_write(path: Union[str, Path], text: str) -> None:
+    """Write text to path with owner-only permissions (0700 dir / 0600 file)."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    _restrict_perms(p)
 
 # Session data persistence helpers
 def _save_session_data():
@@ -138,14 +194,13 @@ def _save_session_data():
     if not ctx.session or not ctx.metrics:
         return
     try:
-        _SESSION_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
         data = {
             'session':  ctx.session.to_dict(),
             'metrics':  ctx.metrics.get_stats(),
             'commands': [dict(c) for c in getattr(ctx.metrics, 'command_history', [])],
             'saved_at': time.time(),
         }
-        _SESSION_DATA_PATH.write_text(json.dumps(data, indent=2, default=str))
+        _secure_write(_SESSION_DATA_PATH, json.dumps(data, indent=2, default=str))
     except Exception as e:
         logger.debug(f"Could not save session data: {e}")
 
@@ -246,7 +301,7 @@ def connect(host: Optional[str], port: Optional[int], token: Optional[str], ssl:
             host=server_config['host'],
             port=server_config['port'],
             timeout=connection_timeout,
-            use_ssl=server_config['use_ssl']
+            use_ssl=_resolve_use_ssl() or server_config['use_ssl']
         )
         
         # Set token for authentication
@@ -443,6 +498,17 @@ def _interactive_mode(controller):
     _watcher = threading.Thread(target=_watch_for_disconnect, daemon=True)
     _watcher.start()
 
+    # Load this server's persisted command history into readline. Persists across
+    # `connect` sessions and is wiped when the server restarts; encrypted at rest.
+    # Degrades to in-memory-only when the server instance or keyring is unavailable.
+    _history = None
+    try:
+        from controller.management.history import ServerHistoryStore
+        _history = ServerHistoryStore()
+        _history.load(ServerHistoryStore.resolve_instance(ctx.client))
+    except Exception as e:
+        logger.debug(f"Command history unavailable: {e}")
+
     while not ctx.interrupted:
         try:
             if ctx.client and not ctx.client.is_connected():
@@ -534,20 +600,24 @@ def _interactive_mode(controller):
                     click.echo("\n[!] Lost connection to server. Session terminated.", err=True)
                     break
 
-            # Blocking read with readline line editing + in-memory history.
-            # readline decorates the prompt passed to input(); non-empty lines are
-            # auto-appended to history. The agent-disconnect watcher breaks an idle
-            # read by delivering a SIGINT to the main thread, surfacing here as a
-            # KeyboardInterrupt (handled below, distinguished via _agent_gone).
+            # Blocking read with readline line editing. readline decorates the prompt
+            # passed to input() and auto-appends non-empty lines to its in-session
+            # history; _history mirrors them to the encrypted, server-scoped store so
+            # they survive across connect sessions. The agent-disconnect watcher breaks
+            # an idle read by delivering a SIGINT to the main thread, surfacing here as
+            # a KeyboardInterrupt (handled below, distinguished via _agent_gone).
             user_input = input("control-center> ")
             if _agent_gone.is_set():
                 click.echo("\n[!] Agent has disconnected from server. Session terminated.", err=True)
                 break
             user_input = user_input.strip()
-            
+
             if not user_input:
                 continue
-            
+
+            if _history is not None:
+                _history.append(user_input)
+
             # Handle special commands
             if user_input.lower() in ['exit', 'quit', 'q']:
                 logger.info("Exiting...")
@@ -680,7 +750,7 @@ def execute(host: Optional[str], port: Optional[int], token: Optional[str], comm
             host=server_config['host'],
             port=server_config['port'],
             timeout=5,
-            use_ssl=server_config['use_ssl']
+            use_ssl=_resolve_use_ssl() or server_config['use_ssl']
         )
         ctx.client.set_token(api_token)
         
@@ -1752,6 +1822,7 @@ def export_metrics(fmt, output):
             writer.writerow(['metric', 'value'])
             for k, v in stats.items():
                 writer.writerow([k, v])
+    _restrict_perms(out_path)
 
     click.echo(f"[+] Exported metrics -> {out_path}")
 
@@ -1780,6 +1851,7 @@ def export_session(fmt, output):
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(commands)
+    _restrict_perms(out_path)
 
     click.echo(f"[+] Exported session -> {out_path}")
 
@@ -2146,6 +2218,7 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
 
     if output:
         Path(output).write_text(tok + '\n')
+        _restrict_perms(output)
         click.echo(f"[+] Token written to {output}")
     else:
         click.echo(tok)
@@ -2159,15 +2232,21 @@ def token_generate(user, scopes, expires, secret_override, algorithm, audience, 
     )
 
 @token.command(name='inspect')
-@click.argument('token_string')
+@click.argument('token_string', required=False)
 @click.option('--format', 'fmt', default='text', type=click.Choice(['text', 'json']))
 def token_inspect(token_string, fmt):
-    """Decode and display a JWT token's claims (does NOT verify signature)"""
+    """Decode and display a JWT token's claims (does NOT verify signature)
+
+    The token may be passed as an argument, but that exposes it in the process
+    list and shell history; omit it to enter it at a no-echo prompt instead.
+    """
     try:
         import jwt
     except ImportError:
         click.echo("Error: PyJWT not installed. Run: pip install PyJWT", err=True)
         sys.exit(1)
+
+    token_string = _read_token_arg(token_string)
 
     try:
         # Decode without verification to inspect any token
@@ -2201,19 +2280,24 @@ def token_inspect(token_string, fmt):
     click.echo("")
 
 @token.command(name='validate')
-@click.argument('token_string')
+@click.argument('token_string', required=False)
 @click.option('--secret', 'secret_override', default=None, envvar='CC_JWT_SECRET',
               help='JWT signing secret (or set CC_JWT_SECRET)')
 @click.option('--audience', default=None, envvar='JWT_AUDIENCE',
               help='Expected audience claim (default: control-center)')
 def token_validate(token_string, secret_override, audience):
-    """Verify a JWT token's signature and expiry against your secret"""
+    """Verify a JWT token's signature and expiry against your secret
+
+    The token may be passed as an argument, but that exposes it in the process
+    list and shell history; omit it to enter it at a no-echo prompt instead.
+    """
     try:
         import jwt
     except ImportError:
         click.echo("Error: PyJWT not installed. Run: pip install PyJWT", err=True)
         sys.exit(1)
 
+    token_string = _read_token_arg(token_string)
     secret = secret_override or _jwt_secret()
     aud = audience or os.environ.get('JWT_AUDIENCE', 'control-center')
 
@@ -2707,10 +2791,15 @@ def config_show():
         sys.exit(1)
 
 @config.command('set-token')
-@click.argument('token')
-def config_set_token(token: str):
-    """Set API token in config file"""
+@click.argument('token', required=False)
+def config_set_token(token: Optional[str] = None):
+    """Set API token in config file
+
+    The token may be passed as an argument, but that exposes it in the process
+    list and shell history; omit it to enter it at a no-echo prompt instead.
+    """
     try:
+        token = _read_token_arg(token)
         ctx.config_manager.set_token(token)
         click.echo("API token saved to config")
     except ConfigurationError as e:
@@ -2946,6 +3035,115 @@ def server_start(host, port, single_agent, network, auth_url, token_url, client_
     except Exception as e:
         click.echo(f"[ERROR] Failed to start server: {e}", err=True)
         sys.exit(1)
+
+# ============================================================================
+@cli.command(name='gen-certs')
+@click.option('--out-dir', 'out_dir', default=None,
+              help='Output directory (default: ~/.config/control-center/tls)')
+@click.option('--host', 'extra_hosts', multiple=True,
+              help='Additional DNS name or IP SAN (repeatable)')
+@click.option('--days', default=825, type=int, help='Validity in days (default 825)')
+def gen_certs(out_dir, extra_hosts, days):
+    """Generate a self-signed CA + server cert/key for local/dev TLS.
+
+    Writes ca.crt, server.crt, server.key (keys 0600) and prints the env vars to set
+    for the server (CC_TLS_CERT/CC_TLS_KEY) and clients/agent (CC_TLS_CA).
+    """
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except ImportError:
+        click.echo("Error: cryptography not installed (pip install cryptography)", err=True)
+        sys.exit(1)
+    import datetime as _dt
+    import ipaddress as _ip
+    import socket as _socket
+
+    tls_dir = Path(out_dir) if out_dir else (Path.home() / '.config' / 'control-center' / 'tls')
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != 'nt':
+        try:
+            os.chmod(tls_dir, 0o700)
+        except Exception:
+            pass
+
+    # Build SAN list: localhost + loopback + this host's name/IPs + any extras.
+    dns_names = {'localhost'}
+    ip_addrs = {'127.0.0.1', '::1'}
+    try:
+        hostname = _socket.gethostname()
+        dns_names.add(hostname)
+        ip_addrs.add(_socket.gethostbyname(hostname))
+    except Exception:
+        pass
+    for h in extra_hosts:
+        try:
+            _ip.ip_address(h)
+            ip_addrs.add(h)
+        except ValueError:
+            dns_names.add(h)
+
+    sans: List = [x509.DNSName(n) for n in sorted(dns_names)]
+    for a in sorted(ip_addrs):
+        try:
+            sans.append(x509.IPAddress(_ip.ip_address(a)))
+        except ValueError:
+            pass
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    not_after = now + _dt.timedelta(days=days)
+
+    # CA
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Control Center Dev CA")])
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name).issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now).not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    # Server cert signed by the CA
+    srv_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    srv_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "control-center-server")])
+    srv_cert = (
+        x509.CertificateBuilder()
+        .subject_name(srv_name).issuer_name(ca_name)
+        .public_key(srv_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now).not_valid_after(not_after)
+        .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    ca_path = tls_dir / 'ca.crt'
+    crt_path = tls_dir / 'server.crt'
+    key_path = tls_dir / 'server.key'
+    ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    crt_path.write_bytes(srv_cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(srv_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    _restrict_perms(key_path)
+    _restrict_perms(crt_path)
+    _restrict_perms(ca_path)
+
+    click.echo(f"[+] Wrote TLS material to {tls_dir}")
+    click.echo(f"    SANs: {', '.join(sorted(dns_names) + sorted(ip_addrs))}")
+    click.echo("\nServer (set before 'server start'):")
+    click.echo(f"  export CC_TLS_CERT={crt_path}")
+    click.echo(f"  export CC_TLS_KEY={key_path}")
+    click.echo("\nCLI + agent (to trust the server):")
+    click.echo(f"  export CC_TLS_CA={ca_path}")
+    click.echo(f"  export AGENT_TLS_CA={ca_path}")
 
 # ============================================================================
 # Register monitoring group + entry point

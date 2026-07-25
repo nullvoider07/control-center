@@ -508,6 +508,7 @@ mod tests {
             command: "960 540 left".to_string(),
             user_id: Some("test-user".to_string()),
             timestamp: chrono::Utc::now().timestamp(),
+            ..Default::default()
         };
         
         // Queue a command (will timeout since no agent)

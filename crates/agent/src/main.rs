@@ -3,7 +3,6 @@
 use tonic::{Request, Response, Status};
 use tracing::{info, warn, error, debug};
 use std::process::Command as ProcessCommand;
-use std::time::Instant;
 #[cfg(any(target_os = "linux"))]
 use regex::Regex;
 
@@ -12,6 +11,7 @@ mod proto {
     tonic::include_proto!("control_center");
 }
 
+mod argv_policy;
 mod identity;
 mod connection;
 
@@ -235,240 +235,6 @@ impl AgentServiceImpl {
         capabilities
     }
     
-    /// Validate command before execution
-    fn validate_command(&self, command: &str) -> Result<(), String> {
-        if command.is_empty() {
-            return Err("Command cannot be empty".to_string());
-        }
-        
-        if command.len() > 10000 {
-            return Err("Command exceeds maximum length (10000 characters)".to_string());
-        }
-        
-        // Check for dangerous patterns (basic protection)
-        let dangerous_patterns = [
-            "rm -rf /",
-            "format c:",
-            "dd if=/dev/zero",
-            ":(){ :|:& };:",  // Fork bomb
-            "mkfs",
-            "shutdown",
-            "reboot",
-        ];
-        
-        for pattern in &dangerous_patterns {
-            if command.to_lowercase().contains(&pattern.to_lowercase()) {
-                warn!("Blocked potentially dangerous command: {}", command);
-                return Err(format!("Command contains blocked pattern: {}", pattern));
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// Extract a human-readable command from the raw OS command sent by the
-    /// Python actuation layer.
-    fn extract_human_command(&self, command: &str) -> String {
-        // ── Windows ──────────────────────────────────────────────────────────
-        // Pattern: "cmd /c echo <human_cmd> > C:\mouse_cmd.txt"
-        //      or: "cmd /c echo <human_cmd> > C:\keyboard_cmd.txt"
-        // Extract the text between "echo " and " > C:\".
-        if command.starts_with("cmd /c echo ") {
-            let after_echo = &command["cmd /c echo ".len()..];
-            if let Some(pos) = after_echo.find(" > C:\\") {
-                return after_echo[..pos].trim().to_string();
-            }
-        }
-
-        // ── Linux xdotool ────────────────────────────────────────────────────
-        // Pattern: "DISPLAY=:0 xdotool <sub-command> …"
-        // Reconstruct a human command from the xdotool syntax.
-        if command.contains("xdotool") {
-            return self.extract_xdotool_human_command(command);
-        }
-
-        // ── macOS osascript (pure keyboard commands: type / key code) ─────────
-        if command.starts_with("osascript") {
-            return self.extract_osascript_human_command(command);
-        }
-
-        // ── macOS cliclick ───────────────────────────────────────────────────
-        if command.contains("cliclick") {
-            return self.extract_cliclick_human_command(command);
-        }
-
-        // Fallback – return unchanged.
-        command.to_string()
-    }
-
-    /// Parse a cliclick command string and return a human-readable equivalent.
-    fn extract_cliclick_human_command(&self, command: &str) -> String {
-        // Strip leading "cliclick" or full path e.g. "/usr/local/bin/cliclick"
-        let after = command
-            .split_whitespace()
-            .skip_while(|s| s.ends_with("cliclick"))
-            .collect::<Vec<&str>>()
-            .join(" ");
-
-        let tokens: Vec<&str> = after.split_whitespace().collect();
-        if tokens.is_empty() {
-            return command.to_string();
-        }
-
-        let action_token = tokens[0];
-
-        // Keyboard: "t:text" → "type text", "kp:return" → "press {Enter}"
-        if let Some(text) = action_token.strip_prefix("t:") {
-            return format!("type {}", text.trim_matches('"'));
-        }
-        if let Some(key) = action_token.strip_prefix("kp:") {
-            return format!("press {{{}}}", key);
-        }
-        if action_token.starts_with("kd:") {
-            return self.parse_cliclick_key_sequence(&tokens);
-        }
-        if action_token.starts_with("ku:") {
-            return format!("press {}", tokens.join(" "));
-        }
-
-        // Mouse: parse shortcut prefix and coordinates
-        // Shortcuts: c=left, rc=right, dc=double, tc=triple, mc=middle,
-        //            dd=hold, du=release, m=move, p=position
-        let (shortcut, coords) = if let Some(pos) = action_token.find(':') {
-            (&action_token[..pos], &action_token[pos+1..])
-        } else {
-            return command.to_string();
-        };
-
-        let is_here = coords == ".";
-        let coord_str = if is_here {
-            String::new()
-        } else {
-            // "960,540" → "960 540"
-            coords.replace(',', " ")
-        };
-
-        let action = match shortcut {
-            "c"  => "left",
-            "rc" => "right",
-            "dc" => "double",
-            "tc" => "triple",
-            "mc" => "middle",
-            "dd" => "hold",
-            "du" => "release",
-            "m"  => "move",
-            "p"  => return "position".to_string(),
-            _    => "left",
-        };
-
-        if is_here {
-            format!("here {}", action)
-        } else {
-            format!("{} {}", coord_str, action)
-        }
-    }
-
-    fn extract_osascript_human_command(&self, command: &str) -> String {
-        // keystroke "text"  →  "type text"
-        if command.contains("keystroke") {
-            if let Some(start) = command.find("keystroke \"") {
-                let after = &command[start + "keystroke \"".len()..];
-                if let Some(end) = after.find('"') {
-                    return format!("type {}", &after[..end]);
-                }
-            }
-            return "type".to_string();
-        }
-
-        // key code N [using {mods}]  →  "press [mods]{KeyName}"
-        if command.contains("key code") {
-            let key_name: &str = if let Some(code_pos) = command.find("key code ") {
-                let after = &command[code_pos + "key code ".len()..];
-                let code_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                match code_str.parse::<u32>() {
-                    Ok(36)  => "{Enter}",
-                    Ok(48)  => "{Tab}",
-                    Ok(51)  => "{Backspace}",
-                    Ok(53)  => "{Esc}",
-                    Ok(117) => "{Delete}",
-                    Ok(116) => "{PgUp}",
-                    Ok(121) => "{PgDn}",
-                    Ok(115) => "{Home}",
-                    Ok(119) => "{End}",
-                    Ok(123) => "{Left}",
-                    Ok(124) => "{Right}",
-                    Ok(125) => "{Down}",
-                    Ok(126) => "{Up}",
-                    _       => "",
-                }
-            } else {
-                ""
-            };
-
-            let mut mods = String::new();
-            if command.contains("command down") { mods.push('#'); }
-            if command.contains("option down")  { mods.push('!'); }
-            if command.contains("control down") { mods.push('^'); }
-            if command.contains("shift down")   { mods.push('+'); }
-
-            if !key_name.is_empty() || !mods.is_empty() {
-                return format!("press {}{}", mods, key_name);
-            }
-        }
-
-        command.to_string()
-    }
-
-    fn parse_cliclick_key_sequence(&self, tokens: &[&str]) -> String {
-        let mut modifiers = String::new();
-        let mut key       = String::new();
-
-        for token in tokens {
-            if let Some(mods_str) = token.strip_prefix("kd:") {
-                for m in mods_str.split(',') {
-                    let sym = match m.trim() {
-                        "cmd"   => "#",
-                        "alt"   => "!",
-                        "ctrl"  => "^",
-                        "shift" => "+",
-                        _       => "",
-                    };
-                    modifiers.push_str(sym);
-                }
-            } else if let Some(text) = token.strip_prefix("t:") {
-                key = text.trim_matches('"').to_string();
-            } else if let Some(key_name) = token.strip_prefix("kp:") {
-                key = match key_name {
-                    "return"      => "{Enter}",
-                    "tab"         => "{Tab}",
-                    "delete"      => "{Backspace}",
-                    "fwd-delete"  => "{Delete}",
-                    "arrow-up"    => "{Up}",
-                    "arrow-down"  => "{Down}",
-                    "arrow-left"  => "{Left}",
-                    "arrow-right" => "{Right}",
-                    "page-up"     => "{PgUp}",
-                    "page-down"   => "{PgDn}",
-                    "home"        => "{Home}",
-                    "end"         => "{End}",
-                    "esc"         => "{Esc}",
-                    "space"       => "{Space}",
-                    "f1"  => "{F1}",  "f2"  => "{F2}",  "f3"  => "{F3}",  "f4"  => "{F4}",
-                    "f5"  => "{F5}",  "f6"  => "{F6}",  "f7"  => "{F7}",  "f8"  => "{F8}",
-                    "f9"  => "{F9}",  "f10" => "{F10}", "f11" => "{F11}", "f12" => "{F12}",
-                    other => other,
-                }.to_string();
-            }
-            // ku: tokens are key-up cleanup — skip them
-        }
-
-        if !modifiers.is_empty() || !key.is_empty() {
-            format!("press {}{}", modifiers, key)
-        } else {
-            format!("press {}", tokens.join(" "))
-        }
-    }
-
     // Convert a key string with modifiers into a human-readable format
     fn format_keys_for_display(&self, keys: &str) -> String {
         let mod_names: &[(&str, &str)] = match self.os_type {
@@ -537,120 +303,6 @@ impl AgentServiceImpl {
         if parts.is_empty() { keys.to_string() } else { parts.join("+") }
     }
 
-    /// Parse an xdotool command string and return a human-readable equivalent.
-    fn extract_xdotool_human_command(&self, command: &str) -> String {
-        let tokens: Vec<&str> = command.split_whitespace().collect();
-
-        // Locate "xdotool" and take everything after it as the sub-command.
-        let xdotool_idx = match tokens.iter().position(|&t| t == "xdotool") {
-            Some(i) => i,
-            None => return command.to_string(),
-        };
-        let sub = &tokens[xdotool_idx + 1..];
-
-        if sub.is_empty() {
-            return command.to_string();
-        }
-
-        match sub[0] {
-            // "DISPLAY=:0 xdotool getmouselocation --shell" → "position"
-            "getmouselocation" => "position".to_string(),
-
-            // "DISPLAY=:0 xdotool type \"Hello World\"" → "type Hello World"
-            "type" => {
-                let text = sub[1..].join(" ").trim_matches('"').to_string();
-                format!("type {}", text)
-            }
-
-            // "DISPLAY=:0 xdotool key ctrl+c" → "press ctrl+c"
-            "key" => {
-                let keys = sub[1..].join(" ");
-                format!("press {}", keys)
-            }
-
-            // "DISPLAY=:0 xdotool mousemove X Y [...]"
-            "mousemove" => {
-                if sub.len() < 3 {
-                    return command.to_string();
-                }
-                let x = sub[1];
-                let y = sub[2];
-
-                if sub.len() == 3 {
-                    // Pure move: "X Y move"
-                    return format!("{} {} move", x, y);
-                }
-
-                match sub[3] {
-                    "click" => {
-                        // "xdotool mousemove X Y click [--repeat N] [--clearmodifiers] BTN"
-                        self.parse_xdotool_click_tokens(&sub[3..], Some((x, y)))
-                    }
-                    "mousedown" => {
-                        // Drag: "xdotool mousemove X Y mousedown 1 mousemove X2 Y2 mouseup 1"
-                        // Find the second "mousemove" to get the destination.
-                        let dest = sub[4..].windows(3).find(|w| w[0] == "mousemove");
-                        if let Some(m) = dest {
-                            if m.len() >= 3 {
-                                return format!("{} {} drag {} {}", x, y, m[1], m[2]);
-                            }
-                        }
-                        format!("{} {} drag", x, y)
-                    }
-                    _ => format!("{} {} move", x, y),
-                }
-            }
-
-            // "DISPLAY=:0 xdotool click [--repeat N] BTN" → "here <action>"
-            "click" => self.parse_xdotool_click_tokens(sub, None),
-
-            _ => command.to_string(),
-        }
-    }
-
-    /// Convert an xdotool `click` token slice into a human action string.
-    ///
-    /// `tokens[0]` must be `"click"`.
-    /// `coords` is `Some((x, y))` for coordinate-based commands, `None` for "here".
-    fn parse_xdotool_click_tokens(&self, tokens: &[&str], coords: Option<(&str, &str)>) -> String {
-        let prefix = match coords {
-            Some((x, y)) => format!("{} {} ", x, y),
-            None => "here ".to_string(),
-        };
-
-        let mut i = 1usize; // skip "click"
-        let mut repeat: Option<&str> = None;
-
-        if tokens.get(i) == Some(&"--repeat") {
-            repeat = tokens.get(i + 1).copied();
-            i += 2;
-        }
-        if tokens.get(i) == Some(&"--clearmodifiers") {
-            i += 1;
-        }
-
-        let button = tokens.get(i).copied().unwrap_or("1");
-
-        match button {
-            "1" => match repeat {
-                Some("2") => format!("{}double", prefix),
-                Some(_)   => format!("{}double", prefix), // --repeat N means double/multi
-                None      => format!("{}left", prefix),
-            },
-            "2" => format!("{}middle", prefix),
-            "3" => format!("{}right", prefix),
-            "4" => match repeat {
-                Some(n) => format!("{}scroll_up {}", prefix, n),
-                None    => format!("{}scroll_up", prefix),
-            },
-            "5" => match repeat {
-                Some(n) => format!("{}scroll_down {}", prefix, n),
-                None    => format!("{}scroll_down", prefix),
-            },
-            _ => format!("{}left", prefix),
-        }
-    }
-
     fn parse_action_details(&self, command: &str) -> ActionDetails {
         let tokens: Vec<&str> = command.split_whitespace().collect();
 
@@ -704,9 +356,12 @@ impl AgentServiceImpl {
     
     #[cfg(target_os = "linux")]
     async fn capture_position_linux(&self) -> MousePosition {
-        match ProcessCommand::new("sh")
-            .arg("-c")
-            .arg("DISPLAY=${DISPLAY:-:0} xdotool getmouselocation --shell")
+        // Direct spawn with DISPLAY supplied via the environment. The agent invokes no
+        // shell anywhere, so there is no interpreter for any input to reach.
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        match ProcessCommand::new("xdotool")
+            .args(["getmouselocation", "--shell"])
+            .env("DISPLAY", display)
             .output()
         {
             Ok(output) if output.status.success() => {
@@ -856,33 +511,10 @@ impl AgentServiceImpl {
         }
     }
     
-    // Execute command with position tracking
-    async fn execute_command(&self, command: &str) -> (Result<String, String>, MousePosition, ActionDetails) {
-        // Validate first
-        if let Err(e) = self.validate_command(command) {
-            let empty_action = ActionDetails {
-                action_type: "none".to_string(),
-                is_mouse: false,
-                is_here_command: false,
-            };
-            return (Err(e), MousePosition { x: 0, y: 0, captured: false }, empty_action);
-        }
-
-        // Derive the human command first so parse_action_details works on
-        // "here left" not "cmd /c echo here left > C:\mouse_cmd.txt".
-        // Without this, is_mouse is always false and position is never captured.
-        let human_cmd = self.extract_human_command(command);
-        let action = self.parse_action_details(&human_cmd);
-
-        // Execute the command
-        let result = match self.os_type {
-            OsType::Windows => self.execute_windows(command).await,
-            OsType::Macos => self.execute_macos(command).await,
-            OsType::Linux => self.execute_linux(command).await,
-        };
-
-        // Capture position if it's a mouse action
-        let position = if action.is_mouse && result.is_ok() {
+    // Capture mouse position after a successful mouse action (shared by the argv
+    // and legacy execution paths).
+    async fn capture_position_if_mouse(&self, action: &ActionDetails, ok: bool) -> MousePosition {
+        if action.is_mouse && ok {
             #[cfg(target_os = "windows")]
             {
                 let wait_ms = if action.is_here_command { 10 } else { 20 };
@@ -896,139 +528,109 @@ impl AgentServiceImpl {
             }
         } else {
             MousePosition { x: 0, y: 0, captured: false }
-        };
+        }
+    }
 
+    // Execute a structured argv command directly — no shell, so typed text can never
+    // be interpreted as shell syntax (F5). `human_command` drives action parsing and
+    // the recorded string.
+    async fn execute_command_argv(
+        &self,
+        argv: &[String],
+        human_command: &str,
+    ) -> (Result<String, String>, MousePosition, ActionDetails) {
+        let action = self.parse_action_details(human_command);
+        let result = self.run_argv(argv).await;
+        let position = self.capture_position_if_mouse(&action, result.is_ok()).await;
         (result, position, action)
     }
-    
-    /// Windows execution by writing to files for AutoHotkey
-    #[cfg(target_os = "windows")]
-    async fn execute_windows(&self, command: &str) -> Result<String, String> {
 
-        if command.contains("keyboard_cmd.txt") {
-            if let Some(content) = command
-                .split("echo ")
-                .nth(1)
-                .and_then(|s| s.split(" > ").next())
-            {
-                let _ = std::fs::write(r"C:\keyboard_cmd.txt", content);
-                return Ok(format!("Executed: {}", content));
+    // Run an argv vector directly (no shell). The vector is first checked against the
+    // actuation grammar in argv_policy, which constrains sub-commands and arguments —
+    // an argv[0] allow-list alone would still permit `xdotool exec` and free-form
+    // `osascript -e`.
+    async fn run_argv(&self, argv: &[String]) -> Result<String, String> {
+        let plan = argv_policy::validate(argv).inspect_err(|e| {
+            warn!("Blocked command {:?}: {}", argv, e);
+        })?;
+
+        match plan {
+            // Windows AutoHotkey file-drop: write content directly, no `cmd /c echo`.
+            argv_policy::Plan::Write { path, content } => {
+                std::fs::write(&path, &content).map_err(|e| format!("Write error: {}", e))?;
+                Ok(format!("Executed: {}", content))
+            }
+            argv_policy::Plan::Run { bin, args } => {
+                self.spawn_actuation(bin, &args)?;
+                Ok("ok".to_string())
+            }
+            // Focus click, then an AppleScript key-repeat loop. Both scripts are
+            // composed here, so the client only ever supplies the bounded parameters.
+            argv_policy::Plan::Scroll {
+                click,
+                key_code,
+                amount,
+            } => {
+                self.spawn_actuation(
+                    argv_policy::Bin::Cliclick,
+                    &[click, "w:50".to_string()],
+                )?;
+                self.spawn_actuation(
+                    argv_policy::Bin::Osascript,
+                    &[
+                        "-e".to_string(),
+                        format!("tell application \"System Events\" to repeat {} times", amount),
+                        "-e".to_string(),
+                        format!("key code {}", key_code),
+                        "-e".to_string(),
+                        "delay 0.02".to_string(),
+                        "-e".to_string(),
+                        "end repeat".to_string(),
+                    ],
+                )?;
+                Ok("ok".to_string())
             }
         }
-
-        let output = ProcessCommand::new("cmd")
-            .arg("/c")
-            .arg(command)
-            .output()
-            .map_err(|e| {
-                error!("Failed to execute command: {}", e);
-                format!("Execution error: {}", e)
-            })?;
-
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            error!("Command failed: {}", error_msg);
-            return Err(error_msg);
-        }
-
-        debug!("Command executed: {}", command);
-        Ok(format!("Executed: {}", command))
     }
-    
-    /// macOS execution using cliclick
-    #[cfg(target_os = "macos")]
-    async fn execute_macos(&self, command: &str) -> Result<String, String> {
-        // Check if cliclick is available
-        if !self.capabilities.contains(&"cliclick".to_string()) {
-            return Err("cliclick not available - please install it".to_string());
-        }
 
-        // Compound commands (scroll uses cliclick && osascript) must run via sh -c.
-        // Pure osascript commands also need shell execution.
-        if command.contains("&&") || command.starts_with("osascript") || command.contains("t:\"") {
-            let output = ProcessCommand::new("sh")
-                .arg("-c")
-                .arg(command)
-                .output()
-                .map_err(|e| format!("Execution error: {}", e))?;
-
-            return if output.status.success() {
-                Ok(format!("Executed: {}", command))
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).to_string())
-            };
-        }
-
-        // Try multiple cliclick paths.
-        let args: Vec<&str> = command.split_whitespace()
-            .filter(|&s| s != "cliclick")
-            .collect();
-
-        // Use cached path resolved at startup — no repeated path probing per command
-        let cliclick_path = self.cliclick_path.as_deref().unwrap_or("cliclick");
-
-        match ProcessCommand::new(cliclick_path)
-            .args(&args)
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    debug!("Command executed via {}: {}", cliclick_path, command);
-                    Ok(format!("Executed: {}", command))
-                } else {
-                    let err = String::from_utf8_lossy(&output.stderr).to_string();
-                    error!("cliclick failed: {}", err);
-                    Err(format!("Execution failed: {}", err))
+    // Spawn a validated actuation binary. Never goes through a shell.
+    fn spawn_actuation(&self, bin: argv_policy::Bin, args: &[String]) -> Result<(), String> {
+        let program: String = match bin {
+            argv_policy::Bin::Xdotool => "xdotool".to_string(),
+            argv_policy::Bin::Osascript => "osascript".to_string(),
+            // Resolve cliclick to the path probed at startup (macOS-only field).
+            argv_policy::Bin::Cliclick => {
+                #[cfg(target_os = "macos")]
+                {
+                    self.cliclick_path
+                        .clone()
+                        .unwrap_or_else(|| "cliclick".to_string())
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    "cliclick".to_string()
                 }
             }
-            Err(e) => {
-                error!("Failed to execute cliclick: {}", e);
-                Err(format!("Execution error: {}", e))
-            }
+        };
+
+        let mut cmd = ProcessCommand::new(&program);
+        cmd.args(args);
+        // xdotool needs DISPLAY; harmless for the others.
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        cmd.env("DISPLAY", display);
+
+        let output = cmd.output().map_err(|e| {
+            error!("Failed to execute {}: {}", program, e);
+            format!("Execution error: {}", e)
+        })?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr).to_string();
+            error!("Command failed: {}", err);
+            Err(err)
         }
-    }
-    
-    /// Linux execution using xdotool
-    #[cfg(target_os = "linux")]
-    async fn execute_linux(&self, command: &str) -> Result<String, String> {
-        // Check if xdotool is available
-        if !self.capabilities.contains(&"xdotool".to_string()) {
-            return Err("xdotool not available - please install it".to_string());
-        }
-        
-        let output = ProcessCommand::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()
-            .map_err(|e| {
-                error!("Failed to execute command: {}", e);
-                format!("Execution error: {}", e)
-            })?;
-        
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            error!("Command failed: {}", error_msg);
-            return Err(error_msg);
-        }
-        
-        debug!("Command executed: {}", command);
-        Ok(format!("Executed: {}", command))
-    }
-    
-    // Stub implementations for cross-compilation
-    #[cfg(not(target_os = "windows"))]
-    async fn execute_windows(&self, _command: &str) -> Result<String, String> {
-        Err("Windows execution not available on this platform".to_string())
-    }
-    
-    #[cfg(not(target_os = "macos"))]
-    async fn execute_macos(&self, _command: &str) -> Result<String, String> {
-        Err("macOS execution not available on this platform".to_string())
-    }
-    
-    #[cfg(not(target_os = "linux"))]
-    async fn execute_linux(&self, _command: &str) -> Result<String, String> {
-        Err("Linux execution not available on this platform".to_string())
     }
 }
 
@@ -1049,66 +651,18 @@ impl AgentService for AgentServiceImpl {
         }))
     }
     
-    // Execute with position tracking and detailed messages
+    // Retired. ExecuteRequest carries only a shell string; commands arrive over the
+    // server stream as structured argv and are handled by execute_command_argv.
+    // The agent binds no gRPC listener, so this exists only to satisfy the trait.
     async fn execute(
         &self,
-        request: Request<ExecuteRequest>,
+        _request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
-        let req = request.into_inner();
-        
-        debug!("Executing command: id={}, cmd={}", req.id, req.command);
-        
-        let start = Instant::now();
-        let (result, position, _os_action) = self.execute_command(&req.command).await;
-        let execution_time = start.elapsed().as_millis() as i64;
-        let human_cmd = self.extract_human_command(&req.command);
-        let human_action = self.parse_action_details(&human_cmd);
-        
-        match result {
-            Ok(_) => {
-                // Build detailed message from the HUMAN command, not the OS command
-                let message = self.build_detailed_message(&human_action, &position, &human_cmd);
-                
-                // Single clean log line per command
-                if position.captured && human_action.is_mouse {
-                    info!(
-                        "{{\"action\": \"{}\", \"X\": {}, \"Y\": {}, \"time_taken\": \"{}ms\"}}",
-                        message, position.x, position.y, execution_time
-                    );
-                } else {
-                    info!(
-                        "{{\"action\": \"{}\", \"time_taken\": \"{}ms\"}}",
-                        message, execution_time
-                    );
-                }
-                
-                Ok(Response::new(ExecuteResponse {
-                    id: req.id,
-                    success: true,
-                    message,
-                    execution_time_ms: execution_time,
-                    // Position data
-                    mouse_x: if position.captured { Some(position.x) } else { None },
-                    mouse_y: if position.captured { Some(position.y) } else { None },
-                    position_captured: Some(position.captured),
-                }))
-            }
-            Err(error) => {
-                warn!("Command failed: id={}, error={}", req.id, error);
-                
-                Ok(Response::new(ExecuteResponse {
-                    id: req.id,
-                    success: false,
-                    message: error,
-                    execution_time_ms: execution_time,
-                    mouse_x: None,
-                    mouse_y: None,
-                    position_captured: Some(false),
-                }))
-            }
-        }
+        Err(Status::unimplemented(
+            "Execute is retired: commands are delivered as argv over the agent stream",
+        ))
     }
-    
+
     async fn ping(
         &self,
         _request: Request<PingRequest>,
@@ -1161,7 +715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_host,
         server_port,
         agent_identity,
-        auth_token,
+        auth_token.clone(),
     );
     
     // Connect and register
@@ -1177,8 +731,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Start bidirectional stream with server
             info!("Starting bidirectional stream with server...");
             let request_stream = tokio_stream::wrappers::ReceiverStream::new(agent_rx);
-            
-            let response = match client.agent_stream(Request::new(request_stream)).await {
+
+            // Authenticate the stream: attach the agent JWT as Bearer metadata so the
+            // server can verify and bind it (F2).
+            let mut stream_request = Request::new(request_stream);
+            if let Some(token) = &auth_token {
+                match format!("Bearer {}", token).parse() {
+                    Ok(value) => { stream_request.metadata_mut().insert("authorization", value); }
+                    Err(e) => { error!("Invalid CONTROL_CENTER_TOKEN for stream metadata: {}", e); }
+                }
+            }
+
+            let response = match client.agent_stream(stream_request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Failed to start agent stream: {}", e);
@@ -1280,61 +844,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match msg.payload {
                                     Some(proto::server_message::Payload::CommandRequest(cmd_req)) => {
                                         let command_id = cmd_req.id.clone();
-                                        let command = cmd_req.command.clone();
-                                        
+
                                         // Track command execution time
                                         let cmd_start_time = std::time::Instant::now();
-                                        
-                                        debug!("Received command: {} (ID: {})", command, command_id);
-                                        
-                                        // Execute command using AgentServiceImpl
-                                        let execute_request = proto::ExecuteRequest {
-                                            id: command_id.clone(),
-                                            command: command.clone(),
-                                            user_id: cmd_req.user_id.clone(),
+
+                                        // Structured argv is the only accepted form; the legacy
+                                        // shell-string field is rejected without executing.
+                                        let human_cmd = cmd_req.human_command.clone();
+                                        let malformed = if cmd_req.argv.is_empty() {
+                                            Some("argv is required: the legacy shell command field is no longer accepted")
+                                        } else if human_cmd.is_empty() {
+                                            Some("human_command is required alongside argv")
+                                        } else {
+                                            None
                                         };
-                                        
-                                        let result = service.execute(Request::new(execute_request)).await;
-                                        
-                                        // Calculate execution time
+
+                                        debug!("Received command: {} (ID: {})", human_cmd, command_id);
+
+                                        let (result, position, action) = match malformed {
+                                            Some(reason) => {
+                                                warn!("Rejected command {}: {}", command_id, reason);
+                                                (
+                                                    Err(reason.to_string()),
+                                                    MousePosition { x: 0, y: 0, captured: false },
+                                                    service.parse_action_details(&human_cmd),
+                                                )
+                                            }
+                                            None => {
+                                                service.execute_command_argv(&cmd_req.argv, &human_cmd).await
+                                            }
+                                        };
+
                                         let execution_time = cmd_start_time.elapsed();
-                                        
+
+                                        // Ground truth for the recorded event: what actually
+                                        // ran, independent of the caller-supplied
+                                        // human_command that drives the display string.
+                                        let mut executed_meta = std::collections::HashMap::new();
+                                        executed_meta.insert(
+                                            "argv".to_string(),
+                                            cmd_req.argv.join("\u{1f}"),
+                                        );
+
                                         // Build response and update counters
                                         let response = match result {
-                                            Ok(resp) => {
-                                                let exec_resp = resp.into_inner();
-                                                
-                                                // Increment success counter
+                                            Ok(_) => {
                                                 *commands_executed.write().await += 1;
-                                                
+
+                                                let message = service.build_detailed_message(
+                                                    &action, &position, &human_cmd,
+                                                );
+
                                                 debug!(
                                                     "Command {} executed successfully (time: {:?})",
                                                     command_id,
                                                     execution_time
                                                 );
-                                                
+
                                                 proto::CommandResponse {
                                                     id: command_id.clone(),
-                                                    success: exec_resp.success,
-                                                    message: exec_resp.message,
-                                                    execution_time_ms: exec_resp.execution_time_ms,
-                                                    mouse_x: exec_resp.mouse_x,
-                                                    mouse_y: exec_resp.mouse_y,
-                                                    position_captured: exec_resp.position_captured,
-                                                    metadata: std::collections::HashMap::new(),
+                                                    success: true,
+                                                    message,
+                                                    execution_time_ms: execution_time.as_millis() as i64,
+                                                    mouse_x: if position.captured { Some(position.x) } else { None },
+                                                    mouse_y: if position.captured { Some(position.y) } else { None },
+                                                    position_captured: Some(position.captured),
+                                                    metadata: executed_meta,
                                                 }
                                             }
                                             Err(e) => {
                                                 // Increment failure counter
                                                 *commands_failed.write().await += 1;
-                                                
+
                                                 error!(
                                                     "Command {} failed: {} (time: {:?})",
                                                     command_id,
                                                     e,
                                                     execution_time
                                                 );
-                                                
+
                                                 proto::CommandResponse {
                                                     id: command_id.clone(),
                                                     success: false,
@@ -1343,7 +931,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     mouse_x: None,
                                                     mouse_y: None,
                                                     position_captured: None,
-                                                    metadata: std::collections::HashMap::new(),
+                                                    metadata: executed_meta,
                                                 }
                                             }
                                         };
@@ -1441,17 +1029,4 @@ mod tests {
         assert!(!version.contains("Unknown") || cfg!(debug_assertions));
     }
     
-    #[test]
-    fn test_command_validation() {
-        let agent = AgentServiceImpl::new();
-        
-        // Valid commands
-        assert!(agent.validate_command("960 540 left").is_ok());
-        assert!(agent.validate_command("type Hello World").is_ok());
-        
-        // Invalid commands
-        assert!(agent.validate_command("").is_err());
-        assert!(agent.validate_command("rm -rf /").is_err());
-        assert!(agent.validate_command(&"x".repeat(10001)).is_err());
-    }
 }

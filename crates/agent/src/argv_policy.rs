@@ -1,0 +1,595 @@
+// crates/agent/src/argv_policy.rs
+// Deny-by-default validation of the structured argv delivered by the server.
+//
+// The allow-listed actuation binaries are not themselves safe boundaries: `xdotool
+// exec <cmd>` spawns arbitrary processes and `osascript -e` evaluates arbitrary
+// AppleScript (including `do shell script`). Checking argv[0] alone therefore leaves
+// an `execute`-scoped caller with arbitrary code execution on the guest. Every
+// accepted argv form is enumerated below and anything outside the grammar is refused
+// before a process is spawned.
+//
+// The grammar covers exactly what crates/controller/os_specific/*_actuation.py emits.
+
+/// An actuation binary the agent is allowed to spawn.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Bin {
+    Xdotool,
+    Cliclick,
+    Osascript,
+}
+
+/// A validated action, ready to execute. Construction is only possible via
+/// [`validate`], so holding one means the grammar has already been satisfied.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Write `content` to an allow-listed AutoHotkey input file (Windows actuation).
+    Write { path: String, content: String },
+    /// Spawn `bin` with validated arguments.
+    Run { bin: Bin, args: Vec<String> },
+    /// macOS scroll: a cliclick focus click followed by an AppleScript key-repeat
+    /// loop. Composed by the agent so the client never supplies script text.
+    Scroll {
+        click: String,
+        key_code: u32,
+        amount: u32,
+    },
+}
+
+const ALLOWED_WRITE_PATHS: &[&str] = &[r"C:\keyboard_cmd.txt", r"C:\mouse_cmd.txt"];
+
+/// AppleScript prefix shared by both accepted osascript templates.
+const OSA_PREFIX: &str = "tell application \"System Events\" to ";
+const OSA_MODIFIERS: &[&str] = &["command", "option", "control", "shift"];
+
+/// Key codes for the four scroll directions (up/down/left/right arrows).
+const SCROLL_KEY_CODES: &[u32] = &[123, 124, 125, 126];
+const MAX_SCROLL_AMOUNT: u32 = 1000;
+
+/// Upper bound (ms) on any caller-supplied wait or inter-keystroke delay. The agent
+/// serves one command at a time, so an unbounded value would stall all actuation.
+const MAX_DELAY_MS: u64 = 60_000;
+
+fn is_bounded_delay(s: &str) -> bool {
+    matches!(s.parse::<u64>(), Ok(n) if n <= MAX_DELAY_MS)
+}
+
+/// Validate an argv vector against the actuation grammar.
+pub fn validate(argv: &[String]) -> Result<Plan, String> {
+    let bin = argv.first().map(|s| s.as_str()).unwrap_or("");
+    if bin.is_empty() {
+        return Err("Empty command".to_string());
+    }
+    let args = &argv[1..];
+
+    match bin {
+        "__write__" => validate_write(args),
+        "__scroll__" => validate_scroll(args),
+        "xdotool" => validate_xdotool(args).map(|args| Plan::Run {
+            bin: Bin::Xdotool,
+            args,
+        }),
+        "cliclick" => validate_cliclick(args).map(|args| Plan::Run {
+            bin: Bin::Cliclick,
+            args,
+        }),
+        "osascript" => validate_osascript(args).map(|args| Plan::Run {
+            bin: Bin::Osascript,
+            args,
+        }),
+        other => Err(format!(
+            "Command '{}' is not an allowed actuation binary",
+            other
+        )),
+    }
+}
+
+fn validate_write(args: &[String]) -> Result<Plan, String> {
+    if args.len() != 2 {
+        return Err("__write__ requires <path> <content>".to_string());
+    }
+    if !ALLOWED_WRITE_PATHS.contains(&args[0].as_str()) {
+        return Err(format!("Write to '{}' is not permitted", args[0]));
+    }
+    Ok(Plan::Write {
+        path: args[0].clone(),
+        content: args[1].clone(),
+    })
+}
+
+fn validate_scroll(args: &[String]) -> Result<Plan, String> {
+    if args.len() != 3 {
+        return Err("__scroll__ requires <click-token> <key-code> <amount>".to_string());
+    }
+    if !is_cliclick_point("c", &args[0]) {
+        return Err(format!("Invalid scroll click token: '{}'", args[0]));
+    }
+    let key_code: u32 = args[1]
+        .parse()
+        .map_err(|_| format!("Invalid scroll key code: '{}'", args[1]))?;
+    if !SCROLL_KEY_CODES.contains(&key_code) {
+        return Err(format!("Scroll key code {} is not permitted", key_code));
+    }
+    let amount: u32 = args[2]
+        .parse()
+        .map_err(|_| format!("Invalid scroll amount: '{}'", args[2]))?;
+    if amount == 0 || amount > MAX_SCROLL_AMOUNT {
+        return Err(format!("Scroll amount {} out of range 1..{}", amount, MAX_SCROLL_AMOUNT));
+    }
+    Ok(Plan::Scroll {
+        click: args[0].clone(),
+        key_code,
+        amount,
+    })
+}
+
+/// xdotool: dispatch on the sub-command. `exec`, `spawn` and `behave` are excluded by
+/// virtue of not appearing in any accepted branch.
+fn validate_xdotool(args: &[String]) -> Result<Vec<String>, String> {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    let rest = if args.is_empty() { &args[0..0] } else { &args[1..] };
+
+    match sub {
+        // "type" carries free text: the payload is data and is never scanned, but it
+        // must be the single trailing argument so it cannot be read as a sub-command.
+        //
+        // A lone trailing argument is still not enough. xdotool parses type's options
+        // with getopt_long, so a payload in `--opt=value` form is read as an option
+        // even though it is one argv element — and `type --file=PATH` types the
+        // contents of PATH, turning the actuation channel into a file-read primitive.
+        // A `--` terminator is inserted below so the payload is always data; verified
+        // against xdotool 3.x, including combined with the flags accepted here.
+        "type" => {
+            let mut i = 0;
+            let mut out: Vec<String> = vec!["type".to_string()];
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--clearmodifiers" => {
+                        out.push(rest[i].clone());
+                        i += 1;
+                    }
+                    "--delay" => {
+                        let n = rest.get(i + 1).ok_or("xdotool type: --delay needs a value")?;
+                        if !is_bounded_delay(n) {
+                            return Err(format!("xdotool type: invalid --delay '{}'", n));
+                        }
+                        out.push(rest[i].clone());
+                        out.push(n.clone());
+                        i += 2;
+                    }
+                    _ => break,
+                }
+            }
+            if rest.len() - i != 1 {
+                return Err("xdotool type: expected exactly one text argument".to_string());
+            }
+            out.push("--".to_string());
+            out.push(rest[i].clone());
+            Ok(out)
+        }
+        // Key specs only: no free text, so every token is constrained.
+        "key" => {
+            if rest.is_empty() {
+                return Err("xdotool key: expected at least one key".to_string());
+            }
+            for t in rest {
+                if t == "--clearmodifiers" {
+                    continue;
+                }
+                if !is_keysym(t) {
+                    return Err(format!("xdotool key: invalid key spec '{}'", t));
+                }
+            }
+            Ok(args.to_vec())
+        }
+        // Pointer actions, optionally chained (e.g. "mousemove X Y click 1").
+        "getmouselocation" | "click" | "mousemove" | "mousedown" | "mouseup" => {
+            for t in rest {
+                let ok = matches!(
+                    t.as_str(),
+                    "--shell"
+                        | "--repeat"
+                        | "--clearmodifiers"
+                        | "click"
+                        | "mousemove"
+                        | "mousedown"
+                        | "mouseup"
+                ) || is_digits(t);
+                if !ok {
+                    return Err(format!("xdotool {}: unexpected token '{}'", sub, t));
+                }
+            }
+            Ok(args.to_vec())
+        }
+        other => Err(format!("xdotool sub-command '{}' is not permitted", other)),
+    }
+}
+
+/// cliclick: every argument is a `prefix:value` action token. cliclick has no
+/// process-spawning verb, so constraining the token shapes is sufficient.
+fn validate_cliclick(args: &[String]) -> Result<Vec<String>, String> {
+    if args.is_empty() {
+        return Err("cliclick: expected at least one action".to_string());
+    }
+    for t in args {
+        let (prefix, value) = t
+            .split_once(':')
+            .ok_or_else(|| format!("cliclick: invalid action token '{}'", t))?;
+        let ok = match prefix {
+            // Pointer actions: "." (current position) or explicit coordinates.
+            "p" | "c" | "rc" | "dc" | "tc" | "mc" | "dd" | "du" | "m" => {
+                is_cliclick_point(prefix, t)
+            }
+            // Wait, in milliseconds.
+            "w" => is_bounded_delay(value),
+            // Key down / up / press: key names, optionally comma-separated.
+            "kd" | "ku" | "kp" => {
+                !value.is_empty()
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ',' | '+' | '-'))
+            }
+            // Typed text: the payload is data.
+            "t" => !value.is_empty(),
+            _ => false,
+        };
+        if !ok {
+            return Err(format!("cliclick: invalid action token '{}'", t));
+        }
+    }
+    Ok(args.to_vec())
+}
+
+/// osascript: only `-e <body>` pairs, each body matching one of the two templates the
+/// actuation layer emits. Free-form scripts (and therefore `do shell script`) are
+/// rejected.
+fn validate_osascript(args: &[String]) -> Result<Vec<String>, String> {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Err("osascript: expected -e <script> pairs".to_string());
+    }
+    for pair in args.chunks(2) {
+        if pair[0] != "-e" {
+            return Err(format!("osascript: unexpected argument '{}'", pair[0]));
+        }
+        let body = &pair[1];
+        if body.contains('\n') || body.contains('\r') {
+            return Err("osascript: multi-line scripts are not permitted".to_string());
+        }
+        let tail = body
+            .strip_prefix(OSA_PREFIX)
+            .ok_or_else(|| format!("osascript: script '{}' is not an accepted template", body))?;
+        if let Some(literal) = tail.strip_prefix("keystroke ") {
+            if !is_applescript_string_literal(literal) {
+                return Err("osascript: keystroke argument is not a closed string literal".to_string());
+            }
+        } else if let Some(spec) = tail.strip_prefix("key code ") {
+            if !is_key_code_spec(spec) {
+                return Err(format!("osascript: invalid key code spec '{}'", spec));
+            }
+        } else {
+            return Err(format!("osascript: script '{}' is not an accepted template", body));
+        }
+    }
+    Ok(args.to_vec())
+}
+
+/// `"…"` where the closing quote is the final character, so nothing can follow the
+/// literal. Inner quotes must be backslash-escaped, which is what keeps an injected
+/// `do shell script` inside the string rather than beside it.
+fn is_applescript_string_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i == bytes.len() - 1,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// `<digits>` optionally followed by ` using {mod down[, mod down]…}`.
+fn is_key_code_spec(spec: &str) -> bool {
+    let (code, modifiers) = match spec.split_once(" using ") {
+        Some((code, rest)) => (code, Some(rest)),
+        None => (spec, None),
+    };
+    if code.is_empty() || code.len() > 3 || !is_digits(code) {
+        return false;
+    }
+    let Some(modifiers) = modifiers else {
+        return true;
+    };
+    let Some(inner) = modifiers.strip_prefix('{').and_then(|m| m.strip_suffix('}')) else {
+        return false;
+    };
+    if inner.is_empty() {
+        return false;
+    }
+    inner.split(", ").all(|m| {
+        m.strip_suffix(" down")
+            .is_some_and(|name| OSA_MODIFIERS.contains(&name))
+    })
+}
+
+/// A cliclick pointer token: `<prefix>:.` or `<prefix>:<x>,<y>`.
+fn is_cliclick_point(prefix: &str, token: &str) -> bool {
+    let Some(value) = token
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix(':'))
+    else {
+        return false;
+    };
+    if value == "." {
+        return true;
+    }
+    match value.split_once(',') {
+        Some((x, y)) => is_signed_int(x) && is_signed_int(y),
+        None => false,
+    }
+}
+
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_signed_int(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    is_digits(body)
+}
+
+/// An X keysym as emitted by the Linux actuation layer, e.g. "ctrl+shift+t".
+fn is_keysym(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- the escapes that motivated this module ----------------------------
+
+    #[test]
+    fn xdotool_exec_is_rejected() {
+        for case in [
+            argv(&["xdotool", "exec", "/bin/sh", "-c", "id"]),
+            argv(&["xdotool", "exec", "--sync", "/bin/sh"]),
+            argv(&["xdotool", "spawn", "/bin/sh"]),
+            argv(&["xdotool", "behave", "$0", "mouse-enter", "exec", "id"]),
+        ] {
+            assert!(validate(&case).is_err(), "should reject {:?}", case);
+        }
+    }
+
+    #[test]
+    fn xdotool_type_chained_with_exec_is_rejected() {
+        // The payload must be the single trailing argument, so a chained sub-command
+        // after the text cannot slip through.
+        let case = argv(&["xdotool", "type", "hi", "exec", "/bin/sh"]);
+        assert!(validate(&case).is_err());
+    }
+
+    #[test]
+    fn osascript_do_shell_script_is_rejected() {
+        for body in [
+            "do shell script \"id\"",
+            "tell application \"System Events\" to do shell script \"id\"",
+            "tell application \"System Events\" to keystroke \"a\" \ndo shell script \"id\"",
+        ] {
+            let case = argv(&["osascript", "-e", body]);
+            assert!(validate(&case).is_err(), "should reject {:?}", body);
+        }
+    }
+
+    #[test]
+    fn osascript_keystroke_cannot_escape_the_literal() {
+        // A payload that closes the literal and appends a statement must be refused.
+        let body = "tell application \"System Events\" to keystroke \"a\" \
+                    & (do shell script \"id\")";
+        assert!(validate(&argv(&["osascript", "-e", body])).is_err());
+    }
+
+    #[test]
+    fn unknown_binary_is_rejected() {
+        assert!(validate(&argv(&["sh", "-c", "id"])).is_err());
+        assert!(validate(&argv(&["/usr/bin/xdotool", "type", "hi"])).is_err());
+        assert!(validate(&[]).is_err());
+    }
+
+    // ---- everything the actuation layer actually emits ---------------------
+
+    #[test]
+    fn xdotool_actuation_vocabulary_is_accepted() {
+        for case in [
+            argv(&["xdotool", "getmouselocation", "--shell"]),
+            argv(&["xdotool", "click", "1"]),
+            argv(&["xdotool", "click", "--repeat", "5", "4"]),
+            argv(&["xdotool", "mousemove", "960", "540"]),
+            argv(&["xdotool", "mousemove", "960", "540", "click", "1"]),
+            argv(&["xdotool", "mousemove", "10", "20", "click", "--repeat", "2", "1"]),
+            argv(&["xdotool", "mousemove", "1", "2", "mousedown", "1", "mousemove", "3", "4", "mouseup", "1"]),
+            argv(&["xdotool", "mousedown", "1"]),
+            argv(&["xdotool", "mouseup", "1"]),
+            argv(&["xdotool", "key", "ctrl+shift+t"]),
+            argv(&["xdotool", "key", "Return"]),
+        ] {
+            assert!(validate(&case).is_ok(), "should accept {:?}", case);
+        }
+    }
+
+    #[test]
+    fn typed_text_is_data_not_syntax() {
+        // Shell metacharacters in the payload are accepted and passed through as a
+        // single argument — there is no shell for them to act on.
+        let case = argv(&["xdotool", "type", "hello$(touch /tmp/pwned)`id`; rm -rf /"]);
+        assert_eq!(
+            validate(&case).unwrap(),
+            Plan::Run {
+                bin: Bin::Xdotool,
+                args: argv(&["type", "--", "hello$(touch /tmp/pwned)`id`; rm -rf /"]),
+            }
+        );
+    }
+
+    #[test]
+    fn typed_text_cannot_become_an_xdotool_option() {
+        // `xdotool type --file=PATH` types the contents of PATH. The payload is one
+        // argv element, so arity alone does not stop it — the inserted `--` does.
+        let case = argv(&["xdotool", "type", "--file=/etc/shadow"]);
+        assert_eq!(
+            validate(&case).unwrap(),
+            Plan::Run {
+                bin: Bin::Xdotool,
+                args: argv(&["type", "--", "--file=/etc/shadow"]),
+            }
+        );
+
+        // The terminator goes after any accepted flags, never before them.
+        let case = argv(&["xdotool", "type", "--clearmodifiers", "--file=-"]);
+        assert_eq!(
+            validate(&case).unwrap(),
+            Plan::Run {
+                bin: Bin::Xdotool,
+                args: argv(&["type", "--clearmodifiers", "--", "--file=-"]),
+            }
+        );
+
+        let case = argv(&["xdotool", "type", "--delay", "12", "-h"]);
+        assert_eq!(
+            validate(&case).unwrap(),
+            Plan::Run {
+                bin: Bin::Xdotool,
+                args: argv(&["type", "--delay", "12", "--", "-h"]),
+            }
+        );
+    }
+
+    #[test]
+    fn xdotool_type_file_option_form_is_still_rejected() {
+        // The two-element form fails arity before it can reach the terminator.
+        assert!(validate(&argv(&["xdotool", "type", "--file", "/etc/shadow"])).is_err());
+        assert!(validate(&argv(&["xdotool", "type", "--delay", "abc", "hi"])).is_err());
+        assert!(validate(&argv(&["xdotool", "type"])).is_err());
+    }
+
+    #[test]
+    fn cliclick_actuation_vocabulary_is_accepted() {
+        for case in [
+            argv(&["cliclick", "p:."]),
+            argv(&["cliclick", "c:."]),
+            argv(&["cliclick", "c:960,540"]),
+            argv(&["cliclick", "c:-10,-20"]),
+            argv(&["cliclick", "rc:."]),
+            argv(&["cliclick", "dc:."]),
+            argv(&["cliclick", "tc:."]),
+            argv(&["cliclick", "mc:."]),
+            argv(&["cliclick", "dd:."]),
+            argv(&["cliclick", "du:."]),
+            argv(&["cliclick", "c:.", "w:50"]),
+            argv(&["cliclick", "kp:return"]),
+            argv(&["cliclick", "kd:cmd", "kp:a", "ku:cmd"]),
+            argv(&["cliclick", "t:x"]),
+        ] {
+            assert!(validate(&case).is_ok(), "should accept {:?}", case);
+        }
+    }
+
+    #[test]
+    fn waits_and_delays_are_bounded() {
+        // The agent serves one command at a time; an unbounded wait stalls actuation.
+        assert!(validate(&argv(&["cliclick", "w:50"])).is_ok());
+        assert!(validate(&argv(&["cliclick", "w:60000"])).is_ok());
+        assert!(validate(&argv(&["cliclick", "w:60001"])).is_err());
+        assert!(validate(&argv(&["cliclick", "w:999999999999999999999"])).is_err());
+        assert!(validate(&argv(&["xdotool", "type", "--delay", "12", "hi"])).is_ok());
+        assert!(validate(&argv(&["xdotool", "type", "--delay", "600000", "hi"])).is_err());
+    }
+
+    #[test]
+    fn cliclick_rejects_malformed_tokens() {
+        for case in [
+            argv(&["cliclick", "c:abc"]),
+            argv(&["cliclick", "nope"]),
+            argv(&["cliclick", "x:1,2"]),
+            argv(&["cliclick", "w:soon"]),
+            argv(&["cliclick"]),
+        ] {
+            assert!(validate(&case).is_err(), "should reject {:?}", case);
+        }
+    }
+
+    #[test]
+    fn osascript_templates_are_accepted() {
+        for body in [
+            "tell application \"System Events\" to keystroke \"hello world\"",
+            // Escaped quote and backslash inside the literal.
+            "tell application \"System Events\" to keystroke \"say \\\"hi\\\" \\\\ ok\"",
+            "tell application \"System Events\" to key code 36",
+            "tell application \"System Events\" to key code 123 using {command down}",
+            "tell application \"System Events\" to key code 51 using {command down, shift down}",
+        ] {
+            let case = argv(&["osascript", "-e", body]);
+            assert!(validate(&case).is_ok(), "should accept {:?}", body);
+        }
+    }
+
+    #[test]
+    fn osascript_rejects_bad_key_code_specs() {
+        for body in [
+            "tell application \"System Events\" to key code 9999",
+            "tell application \"System Events\" to key code abc",
+            "tell application \"System Events\" to key code 36 using {evil down}",
+            "tell application \"System Events\" to key code 36 using {}",
+        ] {
+            assert!(validate(&argv(&["osascript", "-e", body])).is_err(), "should reject {:?}", body);
+        }
+    }
+
+    #[test]
+    fn osascript_requires_e_pairs() {
+        assert!(validate(&argv(&["osascript", "/tmp/script.scpt"])).is_err());
+        assert!(validate(&argv(&[
+            "osascript",
+            "-e",
+            "tell application \"System Events\" to key code 36",
+            "extra"
+        ]))
+        .is_err());
+    }
+
+    // ---- sentinels ---------------------------------------------------------
+
+    #[test]
+    fn write_sentinel_is_path_constrained() {
+        assert!(validate(&argv(&["__write__", r"C:\mouse_cmd.txt", "960 540 left"])).is_ok());
+        assert!(validate(&argv(&["__write__", r"C:\Windows\System32\evil.bat", "x"])).is_err());
+        assert!(validate(&argv(&["__write__", r"C:\mouse_cmd.txt"])).is_err());
+    }
+
+    #[test]
+    fn scroll_sentinel_is_bounded() {
+        assert_eq!(
+            validate(&argv(&["__scroll__", "c:.", "125", "5"])).unwrap(),
+            Plan::Scroll { click: "c:.".to_string(), key_code: 125, amount: 5 }
+        );
+        assert!(validate(&argv(&["__scroll__", "c:960,540", "126", "3"])).is_ok());
+        for case in [
+            argv(&["__scroll__", "c:.", "36", "5"]),      // non-scroll key code
+            argv(&["__scroll__", "c:.", "125", "0"]),     // amount below range
+            argv(&["__scroll__", "c:.", "125", "100000"]), // amount above range
+            argv(&["__scroll__", "rc:.", "125", "5"]),    // wrong click prefix
+            argv(&["__scroll__", "c:.", "125"]),          // arity
+        ] {
+            assert!(validate(&case).is_err(), "should reject {:?}", case);
+        }
+    }
+}

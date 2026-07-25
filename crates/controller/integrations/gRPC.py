@@ -91,8 +91,23 @@ class GRPCClient:
         ]
         
         if self.use_ssl:
-            logger.info("Creating secure channel (SSL)")
-            credentials = grpc.ssl_channel_credentials()
+            # Trust the server's CA (self-signed or private). CC_TLS_CA points at the
+            # CA/server cert PEM; without it, system roots are used.
+            ca_path = os.environ.get('CC_TLS_CA')
+            root_certs = None
+            if ca_path:
+                try:
+                    with open(ca_path, 'rb') as f:
+                        root_certs = f.read()
+                except OSError as e:
+                    logger.warning(f"Could not read CC_TLS_CA '{ca_path}': {e}")
+            # When connecting by IP but the cert has a DNS SAN, allow overriding the
+            # name the client verifies against.
+            server_name = os.environ.get('CC_TLS_SERVER_NAME')
+            if server_name:
+                options = options + [('grpc.ssl_target_name_override', server_name)]
+            logger.info("Creating secure channel (TLS)")
+            credentials = grpc.ssl_channel_credentials(root_certificates=root_certs)
             return grpc.secure_channel(target, credentials, options=options)
         else:
             logger.info("Creating insecure channel")
@@ -298,16 +313,24 @@ class GRPCClient:
             return None
     
     # Public method to execute a single command and return result
-    def execute_command(self, command: str) -> Dict:
+    def execute_command(
+        self,
+        argv: List[str],
+        human_command: str,
+    ) -> Dict:
         """
-        Execute single command
-        
+        Execute a single command.
+
         Args:
-            command: Command to execute
-            
+            argv: Structured argument vector executed directly by the agent (no shell).
+            human_command: Human-readable command for recording (e.g. "type hi").
+
+        Both are required: the server rejects a request without them. The legacy
+        `CommandRequest.command` shell string is no longer accepted anywhere.
+
         Returns:
             Dict with keys: success, message, execution_time_ms, mouse_x, mouse_y, position_captured
-            
+
         Raises:
             AuthenticationError: If token invalid/expired
             RateLimitError: If rate limit exceeded
@@ -315,9 +338,9 @@ class GRPCClient:
         """
         if not self.token:
             raise AuthenticationError(message="Not authenticated")
-        
+
         request_id = str(uuid4())
-        
+
         if not self.stub:
             raise ConnectionError(
                 message="Not connected to server.",
@@ -328,7 +351,8 @@ class GRPCClient:
         try:
             request = control_center_pb2.CommandRequest(
                 id=request_id,
-                command=command
+                argv=list(argv),
+                human_command=human_command,
             )
             
             # Call with authentication metadata
@@ -461,7 +485,7 @@ class GRPCClient:
         }
         return os_map.get(os_enum, "UNKNOWN")
     
-    # Monitoring RPCs (no auth required)
+    # Monitoring RPCs (require a `monitor`-scoped token; Ping is the exception)
     def query_connections(
         self,
         server_id: Optional[str] = None,
@@ -470,7 +494,7 @@ class GRPCClient:
     ) -> Optional[Dict]:
         """Query current connection metadata from the server.
 
-        No authentication required.
+        Requires a `monitor`-scoped token (set via set_token).
 
         Returns:
             Dict with keys: connections (list[dict]), total_count (int)
@@ -486,7 +510,7 @@ class GRPCClient:
                 agent_id=agent_id or "",
                 network=network or "",
             )
-            response = self.stub.QueryConnections(request, timeout=self.timeout)
+            response = self.stub.QueryConnections(request, metadata=self._get_metadata(), timeout=self.timeout)
             self._last_activity = time.time()
             return {
                 'total_count': response.total_count,
@@ -504,7 +528,7 @@ class GRPCClient:
     ) -> Optional[Dict]:
         """Query server status (identity, uptime, connection state).
 
-        No authentication required.
+        Requires a `monitor`-scoped token (set via set_token).
 
         Returns:
             Dict with keys: servers (list[dict]), total_count (int)
@@ -518,7 +542,7 @@ class GRPCClient:
                 server_id=server_id or "",
                 network=network or "",
             )
-            response = self.stub.QueryServers(request, timeout=self.timeout)
+            response = self.stub.QueryServers(request, metadata=self._get_metadata(), timeout=self.timeout)
             self._last_activity = time.time()
 
             servers = []
@@ -557,7 +581,7 @@ class GRPCClient:
     def get_server_identity(self) -> Optional[Dict]:
         """Get persistent server identity.
 
-        No authentication required.
+        Requires a `monitor`-scoped token (set via set_token).
 
         Returns:
             Dict with keys: server_id, hostname, listen_address, version,
@@ -567,7 +591,7 @@ class GRPCClient:
             raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
         try:
             request = control_center_pb2.InfoRequest()
-            response = self.stub.GetServerIdentity(request, timeout=self.timeout)
+            response = self.stub.GetServerIdentity(request, metadata=self._get_metadata(), timeout=self.timeout)
             self._last_activity = time.time()
             return {
                 'server_id': response.server_id,
@@ -685,7 +709,7 @@ class GRPCClient:
     def get_connection_history(self, limit: int = 50) -> Optional[List[Dict]]:
         """Fetch historical agent connection records from the server registry.
 
-        No authentication required — read-only operational metadata.
+        Requires a `monitor`-scoped token (set via set_token).
 
         Args:
             limit: Maximum records to return (default 50, server-side max 500).
@@ -700,7 +724,7 @@ class GRPCClient:
             raise ConnectionError(message="Not connected to server.", host=self.host, port=self.port)
         try:
             request = control_center_pb2.ConnectionHistoryRequest(limit=limit)
-            response = self.stub.GetConnectionHistory(request, timeout=self.timeout)
+            response = self.stub.GetConnectionHistory(request, metadata=self._get_metadata(), timeout=self.timeout)
             self._last_activity = time.time()
             records = []
             for h in response.connections:
@@ -725,7 +749,7 @@ class GRPCClient:
 
     # Real-time command event streaming   
     def watch_commands(self):
-        """Stream live command events from the server — no auth required.
+        """Stream live command events from the server (requires a `monitor` token).
 
         Yields dicts for each CommandEvent as they arrive:
             session_id, agent_id, agent_version, os_type,
@@ -746,7 +770,7 @@ class GRPCClient:
         request = control_center_pb2.WatchRequest()
 
         try:
-            for event in self.stub.WatchCommands(request):
+            for event in self.stub.WatchCommands(request, metadata=self._get_metadata()):
                 yield {
                     'session_id':        event.session_id,
                     'agent_id':          event.agent_id,

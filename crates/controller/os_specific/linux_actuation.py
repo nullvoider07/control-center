@@ -2,7 +2,7 @@
 
 import re
 import os
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 # LinuxActuation class definition
 class LinuxActuation:
@@ -219,21 +219,28 @@ class LinuxActuation:
         return 'keyboard', f"type {command}"
     
     # Build xdotool command for mouse actions
-    def _build_mouse_command(self, command: str) -> Optional[str]:
-        """Build xdotool mouse command"""
+    def _build_mouse_command(self, command: str) -> Optional[Tuple[List[str], str]]:
+        """Build an (argv, human_command) pair for an xdotool mouse action.
+
+        argv is executed directly by the agent (no shell); DISPLAY is set by the
+        agent. Mouse commands carry no free-text, so every token is a safe literal.
+        """
         parts = command.strip().split()
-        
+
+        def out(tokens: List[str]) -> Tuple[List[str], str]:
+            return (['xdotool'] + tokens, command)
+
         # POSITION COMMAND - Returns current coordinates
         if parts[0] == 'position':
-            return f"DISPLAY={self.display} xdotool getmouselocation --shell"
-        
+            return out(['getmouselocation', '--shell'])
+
         # Handle 'here' commands
         if parts[0] == 'here':
             if len(parts) < 2:
                 return None
-            
+
             action = parts[1]
-            
+
             # Scrolling requires an explicit count from the user
             if action in ['scroll_up', 'scroll_down']:
                 if len(parts) < 3:
@@ -241,100 +248,84 @@ class LinuxActuation:
                     return None
                 count = parts[2]
                 button = '4' if action == 'scroll_up' else '5'
-                return f'DISPLAY={self.display} xdotool click --repeat {count} {button}'
-            
-            if action == 'left':
-                return f'DISPLAY={self.display} xdotool click 1'
-            elif action == 'right':
-                return f'DISPLAY={self.display} xdotool click 3'
-            elif action == 'middle':
-                return f'DISPLAY={self.display} xdotool click 2'
-            elif action == 'double':
-                return f'DISPLAY={self.display} xdotool click --repeat 2 1'
-            elif action == 'hold':
-                return f'DISPLAY={self.display} xdotool mousedown 1'
-            elif action == 'release':
-                return f'DISPLAY={self.display} xdotool mouseup 1'
-            
-            return None
-        
+                return out(['click', '--repeat', count, button])
+
+            here_map = {
+                'left':    ['click', '1'],
+                'right':   ['click', '3'],
+                'middle':  ['click', '2'],
+                'double':  ['click', '--repeat', '2', '1'],
+                'hold':    ['mousedown', '1'],
+                'release': ['mouseup', '1'],
+            }
+            return out(here_map[action]) if action in here_map else None
+
         # Handle coordinate-based commands
         try:
             x, y = int(parts[0]), int(parts[1])
             if len(parts) == 2:
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y}'
-            
+                return out(['mousemove', str(x), str(y)])
+
             action = parts[2]
             if action == 'move':
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y}'
+                return out(['mousemove', str(x), str(y)])
             elif action == 'left':
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y} click 1'
+                return out(['mousemove', str(x), str(y), 'click', '1'])
             elif action == 'right':
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y} click 3'
+                return out(['mousemove', str(x), str(y), 'click', '3'])
             elif action == 'double':
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y} click --repeat 2 1'
+                return out(['mousemove', str(x), str(y), 'click', '--repeat', '2', '1'])
             elif action == 'middle':
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y} click 2'
+                return out(['mousemove', str(x), str(y), 'click', '2'])
             elif action == 'drag' and len(parts) >= 5:
                 x2, y2 = int(parts[3]), int(parts[4])
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y} mousedown 1 mousemove {x2} {y2} mouseup 1'
+                return out(['mousemove', str(x), str(y), 'mousedown', '1',
+                            'mousemove', str(x2), str(y2), 'mouseup', '1'])
             elif action in ['scroll_up', 'scroll_down']:
-                # Scrolling with coordinates
                 count = parts[3] if len(parts) > 3 else '5'
                 button = '4' if action == 'scroll_up' else '5'
-                return f'DISPLAY={self.display} xdotool mousemove {x} {y} click --repeat {count} {button}'
+                return out(['mousemove', str(x), str(y), 'click', '--repeat', count, button])
         except (ValueError, IndexError):
             pass
-        
+
         # Standalone scroll (must include count)
         if parts[0] in ['scroll_up', 'scroll_down']:
             if len(parts) < 2:
                 print(f"[!] Error: {parts[0]} requires a count.")
                 return None
             button = '4' if parts[0] == 'scroll_up' else '5'
-            return f'DISPLAY={self.display} xdotool click --repeat {parts[1]} {button}'
-        
+            return out(['click', '--repeat', parts[1], button])
+
         return None
-    
+
     # Build xdotool command for keyboard actions
-    def _build_keyboard_command(self, command: str) -> Optional[str]:
-        """
-        Build xdotool keyboard command
-        
-        Handles:
-        - type: Types literal text
-        - press: Presses key combinations (including standalone modifiers)
+    def _build_keyboard_command(self, command: str) -> Optional[Tuple[List[str], str]]:
+        """Build an (argv, human_command) pair for an xdotool keyboard action.
+
+        For 'type', the literal text is a single argv element passed straight to
+        xdotool — no shell, so no escaping and no injection (F5).
         """
         parts = command.strip().split(maxsplit=1)
-        
+
         if len(parts) < 1:
             return None
-        
+
         action = parts[0]
-        
+
         # Handle "type" action
         if action == 'type':
             if len(parts) < 2:
                 return None
             text = parts[1]
-            # Escape special characters for typing
-            escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
-            return f'DISPLAY={self.display} xdotool type "{escaped_text}"'
-        
+            return (['xdotool', 'type', text], command)
+
         # Handle "press" action
         elif action == 'press':
             if len(parts) < 2:
-                # "press" with no arguments is invalid
                 return None
-            
-            text = parts[1]
-            
-            # Translate the key combination (handles standalone modifiers!)
-            translated = self._translate_modifier_keys(text)
-            
-            # Return xdotool key command
-            return f'DISPLAY={self.display} xdotool key {translated}'
-        
+            translated = self._translate_modifier_keys(parts[1])
+            return (['xdotool', 'key'] + translated.split(), command)
+
         return None
     
     # Main command execution method with position tracking
@@ -352,23 +343,24 @@ class LinuxActuation:
             print(f"[✗] Invalid command: {command}")
             return False
         
-        # Build the xdotool command
+        # Build the xdotool command as (argv, human_command)
         if cmd_type == 'mouse':
-            xdotool_cmd = self._build_mouse_command(processed_cmd)
+            built = self._build_mouse_command(processed_cmd)
         elif cmd_type == 'keyboard':
-            xdotool_cmd = self._build_keyboard_command(processed_cmd)
+            built = self._build_keyboard_command(processed_cmd)
         else:
-            xdotool_cmd = None
-        
-        if not xdotool_cmd:
+            built = None
+
+        if not built:
             print(f"[✗] Failed to build command: {command}")
             return False
-        
+
+        argv, human_command = built
         position_after = None
 
-        # Send to server via gRPC
-        result = self.grpc_client.execute_command(xdotool_cmd)
-        
+        # Send to server via gRPC (structured argv — executed without a shell)
+        result = self.grpc_client.execute_command(argv=argv, human_command=human_command)
+
         if cmd_type == 'mouse' and result['success'] and processed_cmd != 'position':
             mx = result.get('mouse_x')
             my = result.get('mouse_y')
@@ -393,7 +385,8 @@ class LinuxActuation:
                     human = self._format_press_for_display(kb_content)
                     print(f"Pressed: {human}, time taken: {ms}ms")
                 else:
-                    print(f"Typed: {kb_content}, time taken: {ms}ms")
+                    # Do not echo typed content — it may contain secrets.
+                    print(f"Typed: {len(kb_content)} chars, time taken: {ms}ms")
             else:
                 tokens = command.strip().split()
                 is_here = tokens[0] == 'here'
@@ -449,18 +442,19 @@ class LinuxActuation:
             if cmd_type == 'invalid':
                 continue
             
-            # Build xdotool command
+            # Build xdotool command as (argv, human_command)
             if cmd_type == 'mouse':
-                xdotool_cmd = self._build_mouse_command(processed_cmd)
+                built = self._build_mouse_command(processed_cmd)
             elif cmd_type == 'keyboard':
-                xdotool_cmd = self._build_keyboard_command(processed_cmd)
+                built = self._build_keyboard_command(processed_cmd)
             else:
                 continue
-            
-            if not xdotool_cmd:
+
+            if not built:
                 continue
-            
-            result = self.grpc_client.execute_command(xdotool_cmd)
+
+            argv, human_command = built
+            result = self.grpc_client.execute_command(argv=argv, human_command=human_command)
             total_count += 1
             
             if result['success']:

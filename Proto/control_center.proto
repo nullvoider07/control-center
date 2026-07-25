@@ -86,9 +86,11 @@ message RegistrationResponse {
 // Command request from CLI to server
 message CommandRequest {
   string id = 1;                  // Command UUID
-  string command = 2;             // Command string
+  string command = 2;             // Retired shell string; rejected by the server
   optional string user_id = 3;    // User who issued command
   int64 timestamp = 4;            // When command was issued
+  repeated string argv = 5;       // Structured argv; executed directly (no shell)
+  string human_command = 6;       // Human-readable command for recording (e.g. "type hi")
 }
 
 // Command response from agent to server

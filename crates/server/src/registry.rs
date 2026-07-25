@@ -22,6 +22,11 @@ pub struct ConnectedAgent {
     pub os_type: i32,
     pub os_version: String,
     pub capabilities: Vec<String>,
+    /// JWT subject of the token that registered this agent. The command stream may
+    /// only be served by the same principal.
+    pub auth_subject: String,
+    /// Whether a command stream has already been attached to this connection.
+    pub stream_bound: bool,
 }
 
 /// Connection state
@@ -97,6 +102,7 @@ impl ConnectionRegistry {
         agent_identity: &crate::proto::AgentIdentity,
         connection_id: String,
         agent_ip: String,
+        auth_subject: String,
     ) -> Result<(), String> {
         let mut connection_lock = self.current_connection.write().await;
 
@@ -153,6 +159,8 @@ impl ConnectionRegistry {
             last_heartbeat: Instant::now(),
             commands_executed: 0,
             state: ConnectionState::Connected,
+            auth_subject,
+            stream_bound: false,
         };
 
         info!(
@@ -164,6 +172,50 @@ impl ConnectionRegistry {
         );
 
         *connection_lock = Some(connected_agent);
+        Ok(())
+    }
+
+    /// Attach a command stream to the registered connection.
+    ///
+    /// The stream carries the operator's raw typed text and its responses become the
+    /// recorded command history, so it is bound to the principal that registered:
+    /// a different `agent`-scoped token cannot attach, and a connection that already
+    /// has a stream cannot acquire a second one (two handlers would race the shared
+    /// command queue).
+    pub async fn bind_stream(&self, connection_id: &str, subject: &str) -> Result<(), String> {
+        let mut connection_lock = self.current_connection.write().await;
+
+        let agent = connection_lock
+            .as_mut()
+            .ok_or_else(|| "No agent registered".to_string())?;
+
+        if agent.connection_id != connection_id {
+            return Err(format!(
+                "Connection {} is not the registered connection",
+                connection_id
+            ));
+        }
+        if agent.auth_subject != subject {
+            warn!(
+                "Rejecting stream for connection {}: token subject '{}' does not match \
+                 the registering subject '{}'",
+                connection_id, subject, agent.auth_subject
+            );
+            return Err("Stream subject does not match the registered agent".to_string());
+        }
+        if agent.stream_bound {
+            warn!(
+                "Rejecting duplicate stream for connection {} (subject '{}')",
+                connection_id, subject
+            );
+            return Err("A command stream is already attached to this connection".to_string());
+        }
+
+        agent.stream_bound = true;
+        info!(
+            "Command stream bound to connection {} (subject: {})",
+            connection_id, subject
+        );
         Ok(())
     }
 
@@ -362,11 +414,13 @@ mod tests {
 
         // First agent should register successfully
         let result1 = registry
-            .register_agent(&agent1, "conn-1".to_string(), "192.168.1.100".to_string())
+            .register_agent(&agent1, "conn-1".to_string(), "192.168.1.100".to_string(), "agent-1-sub".to_string())
             .await;
         assert!(result1.is_ok());
 
-        // Second agent should be rejected
+        // In single-agent mode a second registration evicts the first rather than
+        // being refused: the new agent takes the slot and the old one is moved to
+        // history (asserted below).
         let agent2 = crate::proto::AgentIdentity {
             agent_id: "agent-2".to_string(),
             hostname: "host-2".to_string(),
@@ -379,9 +433,9 @@ mod tests {
         };
 
         let result2 = registry
-            .register_agent(&agent2, "conn-2".to_string(), "192.168.1.101".to_string())
+            .register_agent(&agent2, "conn-2".to_string(), "192.168.1.101".to_string(), "agent-2-sub".to_string())
             .await;
-        assert!(result2.is_err());
+        assert!(result2.is_ok());
         let current = registry.get_current_connection().await;
         assert!(current.is_some());
         assert_eq!(current.unwrap().agent_id, "agent-2");
@@ -411,7 +465,7 @@ mod tests {
         };
 
         registry
-            .register_agent(&agent, "conn-1".to_string(), "192.168.1.100".to_string())
+            .register_agent(&agent, "conn-1".to_string(), "192.168.1.100".to_string(), "agent-sub".to_string())
             .await
             .unwrap();
         assert!(registry.is_agent_connected().await);
@@ -425,6 +479,57 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].agent_id, "agent-1");
         assert!(history[0].disconnect_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_bind_stream_is_restricted_to_the_registering_subject() {
+        let registry = ConnectionRegistry::new(true, 10, "127.0.0.1".to_string());
+
+        let agent = crate::proto::AgentIdentity {
+            agent_id: "agent-1".to_string(),
+            hostname: "host-1".to_string(),
+            os_type: 0,
+            os_version: "macOS 14".to_string(),
+            ip_address: "192.168.1.100".to_string(),
+            version: "1.0.0".to_string(),
+            capabilities: vec![],
+            metadata: std::collections::HashMap::new(),
+        };
+
+        // No agent registered yet.
+        assert!(registry.bind_stream("conn-1", "agent-sub").await.is_err());
+
+        registry
+            .register_agent(
+                &agent,
+                "conn-1".to_string(),
+                "192.168.1.100".to_string(),
+                "agent-sub".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // A different agent-scoped principal cannot serve this connection's stream.
+        assert!(registry.bind_stream("conn-1", "other-agent").await.is_err());
+        // Nor can the right principal claim a connection that is not the current one.
+        assert!(registry.bind_stream("conn-2", "agent-sub").await.is_err());
+
+        // The registering principal binds once.
+        assert!(registry.bind_stream("conn-1", "agent-sub").await.is_ok());
+        // A second stream would race the shared command queue.
+        assert!(registry.bind_stream("conn-1", "agent-sub").await.is_err());
+
+        // Re-registering resets the binding so a reconnecting agent can attach again.
+        registry
+            .register_agent(
+                &agent,
+                "conn-2".to_string(),
+                "192.168.1.100".to_string(),
+                "agent-sub".to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(registry.bind_stream("conn-2", "agent-sub").await.is_ok());
     }
 
     #[tokio::test]
@@ -449,7 +554,7 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
         registry
-            .register_agent(&agent, "conn-1".to_string(), "192.168.1.100".to_string())
+            .register_agent(&agent, "conn-1".to_string(), "192.168.1.100".to_string(), "agent-sub".to_string())
             .await
             .unwrap();
 
