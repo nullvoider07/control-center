@@ -96,6 +96,16 @@ def test_python_and_rust_versions_match():
     )
 
 
+def test_readme_states_the_packaged_version():
+    """The README header is the first thing a release points at, and it went out at
+    1.1.0 while everything else had moved to 1.2.0."""
+    match = re.search(r"^\*\*Version:\*\* *(\S+)", (REPO_ROOT / "README.md").read_text(), re.M)
+    assert match, "no '**Version:**' header found in README.md"
+    assert match.group(1) == _package_version(), (
+        f"README says {match.group(1)} but the package is {_package_version()}"
+    )
+
+
 def test_generated_stub_imports_its_sibling_relatively():
     """A bare `import control_center_pb2` resolves only via a sys.path hack.
     scripts/generate_proto.py rewrites it; this catches a regeneration that bypassed

@@ -1,6 +1,6 @@
 # Control Center - Desktop Actuation Tool
 
-**Version:** 1.1.0  
+**Version:** 1.2.0  
 **Last Updated:** July 2026  
 **Developer:** Kartik A (NullVoider)
 

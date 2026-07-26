@@ -749,9 +749,10 @@ jobs:
             > `mouse_x`/`mouse_y`. An uncaptured position is carried as `(0, 0)`,
             > which is itself a valid screen coordinate.
 
-            ## ✨ Previously in v1.1.1
+            ## ✨ Also new in v1.2.0
 
-            Actuation and recording fidelity:
+            Prepared as v1.1.1 and folded into this release, so v1.2.0 is the first
+            build containing it — actuation and recording fidelity:
 
             - **Fixed** — Recorded steps no longer truncate at the first quote. A
               `type` command containing double quotes actuated correctly but every
