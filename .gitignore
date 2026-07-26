@@ -6,6 +6,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+# setuptools/pip build output — `pip install .` leaves these in the source tree
+build/
+dist/
 
 # Runtime logs (audit + error logs written by the controller/server)
 logs/

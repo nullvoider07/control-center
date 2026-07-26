@@ -1,12 +1,36 @@
+import ast
+from pathlib import Path
+
 from setuptools import setup, find_packages
+
+
+def _version() -> str:
+    """Read __version__ from the package without importing it.
+
+    Importing controller at build time would require its dependencies to already be
+    installed, which is exactly what this file is declaring.
+    """
+    source = Path(__file__).parent / "crates" / "controller" / "__init__.py"
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise RuntimeError(f"no __version__ found in {source}")
+
 
 setup(
     name="control-center",
-    version="1.2.0",
+    version=_version(),
     description="Unified multi-OS control center for CUA actuation",
     author="Kartik A (NullVoider)",
     license="GPL-3.0",
-    packages=find_packages(),
+    # The package lives at crates/controller, not at the repo root. Without
+    # package_dir, find_packages() searches the root, finds nothing, and produces a
+    # distribution containing no modules at all — while entry_points still installs a
+    # `control-center` script, so the CLI installs and then fails on import.
+    package_dir={"": "crates"},
+    packages=find_packages(where="crates"),
     install_requires=[
         "grpcio>=1.60.0",
         "grpcio-tools>=1.60.0",

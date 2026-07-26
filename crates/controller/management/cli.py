@@ -40,7 +40,9 @@ from controller.management.agent import AgentManager, AgentInfo
 from controller.utils.logger import setup_logger, get_audit_logger
 from controller.utils.validation import require_valid_host, require_valid_port, ValidationError
 
-__version__ = "1.1.0"
+# Re-exported from the package root so `--version` and the update check cannot
+# report a different version than the one packaged.
+from controller import __version__
 
 # Setup logger
 logger = setup_logger('control-center')

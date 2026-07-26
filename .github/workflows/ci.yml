@@ -62,17 +62,7 @@ jobs:
       - name: Generate protobuf modules
         # Same generation release.yml performs, so CI tests the current .proto rather
         # than whatever happened to be committed.
-        run: |
-          mkdir -p crates/controller/integrations/proto
-          python -m grpc_tools.protoc \
-            -IProto \
-            --python_out=crates/controller/integrations/proto \
-            --grpc_python_out=crates/controller/integrations/proto \
-            Proto/control_center.proto
-          cat > crates/controller/integrations/proto/__init__.py << 'EOF'
-          from .control_center_pb2 import *
-          from .control_center_pb2_grpc import *
-          EOF
+        run: python scripts/generate_proto.py
 
       - name: Build workspace
         # Debug binaries are a prerequisite for the integration suite, not just a
