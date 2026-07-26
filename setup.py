@@ -15,6 +15,10 @@ setup(
         "requests>=2.31.0",
         "cryptography>=42.0.0",
         "keyring>=24.0.0",
+        # Imported unconditionally by integrations/status.py and integrations/export.py,
+        # and integrations/__init__.py imports export — so without psutil the whole
+        # integrations package, including the gRPC client, fails to import.
+        "psutil>=5.9.0",
     ],
     entry_points={
         'console_scripts': [
