@@ -247,8 +247,24 @@ def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path):
     interference would not actually move anything and the test would pass without
     exercising the check.
     """
-    import itertools
+    import random
     import threading
+
+    # The agent samples the cursor, actuates, settles ~50ms, samples again, and
+    # re-reads a bounded number of times; any read matching the pre-read counts as a
+    # capture (agent/src/main.rs). Two things follow for the interference:
+    #
+    #  * It must be continuous. One xdotool process per move costs ~50ms on an idle
+    #    machine and more on a loaded runner, comparable to the sample window itself,
+    #    so the race often went unstaged and the assertion failed for an unrelated
+    #    reason. Chaining many moves into one invocation keeps the cursor in motion.
+    #  * The coordinates must not repeat. Cycling a handful of fixed points meant the
+    #    pre-read was itself one of them, so a later re-read landed back on it by
+    #    coincidence and the command was reported as captured — the test was measuring
+    #    that coincidence rather than the check.
+    MOVES_PER_BATCH = 200
+    MIN_MOVES_PER_SECOND = 200  # a move every 5ms against a >=50ms sample window
+    COMMANDS = 12
 
     win = tmp_path / "win.py"
     win.write_text(WINDOW)
@@ -259,12 +275,18 @@ def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path):
     )
     stop = threading.Event()
 
+    rng = random.Random(20260727)
+    moves = [0]
+
     def jitter():
-        for x, y in itertools.cycle([(10, 10), (900, 800), (400, 200), (1200, 900)]):
-            if stop.is_set():
+        while not stop.is_set():
+            batch = ["xdotool"]
+            for _ in range(MOVES_PER_BATCH):
+                batch += ["mousemove",
+                          str(rng.randrange(60, 1200)), str(rng.randrange(60, 950))]
+            if subprocess.run(batch, env=env, capture_output=True).returncode != 0:
                 return
-            subprocess.run(["xdotool", "mousemove", str(x), str(y)],
-                           env=env, capture_output=True)
+            moves[0] += MOVES_PER_BATCH
 
     worker = threading.Thread(target=jitter, daemon=True)
     try:
@@ -279,9 +301,10 @@ def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path):
         la = _linux()
         client = _client(stack, "moving")
         worker.start()
+        started = time.time()
         uncaptured = 0
         try:
-            for _ in range(12):
+            for _ in range(COMMANDS):
                 argv, human = la._build_mouse_command("here left")
                 result = client.execute_command(argv=argv, human_command=human)
                 assert result["success"], result
@@ -289,14 +312,23 @@ def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path):
                     uncaptured += 1
         finally:
             client.disconnect()
+            elapsed = time.time() - started
     finally:
         stop.set()
         worker.join(timeout=5)
         proc.kill()
 
+    rate = moves[0] / elapsed if elapsed > 0 else 0.0
+    if uncaptured == 0 and rate < MIN_MOVES_PER_SECOND:
+        # Distinguish "the check is not running" from "this host could not move the
+        # cursor fast enough to overlap the sample window". Failing on the latter
+        # makes the release gate flaky without telling anyone anything true.
+        pytest.skip(f"cursor moved only {rate:.0f} times/sec, too slow to stage the "
+                    f"race (need {MIN_MOVES_PER_SECOND}/sec)")
+
     assert uncaptured > 0, (
-        "the cursor was being moved continuously, yet every `here left` still "
-        "claimed a captured position — the before/after check is not running"
+        f"the cursor was moved {rate:.0f} times/sec throughout, yet every `here left` "
+        "still claimed a captured position — the before/after check is not running"
     )
 
 
