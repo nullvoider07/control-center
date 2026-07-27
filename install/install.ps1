@@ -110,15 +110,41 @@ function Test-Dependencies {
 # ============================================================================
 function Get-LatestRelease {
     Write-Info "Fetching latest version from GitHub..."
-    
+
+    # An anonymous GitHub API request is charged against a 60/hour quota keyed on the
+    # exit IP, shared with every other client leaving through it — behind a VPN or
+    # corporate NAT, strangers spend it. A token moves the quota onto the account, so
+    # the lookup stops depending on the network path.
+    $headers = @{
+        'Accept'     = 'application/vnd.github+json'
+        'User-Agent' = 'control-center-install'
+    }
+    $token = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }
+    if ($token) { $headers['Authorization'] = "Bearer $token" }
+
     try {
-        $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/latest"
+        $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/latest" -Headers $headers
         $script:LATEST_TAG = $response.tag_name
         $script:VERSION = $LATEST_TAG -replace '^v', ''
         Write-Success "Latest version: v$VERSION"
     } catch {
-        Write-ErrorMsg "Could not find latest release."
-        Write-Host "  Check: https://github.com/$REPO/releases"
+        $status = $null
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+
+        if ($status -eq 403 -or $status -eq 429) {
+            Write-ErrorMsg "GitHub API quota exhausted (HTTP $status)."
+            if (-not $token) {
+                Write-Host "  The anonymous quota is 60/hour and is keyed on your public IP, which"
+                Write-Host "  a VPN or corporate NAT shares with everyone else behind it."
+                Write-Host "  Set GITHUB_TOKEN to raise it to 5000/hour tied to your account."
+            }
+        } elseif ($status) {
+            Write-ErrorMsg "GitHub returned HTTP $status while looking up the latest release."
+        } else {
+            Write-ErrorMsg "Could not reach GitHub: $($_.Exception.Message)"
+        }
+        Write-Host "  Release downloads are not rate limited, so you can also install a"
+        Write-Host "  specific version by hand: https://github.com/$REPO/releases"
         exit 1
     }
 }

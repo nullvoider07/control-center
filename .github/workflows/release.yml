@@ -790,6 +790,35 @@ jobs:
 
             > ⚠️ Server, agent and CLI must be deployed together, as in v1.1.0.
 
+            ## ✨ Installer and self-update
+
+            - **Fixed** — `control-center update` could never replace its own binary on
+              Linux or macOS. It copied over the target in place, which the kernel
+              refuses for an executable that is currently running (`ETXTBSY`, reported
+              as "Text file busy"); only the Windows branch had a rename step. Binaries
+              are now staged beside their targets and renamed into place, which is
+              permitted while the old image runs. Staging completes before the first
+              rename, so a failure part-way through can no longer leave a CLI, server
+              and agent at different versions.
+            - **Fixed** — The update check and both install scripts made anonymous
+              GitHub API requests. That quota is 60/hour keyed on the exit IP, so behind
+              a VPN or carrier NAT it is spent by unrelated traffic before the first run
+              of the day. `GITHUB_TOKEN` or `GH_TOKEN` is now used when set, raising the
+              limit to 5000/hour against the account rather than the address.
+            - **Fixed** — A rate-limited check reported "Please check your internet
+              connection", sending the operator to debug a working network. HTTP 403 and
+              429 are now identified as quota exhaustion and report when it resets.
+            - **Fixed** — `install.sh` could not parse the release tag at all. GitHub
+              returns the response on one line, so the greedy `sed` pattern captured the
+              last quoted string in the document — the tail of the release notes —
+              instead of `tag_name`.
+            - **Fixed** — An update would have offered a *downgrade*. Versions were
+              compared as strings, so any difference read as "newer" and a build ahead
+              of the latest release was told to install an older one.
+            - **Fixed** — Archive extraction now passes an explicit `tarfile` filter,
+              which Python 3.14 requires and which rejects paths escaping the
+              destination.
+
             ## ✨ Previously in v1.1.0
 
             Interactive `connect` console upgrades:

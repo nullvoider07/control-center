@@ -121,7 +121,51 @@ check_dependencies() {
 # ============================================================================
 get_latest_release() {
     print_info "Fetching latest version from GitHub..."
-    LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+
+    # An anonymous GitHub API request is charged against a 60/hour quota keyed on the
+    # exit IP, shared with every other client leaving through it — behind a VPN or
+    # carrier NAT, strangers spend it. A token moves the quota onto the account, so
+    # the lookup stops depending on the network path.
+    local auth=()
+    local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "$token" ]; then
+        auth=(-H "Authorization: Bearer $token")
+    fi
+
+    local body status
+    body=$(mktemp)
+    status=$(curl -sS -o "$body" -w '%{http_code}' \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: control-center-install" \
+        "${auth[@]}" \
+        "https://api.github.com/repos/$REPO/releases/latest") || status="000"
+
+    if [ "$status" = "403" ] || [ "$status" = "429" ]; then
+        rm -f "$body"
+        print_error "GitHub API quota exhausted (HTTP $status)."
+        if [ -z "$token" ]; then
+            echo "  The anonymous quota is 60/hour and is keyed on your public IP, which"
+            echo "  a VPN or carrier NAT shares with everyone else behind it."
+            echo "  Set GITHUB_TOKEN to raise it to 5000/hour tied to your account."
+        fi
+        echo "  Release downloads are not rate limited, so you can also install a"
+        echo "  specific version by hand: https://github.com/$REPO/releases"
+        exit 1
+    fi
+
+    if [ "$status" != "200" ]; then
+        rm -f "$body"
+        print_error "GitHub returned HTTP $status while looking up the latest release."
+        echo "  Check: https://github.com/$REPO/releases"
+        exit 1
+    fi
+
+    # The response is a single line, so a greedy `.*"([^"]+)".*` captures the last
+    # quoted string in the whole document — the tail of the release notes — rather
+    # than the tag. Extract the field itself, then take its value.
+    LATEST_TAG=$(grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$body" \
+        | head -n1 | sed -E 's/.*"([^"]*)"$/\1/')
+    rm -f "$body"
 
     if [ -z "$LATEST_TAG" ]; then
         print_error "Could not find latest release."

@@ -2342,6 +2342,189 @@ def token_validate(token_string, secret_override, audience):
 # ============================================================================
 # Update and Uninstall Commands
 # ============================================================================
+GITHUB_REPO = "nullvoider07/control-center"
+
+
+class UpdateCheckError(Exception):
+    """An update-check failure whose message is already phrased for the operator."""
+
+
+def _github_headers() -> Dict[str, str]:
+    """Headers for GitHub REST calls.
+
+    An anonymous request is charged against a 60/hour quota keyed on the exit IP,
+    which is shared by every other client leaving through it — a VPN or carrier NAT
+    means strangers spend the quota. A token moves the quota onto the account
+    (5000/hour), so the check no longer depends on the network path.
+    """
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"control-center/{__version__}",
+    }
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _rate_limit_message(headers, authenticated: bool) -> str:
+    """Explain a 403/429 from the GitHub API, which is quota far more often than
+    it is a permission or connectivity problem."""
+    remaining = headers.get('x-ratelimit-remaining')
+    if remaining not in (None, '0'):
+        return "GitHub refused the request (HTTP 403) — the API quota is not exhausted"
+
+    limit = headers.get('x-ratelimit-limit') or ('5000' if authenticated else '60')
+    scope = "for this account" if authenticated else "for your public IP"
+    message = f"GitHub API quota exhausted ({limit}/hour {scope})"
+
+    reset = headers.get('x-ratelimit-reset')
+    if reset and str(reset).isdigit():
+        wait = max(0, int(reset) - int(time.time()))
+        message += (f", resets at {time.strftime('%H:%M:%S', time.localtime(int(reset)))}"
+                    f" (in {wait // 60}m{wait % 60:02d}s)")
+
+    if not authenticated:
+        message += (
+            "\n  The anonymous quota is shared by everyone behind the same exit IP, so a"
+            "\n  VPN or carrier NAT spends it on your behalf before you run anything."
+            "\n  Set GITHUB_TOKEN or GH_TOKEN to get 5000/hour tied to your account."
+        )
+    return message
+
+
+def _fetch_latest_release(api_url: str) -> dict:
+    """Fetch release metadata, keeping quota exhaustion distinguishable from a
+    genuine network failure so the operator is not sent to debug the wrong thing."""
+    headers = _github_headers()
+    authenticated = "Authorization" in headers
+
+    try:
+        import requests
+    except ImportError:
+        requests = None
+
+    if requests is not None:
+        try:
+            response = requests.get(api_url, headers=headers, timeout=10)
+        except Exception as e:
+            raise UpdateCheckError(f"could not reach GitHub: {e}")
+        if response.status_code in (403, 429):
+            raise UpdateCheckError(_rate_limit_message(response.headers, authenticated))
+        if response.status_code != 200:
+            raise UpdateCheckError(f"GitHub returned HTTP {response.status_code}")
+        try:
+            return response.json()
+        except ValueError as e:
+            raise UpdateCheckError(f"GitHub returned a malformed response: {e}")
+
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(api_url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            raise UpdateCheckError(_rate_limit_message(e.headers, authenticated))
+        raise UpdateCheckError(f"GitHub returned HTTP {e.code}")
+    except UpdateCheckError:
+        raise
+    except Exception as e:
+        raise UpdateCheckError(f"could not reach GitHub: {e}")
+
+
+def _version_tuple(version: str) -> tuple:
+    """Parse a release version for ordered comparison.
+
+    Comparing versions as strings makes any difference read as "newer", so a build
+    ahead of the latest release is offered an update and then silently downgraded by
+    it. Non-numeric suffixes are dropped: ordering pre-releases correctly is not
+    needed here, and treating 1.2.0-rc1 as 1.2.0 is the safe direction.
+    """
+    parts = []
+    for chunk in version.strip().lstrip('v').split('.')[:3]:
+        digits = ''
+        for char in chunk:
+            if not char.isdigit():
+                break
+            digits += char
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+class BinaryInstallError(Exception):
+    """Staging failed before any binary was replaced, so nothing on disk changed."""
+
+
+def _stage_binaries(binaries: List[str], source_dir: Path, install_dir: Path,
+                    executable: bool) -> List[tuple]:
+    """Copy each binary present in source_dir to a temporary name beside its target.
+
+    Copying is the step that realistically fails — absent file, no free space, no
+    write permission — so all of it completes before the first rename. That keeps a
+    failure from leaving an installation whose CLI, server and agent are different
+    versions and no longer agree on the protocol.
+
+    Raises BinaryInstallError after removing anything already staged.
+    """
+    import stat as _stat
+
+    staged: List[tuple] = []
+    current = ""
+    try:
+        for binary in binaries:
+            current = binary
+            src = source_dir / binary
+            if not src.exists():
+                continue
+            pending = install_dir / f".{binary}.new"
+            shutil.copy2(src, pending)
+            if executable:
+                mode = os.stat(pending).st_mode
+                os.chmod(pending, mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+            staged.append((binary, pending))
+    except OSError as e:
+        for _, pending in staged:
+            try: pending.unlink()
+            except OSError: pass
+        raise BinaryInstallError(f"could not stage {current}: {e}")
+    return staged
+
+
+def _swap_binaries(staged: List[tuple], install_dir: Path, windows: bool):
+    """Rename each staged binary over its target; returns (replaced, failures).
+
+    A running executable cannot be written in place: POSIX fails the write with
+    ETXTBSY, and this command is itself one of the binaries being replaced. Renaming
+    over it is permitted — that swaps the directory entry and leaves the running
+    inode alive — which is why staging plus os.replace succeeds where a direct copy
+    cannot. Windows refuses to replace an open file even by rename, so the existing
+    entry is moved aside first and swept once nothing holds it.
+    """
+    replaced: List[str] = []
+    failures: List[tuple] = []
+    for binary, pending in staged:
+        dst = install_dir / binary
+        try:
+            if windows and dst.exists():
+                displaced = install_dir / f"{binary}.old"
+                if displaced.exists():
+                    try: displaced.unlink()
+                    except OSError: pass
+                dst.rename(displaced)
+            os.replace(pending, dst)
+        except OSError as e:
+            failures.append((binary, str(e)))
+            try: pending.unlink()
+            except OSError: pass
+            continue
+        replaced.append(binary)
+    return replaced, failures
+
+
 @cli.command()
 @click.option('--check-only', is_flag=True, help='Only check for updates without installing')
 def update(check_only):
@@ -2357,29 +2540,19 @@ def update(check_only):
     
     import platform as _platform
     import tempfile
-    import stat as _stat
-    
+
     click.echo("Checking for updates...")
     click.echo(f"Current version: v{__version__}")
     
-    GITHUB_REPO = "nullvoider07/control-center"  # TODO: Update this!
     API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    
+
     try:
         try:
-            try:
-                import requests
-                response = requests.get(API_URL, timeout=10)
-                response.raise_for_status()
-                release_data = response.json()
-            except ImportError:
-                import urllib.request
-                with urllib.request.urlopen(API_URL) as response:
-                    release_data = json.loads(response.read().decode())
-        except Exception as e:
+            release_data = _fetch_latest_release(API_URL)
+        except UpdateCheckError as e:
             click.echo(click.style(f"[ERROR] Failed to check for updates: {e}", fg='red'), err=True)
-            click.echo("Please check your internet connection and try again.", err=True)
-            click.echo(f"You can manually check: https://github.com/{GITHUB_REPO}/releases")
+            click.echo("\nRelease downloads are not rate limited; you can fetch one directly:", err=True)
+            click.echo(f"  https://github.com/{GITHUB_REPO}/releases/latest")
             sys.exit(1)
         
         latest_tag = release_data['tag_name']
@@ -2388,10 +2561,15 @@ def update(check_only):
         click.echo(f"Latest version: v{latest_version}")
         
         current_version = __version__
-        if latest_version == current_version:
+        if _version_tuple(latest_version) == _version_tuple(current_version):
             click.echo(click.style("Check: You already have the latest version!", fg='green'))
             return
-        
+        if _version_tuple(latest_version) < _version_tuple(current_version):
+            click.echo(click.style(
+                f"This build (v{current_version}) is ahead of the latest release "
+                f"(v{latest_version}); nothing to install.", fg='green'))
+            return
+
         click.echo(click.style(f"-> New version available: v{latest_version}", fg='yellow'))
         
         if check_only:
@@ -2467,7 +2645,14 @@ def update(check_only):
             else:
                 import tarfile
                 with tarfile.open(temp_file, 'r:gz') as tar:
-                    tar.extractall(temp_dir)
+                    # 'data' rejects absolute paths, parent-directory traversal, links
+                    # escaping the destination and special files. Python 3.12 warns when
+                    # no filter is given and 3.14 makes it an error, so this is required
+                    # rather than optional hardening.
+                    if hasattr(tarfile, 'data_filter'):
+                        tar.extractall(temp_dir, filter='data')
+                    else:
+                        tar.extractall(temp_dir)
             
             if os_name == 'windows':
                 install_dir = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'ControlCenter' / 'bin'
@@ -2503,45 +2688,50 @@ def update(check_only):
             else:
                 binaries = ['control-center', 'control-center-server', 'control-center-agent']
             
-            installed_count = 0
             for binary in binaries:
-                src = extracted_bin_dir / binary
-                dst = install_dir / binary
-                
-                if src.exists():
-                    if os_name == 'windows' and dst.exists():
-                        try:
-                            old_binary = install_dir / f"{binary}.old"
-                            if old_binary.exists():
-                                try: old_binary.unlink()
-                                except: pass
-                            dst.rename(old_binary)
-                        except Exception as e:
-                            click.echo(click.style(f"[WARNING] Could not replace {binary}: {e}", fg='yellow'), err=True)
-                            continue
-                    
-                    shutil.copy2(src, dst)
-                    
-                    if os_name != 'windows':
-                        os.chmod(dst, os.stat(dst).st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
-                    
-                    click.echo(click.style(f"  Updated {binary}", fg='green'))
-                    installed_count += 1
-                else:
+                if not (extracted_bin_dir / binary).exists():
                     click.echo(click.style(f"  - {binary} not found in archive (optional)", fg='yellow'))
-            
-            shutil.rmtree(temp_dir)
-            
+
+            try:
+                staged = _stage_binaries(binaries, extracted_bin_dir, install_dir,
+                                         executable=(os_name != 'windows'))
+            except BinaryInstallError as e:
+                click.echo(click.style(f"\n[ERROR] {e}", fg='red'), err=True)
+                click.echo("No binaries were changed.", err=True)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                sys.exit(1)
+
+            if not staged:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                click.echo(click.style("\n[ERROR] No binaries were installed", fg='red'), err=True)
+                sys.exit(1)
+
+            replaced, failures = _swap_binaries(staged, install_dir,
+                                                windows=(os_name == 'windows'))
+            for binary in replaced:
+                click.echo(click.style(f"  Updated {binary}", fg='green'))
+            for binary, reason in failures:
+                click.echo(click.style(f"[WARNING] Could not replace {binary}: {reason}",
+                                       fg='yellow'), err=True)
+
+            installed_count = len(replaced)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
             if os_name == 'windows':
                 for binary in binaries:
-                    old_binary = install_dir / f"{binary}.old"
-                    if old_binary.exists():
-                        try: old_binary.unlink()
-                        except: pass
-            
+                    displaced = install_dir / f"{binary}.old"
+                    if displaced.exists():
+                        try: displaced.unlink()
+                        except OSError: pass
+
             if installed_count == 0:
                 click.echo(click.style("\n[ERROR] No binaries were installed", fg='red'), err=True)
                 sys.exit(1)
+            if failures:
+                click.echo(click.style(
+                    f"\n[WARNING] Only {installed_count} of {len(staged)} binaries were "
+                    "replaced — the installation now mixes versions. Re-run the update "
+                    "with the affected processes stopped.", fg='yellow'), err=True)
             
             click.echo("\n" + "="*60)
             click.echo(click.style(f"Successfully updated to v{latest_version}!", fg='green', bold=True))
