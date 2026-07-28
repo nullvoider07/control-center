@@ -12,6 +12,7 @@ import subprocess
 import json
 import time
 import csv
+import hashlib
 import io
 from typing import Optional, Union, List, Dict
 from pathlib import Path
@@ -190,6 +191,22 @@ def _secure_write(path: Union[str, Path], text: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text)
     _restrict_perms(p)
+
+def _restrict_export(result: Union[str, Path, Dict[str, str]]) -> None:
+    """Restrict everything an export wrote to owner-only.
+
+    The Exporter writes through a bare `open()`, so the mode is the process umask
+    until this runs — and its output carries the command log, audit events and a
+    config snapshot. Callers must apply this because the write happens outside
+    cli.py, which is why the sweep over this module's own writes did not catch it.
+
+    Handles both return shapes: a single path, or the {label: path} bundle that the
+    diagnostics and report exports produce.
+    """
+    paths = list(result.values()) if isinstance(result, dict) else [result]
+    for path in paths:
+        if path:
+            _restrict_perms(path)
 
 # Session data persistence helpers
 def _save_session_data():
@@ -626,7 +643,13 @@ def _interactive_mode(controller):
             if not user_input:
                 continue
 
-            if _history is not None:
+            # Typed text is kept out of the cross-session store. readline still holds
+            # it for this sitting, so recall is unchanged for the operator who typed
+            # it; what does not happen is a credential sitting one Up-arrow away in a
+            # fresh session for whoever is next at the terminal. The store is
+            # encrypted at rest, which defends against another user on the box and
+            # not against this.
+            if _history is not None and not command_hints.carries_free_text(user_input):
                 _history.append(user_input)
 
             # Handle special commands
@@ -662,7 +685,12 @@ def _interactive_mode(controller):
                 _exec_ms = int((time.time() - _cmd_start) * 1000)
 
                 if ctx.metrics:
-                    ctx.metrics.record_command(user_input, success, _exec_ms)
+                    # Redacted at the source. Metrics need the verb and the shape,
+                    # never the payload, and this history is the input to the session
+                    # data file and to `export commands` — so redacting here keeps
+                    # typed text out of all three rather than at each write site.
+                    ctx.metrics.record_command(
+                        command_hints.redact(user_input), success, _exec_ms)
 
                 if success and ctx.session:
                     ctx.session.update_activity()
@@ -1813,6 +1841,7 @@ def export_commands(fmt, type_filter, success_only, failed_only, last_n, output)
             last_n=last_n,
             filename=output,
         )
+        _restrict_export(path)
         click.echo(f"[+] Exported commands -> {path}")
     except Exception as e:
         click.echo(f"[x] Export failed: {e}", err=True)
@@ -1905,6 +1934,7 @@ def export_audit(log_dir, fmt, since, event_type, level, last_n, output):
             last_n=last_n,
             filename=output,
         )
+        _restrict_export(path)
         click.echo(f"[+] Exported audit logs -> {path}")
     except Exception as e:
         click.echo(f"[x] Export failed: {e}", err=True)
@@ -1927,6 +1957,7 @@ def export_diagnostics(output, include_system, include_html):
             include_system=include_system,
             include_html=include_html,
         )
+        _restrict_export(path)
         click.echo(f"[+] Diagnostics bundle -> {path}")
     except Exception as e:
         click.echo(f"[x] Export failed: {e}", err=True)
@@ -1947,6 +1978,7 @@ def export_report(output, command_fmt):
             metrics=ctx.metrics.get_stats() if ctx.metrics else (_session_data.get('metrics') if _session_data else {}) or {},
             command_fmt=command_fmt,
         )
+        _restrict_export(path)
         click.echo(f"[+] Report -> {path}")
     except Exception as e:
         click.echo(f"[x] Export failed: {e}", err=True)
@@ -2455,6 +2487,76 @@ def _version_tuple(version: str) -> tuple:
     return tuple(parts)
 
 
+CHECKSUM_ASSET = "SHA256SUMS"
+
+
+class IntegrityError(Exception):
+    """The downloaded asset is not the one the release published."""
+
+
+def _fetch_checksums(release_data: dict) -> Dict[str, str]:
+    """Return {filename: sha256} from the release's SHA256SUMS asset.
+
+    Raises IntegrityError if the release publishes no checksum file or it cannot be
+    read. Failing closed is deliberate: the alternative — installing when the
+    digests are missing — means anyone who can strip one asset from the response
+    also strips the only integrity control the update path has.
+    """
+    url = None
+    for asset in release_data.get('assets', []):
+        if asset.get('name') == CHECKSUM_ASSET:
+            url = asset.get('browser_download_url')
+            break
+    if not url:
+        raise IntegrityError(
+            f"this release publishes no {CHECKSUM_ASSET}, so the download cannot be verified"
+        )
+
+    try:
+        try:
+            import requests
+            response = requests.get(url, headers=_github_headers(), timeout=30)
+            response.raise_for_status()
+            body = response.text
+        except ImportError:
+            import urllib.request
+            request = urllib.request.Request(url, headers=_github_headers())
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read().decode()
+    except Exception as e:
+        raise IntegrityError(f"could not fetch {CHECKSUM_ASSET}: {e}")
+
+    sums: Dict[str, str] = {}
+    for line in body.splitlines():
+        parts = line.split()
+        # "<64 hex>  <name>", the sha256sum(1) format, with '*' marking binary mode.
+        if len(parts) == 2 and len(parts[0]) == 64:
+            sums[parts[1].lstrip('*')] = parts[0].lower()
+    if not sums:
+        raise IntegrityError(f"{CHECKSUM_ASSET} contained no usable digests")
+    return sums
+
+
+def _verify_asset(path: str, asset_name: str, sums: Dict[str, str]) -> None:
+    """Compare the downloaded file against the published digest."""
+    expected = sums.get(asset_name)
+    if not expected:
+        raise IntegrityError(f"{CHECKSUM_ASSET} lists no digest for {asset_name}")
+
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    actual = digest.hexdigest()
+
+    if actual != expected:
+        raise IntegrityError(
+            f"{asset_name} does not match the published digest\n"
+            f"    expected {expected}\n"
+            f"    got      {actual}"
+        )
+
+
 class BinaryInstallError(Exception):
     """Staging failed before any binary was replaced, so nothing on disk changed."""
 
@@ -2618,11 +2720,24 @@ def update(check_only):
             click.echo(click.style(f"[ERROR] No release found for {os_name} {arch}", fg='red'), err=True)
             sys.exit(1)
         
+        # Fetched before the payload so a release without published digests costs
+        # nothing but the API call, and so the check cannot be skipped by a download
+        # that succeeds after it.
+        try:
+            checksums = _fetch_checksums(release_data)
+        except IntegrityError as e:
+            click.echo(click.style(f"[ERROR] Refusing to update: {e}", fg='red'), err=True)
+            click.echo(
+                f"\nDownload and verify it yourself if you mean to install this release:\n"
+                f"  https://github.com/{GITHUB_REPO}/releases/tag/{release_data.get('tag_name', '')}",
+                err=True)
+            sys.exit(1)
+
         click.echo(f"\nDownloading {asset_name}...")
-        
+
         temp_dir = tempfile.mkdtemp()
         temp_file = os.path.join(temp_dir, asset_name)
-        
+
         try:
             try:
                 import requests
@@ -2634,8 +2749,20 @@ def update(check_only):
             except ImportError:
                 import urllib.request
                 urllib.request.urlretrieve(download_url, temp_file)
-            
+
             click.echo(click.style("Download complete", fg='green'))
+
+            # Before extraction: a tampered archive must not reach the tar/zip reader
+            # at all, let alone the install step that can replace a running binary.
+            click.echo("Verifying checksum...")
+            try:
+                _verify_asset(temp_file, asset_name, checksums)
+            except IntegrityError as e:
+                click.echo(click.style(f"[ERROR] Refusing to install: {e}", fg='red'), err=True)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                sys.exit(1)
+            click.echo(click.style("Checksum verified", fg='green'))
+
             click.echo("Extracting archive...")
             
             if os_name == 'windows':

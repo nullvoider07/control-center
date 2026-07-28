@@ -4,6 +4,9 @@ The central security property: user free-text (the `type` payload) becomes a sin
 literal argv element, so a shell can never interpret it. These tests assert that on all
 three platforms and that mouse/keyboard mappings still produce the right argv.
 """
+import re
+from pathlib import Path
+
 import pytest
 
 from controller.os_specific.linux_actuation import LinuxActuation
@@ -102,6 +105,67 @@ def test_macos_builders_never_emit_a_shell_string():
         assert argv[0] in ("cliclick", "osascript", "__scroll__"), \
             f"{cmd!r} produced unexpected argv[0]={argv[0]!r}"
         assert human
+
+
+# ---- controller/agent grammar agreement ------------------------------------
+ARGV_POLICY = Path(__file__).resolve().parents[2] / "crates/agent/src/argv_policy.rs"
+
+# Every macOS command shape that reaches cliclick. A token emitted here whose prefix
+# the agent does not list fails the command closed on the guest.
+MACOS_CLICLICK_COMMANDS = [
+    "position", "960 540 move", "960 540 left", "960 540 right", "960 540 double",
+    "960 540 triple", "960 540 middle", "960 540 hold", "960 540 release",
+    "here left", "here right", "here double", "here triple", "here middle",
+    "here hold", "here release",
+    "100 100 drag 900 700",
+    "100 100 drag 900 700 dwell 300",
+    "100 100 drag via 400 300 via 700 500 to 900 700",
+]
+
+MACOS_CLICLICK_KEYBOARD = [
+    "press {Enter}", "press {F5}", "press #{Mute}", "press #q", "press ^v",
+    "press #", "press 4", "press {Space}",
+]
+
+
+def _agent_cliclick_prefixes() -> set:
+    """The action prefixes crates/agent/src/argv_policy.rs accepts for cliclick."""
+    body = re.search(r"fn validate_cliclick\(.*?\n\}", ARGV_POLICY.read_text(), re.S)
+    assert body, "validate_cliclick not found in argv_policy.rs"
+    # The prefixes are the only one- and two-character string literals in the
+    # function; the error messages are all longer and contain spaces.
+    return set(re.findall(r'"([a-z]{1,2})"', body.group(0)))
+
+
+def test_macos_cliclick_tokens_are_all_in_the_agent_grammar():
+    """The controller and the agent must agree on the cliclick vocabulary, and the
+    two halves ship separately — the agent is Rust and needs a macOS build.
+
+    This is how the drag defect had to be fixed twice: the controller emitted `m:`
+    (mouseMoved) where a drag needs `dm:` (leftMouseDragged), and patching only the
+    controller made every drag fail closed at the guest with "cliclick: invalid
+    action token 'dm:400,350'".
+    """
+    ma = macos()
+    accepted = _agent_cliclick_prefixes()
+    assert "dm" in accepted, "the drag-continuation move is missing from the grammar"
+
+    emitted = {}
+    for command in MACOS_CLICLICK_COMMANDS + MACOS_CLICLICK_KEYBOARD:
+        built = (ma.parse_keyboard_command(command) if command.startswith("press ")
+                 else ma.build_mouse_command(command))
+        assert built is not None, f"builder returned None for {command!r}"
+        argv, _ = built
+        if argv[0] != "cliclick":
+            continue
+        for token in argv[1:]:
+            emitted.setdefault(token.split(":", 1)[0], command)
+
+    unknown = {p: cmd for p, cmd in emitted.items() if p not in accepted}
+    assert not unknown, (
+        "the controller emits cliclick prefixes the agent will reject: "
+        + ", ".join(f"{p!r} (from {cmd!r})" for p, cmd in sorted(unknown.items()))
+    )
 
 
 # ---- Windows (__write__ direct file) --------------------------------------

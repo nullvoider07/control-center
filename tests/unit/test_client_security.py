@@ -59,6 +59,60 @@ def test_use_ssl_stays_secure_for_non_optout(monkeypatch, val):
     assert cli._resolve_use_ssl() is True
 
 
+# ---- CC_TLS_CA pins a trust anchor; a bad path must not silently unpin it ---
+def _client():
+    from controller.integrations.gRPC import GRPCClient
+    return GRPCClient(host="127.0.0.1", port=50051, use_ssl=True)
+
+
+def test_an_unreadable_ca_is_an_error_not_a_downgrade(monkeypatch, tmp_path):
+    """It used to log a warning and pass root_certificates=None, which swaps the
+    private CA the operator pinned for the public root set. A typo in the path
+    should not change what the client trusts."""
+    from controller.integrations.exceptions import ConnectionError as CCConnectionError
+
+    monkeypatch.setenv("CC_TLS_CA", str(tmp_path / "does-not-exist.crt"))
+    with pytest.raises(CCConnectionError) as excinfo:
+        _client()._create_channel()
+
+    message = str(excinfo.value)
+    assert "CC_TLS_CA" in message
+    assert "does-not-exist.crt" in message
+
+
+def test_a_readable_ca_is_used_as_the_trust_anchor(monkeypatch, tmp_path):
+    ca = tmp_path / "ca.crt"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("CC_TLS_CA", str(ca))
+
+    captured = {}
+
+    import grpc
+    monkeypatch.setattr(
+        grpc, "ssl_channel_credentials",
+        lambda root_certificates=None, **kw: captured.update(roots=root_certificates))
+    monkeypatch.setattr(grpc, "secure_channel", lambda *a, **kw: "channel")
+
+    assert _client()._create_channel() == "channel"
+    assert captured["roots"] == ca.read_bytes(), "the pinned CA was not passed through"
+
+
+def test_no_ca_set_falls_back_to_system_roots(monkeypatch):
+    """Unsetting CC_TLS_CA is a deliberate choice to use the system trust store; only
+    a set-but-unreadable path is an error."""
+    monkeypatch.delenv("CC_TLS_CA", raising=False)
+
+    captured = {}
+    import grpc
+    monkeypatch.setattr(
+        grpc, "ssl_channel_credentials",
+        lambda root_certificates=None, **kw: captured.update(roots=root_certificates))
+    monkeypatch.setattr(grpc, "secure_channel", lambda *a, **kw: "channel")
+
+    assert _client()._create_channel() == "channel"
+    assert captured["roots"] is None
+
+
 # ---- gen-certs: real self-signed CA + server cert -------------------------
 def test_gen_certs_emits_ca_and_server_material(tmp_path):
     out = tmp_path / "tls"

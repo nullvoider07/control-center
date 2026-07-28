@@ -1,6 +1,6 @@
 # Control Center - Desktop Actuation Tool
 
-**Version:** 1.2.0  
+**Version:** 1.2.1  
 **Last Updated:** July 2026  
 **Developer:** Kartik A (NullVoider)
 
@@ -528,7 +528,7 @@ issue it only to consumers that are entitled to see keystroke content.
 |----------|---------|-------------|
 | `CC_TLS_CERT` | Server binary | Path to the server certificate (PEM). Required unless `CC_ALLOW_INSECURE` |
 | `CC_TLS_KEY` | Server binary | Path to the server private key (PEM). Required unless `CC_ALLOW_INSECURE` |
-| `CC_TLS_CA` | Controller | CA certificate used to verify the server. Omit to use system roots |
+| `CC_TLS_CA` | Controller | CA certificate used to verify the server. Omit to use system roots; if set but unreadable the connection fails rather than falling back |
 | `CC_TLS_SERVER_NAME` | Controller | Override the name verified against the certificate (for connecting by IP to a DNS-SAN cert) |
 | `AGENT_TLS_CA` | Agent binary | CA certificate the agent uses to verify the server |
 | `CC_ALLOW_INSECURE` | Controller + Server | `true` disables TLS. **Development only** |
@@ -633,8 +633,18 @@ image is redistributed.
   server restarts. It is encrypted with Fernet using a key held in the OS keyring. If
   no keyring backend is available it stays in memory for that session rather than
   being written under weaker protection.
+- **`type` commands are not kept across sessions.** readline still recalls them for
+  the sitting that produced them, but they are never written to the persistent
+  store. Encryption at rest defends against another user on the machine; it does
+  nothing about the next person at the same terminal pressing Up, which on a shared
+  capture machine is the likelier exposure.
+- **Recorded metrics hold the redacted form.** A `type` payload is replaced by its
+  character count before it reaches `command_history`, so it is absent from the
+  session data file and from every `export` that derives from it.
 - **Session, export, and token files** are written owner-only (`0600`, in `0700`
-  directories).
+  directories). This includes the four exports that delegate their write to the
+  exporter — `commands`, `audit`, `diagnostics` and `report` — which produce the
+  command log, audit events and a config snapshot.
 - **Tokens are never passed on the command line.** `token inspect`, `token validate`,
   and `config set-token` read from a no-echo prompt when the argument is omitted,
   because argv is visible in the process list and shell history. Passing one anyway
@@ -696,6 +706,15 @@ The default single-hop drag with its 50 ms dwells is enough for a selection drag
 but drag-and-drop targets and some overlay UIs only track a slower or multi-step
 movement. Both extended forms stay **one recorded step**. They are implemented for
 the macOS backend; Linux and Windows accept the plain `drag <x2> <y2>` form only.
+
+On macOS the moves between the press and the release are emitted as `cliclick dm:`
+(drag-continuation), not `m:`. `m:` posts `mouseMoved` and only `dm:` posts
+`leftMouseDragged`, which is the event a target tracking a drag listens for — with
+`m:` the target saw a press, a run of unrelated pointer motion and a release, so a
+⇧⌘4 selection drag reported success while drawing no rectangle and writing no file.
+The agent's argv grammar accepts `dm:` for the same reason, so **the controller and
+the agent have to be upgraded together**: an older agent refuses the token outright
+with `cliclick: invalid action token`.
 
 **Examples:**
 
@@ -779,6 +798,16 @@ hotkeys match on keycode + flags. Shortcuts such as ⇧⌘3/⇧⌘4/⇧⌘5 ther
 success and did nothing. The controller now routes any **modified** digit or
 punctuation key through an AppleScript `key code`, using a US-ANSI layout map.
 Letters are unaffected and still take the original path.
+
+**macOS: modified named keys.** The same rule applies to Space, Escape and F1–F16.
+`cliclick` reaches these with `kd:<mod> kp:<key> ku:<mod>` — three independent
+events, where the key event carries no modifier flags of its own and depends on the
+system having already applied the modifier keydown. The two can disagree, so the
+hotkey fires only some of the time: ⌘Space opened Spotlight intermittently, and when
+it did not, that keystroke and every step after it landed in whatever was frontmost.
+These now go through `key code N using {…}`, which carries the modifiers on the event
+itself. Unmodified named keys keep the `kp:` path, and the media keys stay there
+permanently — they are system-defined events with no virtual keycode.
 
 **Escape hatch.** That map is finite; `{code:N}` sends a virtual keycode directly, so
 a key it does not cover is a console command rather than a release. It composes with
@@ -1500,6 +1529,22 @@ control-center update --check-only   # Only check, do not install
 control-center uninstall    # Remove binaries and optionally purge config/data
 control-center uninstall --purge --yes  # Non-interactive full removal
 ```
+
+**Update integrity.** Every release publishes a `SHA256SUMS` asset covering all five
+platform archives. `update` fetches it before the payload and checks the download
+against the published digest **before extracting anything**, so a tampered archive
+never reaches the tar reader, let alone the install step — which since v1.2.0 can
+replace a binary that is currently running. `install.sh` and `install.ps1` do the
+same for a first install.
+
+Verification fails closed. A release with no `SHA256SUMS`, an unreadable checksum
+file, a missing entry for your platform, or a digest mismatch all abort the install
+rather than warn; there is no flag to skip the check. Releases before v1.2.1 predate
+checksum publishing, so installing one means downloading and checking it yourself.
+
+Set `GITHUB_TOKEN` or `GH_TOKEN` to raise the API quota from 60/hour shared across
+your exit IP to 5000/hour on your account — behind a VPN or carrier NAT the
+anonymous quota is spent by strangers before you run anything.
 
 ---
 

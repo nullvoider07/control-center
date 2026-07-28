@@ -705,6 +705,19 @@ jobs:
       - name: List Release Assets
         run: ls -lh release-assets/
 
+      # `control-center update` installs whatever it downloads, and since v1.2.0 it
+      # can replace a binary that is currently running. TLS to GitHub was the only
+      # integrity control on that path; this publishes the digests so the updater has
+      # something to check the payload against.
+      - name: Generate Checksums
+        working-directory: release-assets
+        run: |
+          # Both globs must match — four tarballs and one zip. No fallback: a
+          # SHA256SUMS that silently omits a platform would leave that platform's
+          # updater with nothing to verify against.
+          sha256sum control-center-*.tar.gz control-center-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
@@ -717,7 +730,81 @@ jobs:
 
             **Unified package: Rust binaries + Python CLI in one download**
 
-            ## ✨ What's New in v1.2.0
+            ## ✨ What's New in v1.2.1
+
+            Drag actuation, and integrity on the paths that install this software.
+
+            > **Upgrade both halves.** The drag fix changes the token the controller
+            > emits and the token the agent's grammar accepts. A new controller
+            > against an older agent fails every drag closed with
+            > `cliclick: invalid action token 'dm:...'`.
+
+            - **Fixed** — `<x> <y> drag <x2> <y2>` performed no drag on macOS. The
+              moves between the press and the release were emitted as `cliclick m:`,
+              which posts `mouseMoved`; a target tracking a drag listens for
+              `leftMouseDragged`, which only `dm:` posts. So the target saw a
+              button-down, a run of unrelated pointer motion, and a button-up. The
+              command reported `success=true` with a clean endpoint and no error
+              throughout — a ⇧⌘4 selection drew no rectangle and wrote no file.
+              Both halves are fixed: the controller emits `dm:` and the agent's argv
+              grammar accepts it.
+
+            - **Fixed** — The console echo for the `via` drag form named the wrong
+              destination. It read the endpoint from the two tokens after `drag`,
+              which is the literal `via` in the waypoint form, so a drag that ran to
+              (850, 650) reported `to X=via, Y=400`. The echo and the emitted argv
+              now come from one parser, so they cannot disagree.
+
+            - **Fixed** — `press #{Space}` opened Spotlight only intermittently, and
+              when it did not, that keystroke and every step after it landed in
+              whatever was frontmost. `cliclick kd:cmd kp:space ku:cmd` posts three
+              independent events; the key event carries no modifier flags of its own
+              and depends on the system having already applied the modifier keydown.
+              Space, Escape and F1–F16 now take the same `key code N using {…}` path
+              that ⇧⌘3/⇧⌘4/⇧⌘5 have taken since v1.2.0, which carries the modifiers
+              on the event itself. Unmodified named keys and the media keys are
+              unchanged.
+
+            ### 🔒 Security
+
+            - **Release assets are now verified.** Every release publishes a
+              `SHA256SUMS` covering all five archives. `update`, `install.sh` and
+              `install.ps1` check the download against it **before extracting**, so a
+              tampered archive never reaches the tar/zip reader — let alone the
+              install step, which since v1.2.0 can replace a running binary. TLS to
+              GitHub was previously the only integrity control on that path.
+              Verification fails closed and there is no flag to skip it; releases
+              before v1.2.1 predate checksum publishing.
+
+            - **The actuation grammar's bounds now hold in aggregate.** `MAX_DELAY_MS`
+              bounded each wait but not their sum, so 500 individually-legal
+              `w:60000` tokens validated to over eight hours of stalled actuation —
+              the agent serves one command at a time. `xdotool --repeat` had no bound
+              at all, so `here scroll_down 999999999` wedged the agent and flooded the
+              display, while the same action on macOS was refused above 1000. Repeat
+              counts, summed waits, per-keystroke type delays and argument counts are
+              all bounded now. The longest documented drag — 16 waypoints at a 5000 ms
+              dwell — still validates.
+
+            - **Four exports no longer write world-readable files.** `export commands`,
+              `audit`, `diagnostics` and `report` delegate their write to the exporter,
+              which uses a bare `open()`, so the mode was the process umask. Their
+              content is the command log, audit events and a config snapshot.
+
+            - **Typed text no longer outlives its session.** A `type` payload is
+              redacted before it reaches the metrics command history, so it is absent
+              from the session data file and every export derived from it. `type`
+              lines are also kept out of the cross-session history store: readline
+              still recalls them for the sitting that produced them, but a credential
+              no longer sits one Up-arrow away in a fresh session for whoever is next
+              at the terminal.
+
+            - **A misconfigured `CC_TLS_CA` is an error, not a downgrade.** An
+              unreadable CA path used to log a warning and fall back to the system
+              trust store, silently replacing the private CA the operator pinned with
+              "any publicly trusted certificate for this name".
+
+            ## ✨ Previously in v1.2.0
 
             Reporting fidelity and held-button safety:
 
@@ -749,7 +836,7 @@ jobs:
             > `mouse_x`/`mouse_y`. An uncaptured position is carried as `(0, 0)`,
             > which is itself a valid screen coordinate.
 
-            ## ✨ Also new in v1.2.0
+            ### Also in v1.2.0
 
             Prepared as v1.1.1 and folded into this release, so v1.2.0 is the first
             build containing it — actuation and recording fidelity:
@@ -790,7 +877,7 @@ jobs:
 
             > ⚠️ Server, agent and CLI must be deployed together, as in v1.1.0.
 
-            ## ✨ Installer and self-update
+            ### Installer and self-update (v1.2.0)
 
             - **Fixed** — `control-center update` could never replace its own binary on
               Linux or macOS. It copied over the target in place, which the kernel

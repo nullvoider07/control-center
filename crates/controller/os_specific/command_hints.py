@@ -91,6 +91,17 @@ def suggest(command: str, mouse_actions: set, keyboard_actions: set) -> Optional
     return None
 
 
+def carries_free_text(command: str) -> bool:
+    """True when the command's argument is operator free text, so it may be a secret.
+
+    `redact` renders such a command for display; this answers the prior question of
+    whether it should be retained at all. The two share `_TYPE_VERB` so a new
+    free-text verb cannot be added to one and forgotten in the other.
+    """
+    stripped = command.strip()
+    return stripped.startswith(_TYPE_VERB) and bool(stripped[len(_TYPE_VERB):].lstrip())
+
+
 def redact(command: str) -> str:
     """Display form of a command, with typed text replaced by a character count.
 

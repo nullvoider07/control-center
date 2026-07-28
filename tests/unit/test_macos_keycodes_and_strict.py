@@ -68,10 +68,11 @@ def test_shift_is_not_duplicated_when_already_present():
 @pytest.mark.parametrize("keys,expected", [
     ("#q", ["cliclick", "kd:cmd", "t:q", "ku:cmd"]),
     ("#+g", ["cliclick", "kd:cmd,shift", "t:g", "ku:cmd,shift"]),
-    ("#{Space}", ["cliclick", "kd:cmd", "kp:space", "ku:cmd"]),
+    ("{Space}", ["cliclick", "kp:space"]),
     ("{F5}", ["cliclick", "kp:f5"]),
     ("#", ["cliclick", "kd:cmd", "w:50", "ku:cmd"]),
     ("4", ["cliclick", "t:4"]),          # unmodified: no hotkey to match
+    ("#{Mute}", ["cliclick", "kd:cmd", "kp:mute", "ku:cmd"]),  # no virtual keycode
 ])
 def test_working_press_paths_are_unchanged(keys, expected):
     argv, _ = macos().parse_keyboard_command(f"press {keys}")
@@ -81,6 +82,34 @@ def test_working_press_paths_are_unchanged(keys, expected):
 def test_navigation_keys_still_use_their_own_key_codes():
     assert script("press ^+{Left}") == \
         PREFIX + "key code 123 using {control down, shift down}"
+
+
+# ---- Item 3: a modified named key must carry its own modifiers -------------
+# "kd:cmd kp:space ku:cmd" posts three independent events; the key event carries
+# no flags of its own and relies on the system having already applied the modifier
+# keydown. ⌘Space opened Spotlight only sometimes, and when it did not the whole
+# following step sequence landed in whatever was frontmost — Finder type-selected
+# a folder and silently changed state.
+@pytest.mark.parametrize("keys,expected", [
+    ("#{Space}", "key code 49 using {command down}"),          # Spotlight
+    ("^{Space}", "key code 49 using {control down}"),          # input source
+    ("!#{Space}", "key code 49 using {option down, command down}"),
+    ("#{Esc}", "key code 53 using {command down}"),
+    ("^{F2}", "key code 120 using {control down}"),            # focus menu bar
+    ("#{F5}", "key code 96 using {command down}"),
+    ("#{F16}", "key code 106 using {command down}"),
+    ("#space", "key code 49 using {command down}"),            # bare-word form
+    ("#Space", "key code 49 using {command down}"),
+])
+def test_modified_named_keys_use_key_codes(keys, expected):
+    assert script(f"press {keys}") == PREFIX + expected
+
+
+def test_modifier_order_follows_the_command():
+    """The "using" clause is built from the modifiers as parsed, so a two-modifier
+    hotkey names both and nothing else."""
+    body = script("press ^!{Space}")
+    assert body == PREFIX + "key code 49 using {control down, option down}"
 
 
 # ---- Task 4: {code:N} passthrough -----------------------------------------
@@ -107,28 +136,49 @@ def drag(command: str):
 
 def test_plain_drag_is_unchanged():
     assert drag("100 100 drag 900 700") == [
-        "cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700",
+        "cliclick", "dd:100,100", "w:50", "dm:900,700", "w:50", "du:900,700",
     ]
 
 
 def test_drag_dwell_override():
     assert drag("100 100 drag 900 700 dwell 150") == [
-        "cliclick", "dd:100,100", "w:150", "m:900,700", "w:150", "du:900,700",
+        "cliclick", "dd:100,100", "w:150", "dm:900,700", "w:150", "du:900,700",
     ]
 
 
 def test_drag_waypoints():
     assert drag("100 100 drag via 400 300 via 700 500 to 900 700") == [
-        "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
-        "m:700,500", "w:50", "m:900,700", "w:50", "du:900,700",
+        "cliclick", "dd:100,100", "w:50", "dm:400,300", "w:50",
+        "dm:700,500", "w:50", "dm:900,700", "w:50", "du:900,700",
     ]
 
 
 def test_drag_waypoints_with_dwell():
     assert drag("100 100 drag via 400 300 to 900 700 dwell 200") == [
-        "cliclick", "dd:100,100", "w:200", "m:400,300", "w:200",
-        "m:900,700", "w:200", "du:900,700",
+        "cliclick", "dd:100,100", "w:200", "dm:400,300", "w:200",
+        "dm:900,700", "w:200", "du:900,700",
     ]
+
+
+# ---- Item 1: the moves between the press and the release must be drags -----
+@pytest.mark.parametrize("command", [
+    "100 100 drag 900 700",
+    "100 100 drag 900 700 dwell 300",
+    "100 100 drag via 400 300 via 700 500 to 900 700",
+    "100 100 drag via 400 300 to 900 700 dwell 200",
+])
+def test_drag_moves_continue_the_drag(command):
+    """cliclick's m: posts mouseMoved and dm: posts leftMouseDragged. Anything that
+    tracks a drag listens for the latter, so a run built from m: is seen as a press,
+    unrelated pointer motion and a release: the ⇧⌘4 overlay drew no selection and
+    wrote no file while the command reported success."""
+    argv = drag(command)
+    assert argv is not None, f"{command!r} failed to build"
+
+    moves = argv[argv.index("dd:100,100") + 1:argv.index("du:900,700")]
+    assert any(t.startswith("dm:") for t in moves), argv
+    assert not any(t.startswith("m:") for t in moves), \
+        f"a plain move between the press and the release is not a drag: {argv}"
 
 
 @pytest.mark.parametrize("command", [
@@ -146,6 +196,64 @@ def test_malformed_drag_is_rejected(command):
 def test_drag_waypoint_limit():
     via = " ".join("via 10 10" for _ in range(17))
     assert drag(f"100 100 drag {via} to 900 700") is None
+
+
+# ---- Item 2: the echo must name the destination the drag actually reached --
+class _StubClient:
+    """Accepts any argv and reports the drag as having landed at `position`."""
+
+    def __init__(self, position=(850, 650)):
+        self.position = position
+        self.sent = []
+
+    def execute_command(self, argv, human_command):
+        self.sent.append((argv, human_command))
+        return {
+            'success': True,
+            'message': 'ok',
+            'execution_time_ms': 2270,
+            'mouse_x': self.position[0],
+            'mouse_y': self.position[1],
+            'position_captured': True,
+            'metadata': {},
+        }
+
+
+def echo(command: str, capsys) -> str:
+    ma = macos()
+    ma.grpc_client = _StubClient()
+    assert ma.execute_command(command) is True, f"{command!r} was not executed"
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("150 150 drag 850 650", "to X=850, Y=650"),
+    ("150 150 drag 850 650 dwell 300", "to X=850, Y=650"),
+    ("150 150 drag via 400 350 to 850 650", "to X=850, Y=650"),
+    ("150 150 drag via 400 350 via 650 500 to 850 650 dwell 300", "to X=850, Y=650"),
+])
+def test_drag_echo_names_the_real_destination(command, expected, capsys):
+    """The echo used to read the destination from the two tokens after "drag", which
+    is the literal "via" in the waypoint form: a drag that ran to (850, 650) reported
+    "dragged from X=150, Y=150 to X=via, Y=400". The action landed and the report
+    lied — the failure class the position work exists to close."""
+    out = echo(command, capsys)
+    assert "dragged from X=150, Y=150" in out, out
+    assert expected in out, out
+    assert "X=via" not in out, out
+
+
+def test_drag_echo_agrees_with_the_argv_it_sent(capsys):
+    """One parser feeds both, so the reported endpoint and the released point are the
+    same value rather than two readings of the same tokens."""
+    ma = macos()
+    ma.grpc_client = _StubClient()
+    ma.execute_command("150 150 drag via 400 350 via 650 500 to 850 650 dwell 300")
+    argv, _ = ma.grpc_client.sent[0]
+    out = capsys.readouterr().out
+
+    assert argv[-1] == "du:850,650", argv
+    assert "to X=850, Y=650" in out, out
 
 
 def test_drag_stays_one_recorded_step():

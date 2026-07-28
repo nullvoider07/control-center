@@ -77,7 +77,7 @@ pub struct ButtonTransition {
 fn cliclick_token_pos(token: &str) -> Option<ExpectedPos> {
     let (prefix, value) = token.split_once(':')?;
     // `p:` queries the position rather than moving to it, so it predicts nothing.
-    if !matches!(prefix, "c" | "rc" | "dc" | "tc" | "mc" | "dd" | "du" | "m") {
+    if !matches!(prefix, "c" | "rc" | "dc" | "tc" | "mc" | "dd" | "du" | "m" | "dm") {
         return None;
     }
     let (x, y) = value.split_once(',')?;
@@ -198,9 +198,29 @@ const MAX_SCROLL_AMOUNT: u32 = 1000;
 /// serves one command at a time, so an unbounded value would stall all actuation.
 const MAX_DELAY_MS: u64 = 60_000;
 
-fn is_bounded_delay(s: &str) -> bool {
-    matches!(s.parse::<u64>(), Ok(n) if n <= MAX_DELAY_MS)
-}
+/// Upper bound (ms) on the summed waits in one command.
+///
+/// [`MAX_DELAY_MS`] bounds each wait individually, which reads like a bound on the
+/// command but is not one: nothing stopped a caller chaining hundreds of them, and
+/// 500 `w:60000` tokens validated to more than eight hours of stall. The longest
+/// legitimate form is a 16-waypoint drag at the maximum 5000 ms dwell, which is 18
+/// waits totalling 90 s, so this leaves headroom over that and nothing else.
+const MAX_TOTAL_DELAY_MS: u64 = 120_000;
+
+/// Upper bound (ms) on `xdotool type --delay`. This is a *per-keystroke* delay
+/// multiplied by the payload length, so the general per-value bound is far too
+/// loose for it. The actuation layer never emits the flag at all.
+const MAX_TYPE_DELAY_MS: u64 = 1_000;
+
+/// Upper bound on a repeat count, matching [`MAX_SCROLL_AMOUNT`] on the macOS path.
+/// `xdotool click --repeat <n>` had no bound at all, so `here scroll_down 999999999`
+/// — a plausible typo — wedged the agent and flooded the display with clicks, while
+/// the same action on macOS was refused above 1000.
+const MAX_REPEAT: u64 = 1_000;
+
+/// Upper bound on the number of arguments in one command. The longest form the
+/// actuation layer emits is a 16-waypoint drag at 37 cliclick tokens.
+const MAX_ARGS: usize = 64;
 
 /// Validate an argv vector against the actuation grammar.
 pub fn validate(argv: &[String]) -> Result<Plan, String> {
@@ -209,6 +229,13 @@ pub fn validate(argv: &[String]) -> Result<Plan, String> {
         return Err("Empty command".to_string());
     }
     let args = &argv[1..];
+    if args.len() > MAX_ARGS {
+        return Err(format!(
+            "Command has {} arguments, more than the {} permitted",
+            args.len(),
+            MAX_ARGS
+        ));
+    }
 
     match bin {
         "__write__" => validate_write(args),
@@ -298,8 +325,12 @@ fn validate_xdotool(args: &[String]) -> Result<Vec<String>, String> {
                     }
                     "--delay" => {
                         let n = rest.get(i + 1).ok_or("xdotool type: --delay needs a value")?;
-                        if !is_bounded_delay(n) {
-                            return Err(format!("xdotool type: invalid --delay '{}'", n));
+                        // Per keystroke, so it multiplies by the payload length.
+                        if !matches!(n.parse::<u64>(), Ok(v) if v <= MAX_TYPE_DELAY_MS) {
+                            return Err(format!(
+                                "xdotool type: --delay '{}' out of range 0..{}",
+                                n, MAX_TYPE_DELAY_MS
+                            ));
                         }
                         out.push(rest[i].clone());
                         out.push(n.clone());
@@ -331,20 +362,31 @@ fn validate_xdotool(args: &[String]) -> Result<Vec<String>, String> {
             Ok(args.to_vec())
         }
         // Pointer actions, optionally chained (e.g. "mousemove X Y click 1").
+        //
+        // `--repeat` is read with its value rather than as a bare token: digits appear
+        // here as coordinates, button numbers and repeat counts, and only the repeat
+        // count multiplies into an unbounded amount of actuation.
         "getmouselocation" | "click" | "mousemove" | "mousedown" | "mouseup" => {
-            for t in rest {
-                let ok = matches!(
-                    t.as_str(),
-                    "--shell"
-                        | "--repeat"
-                        | "--clearmodifiers"
-                        | "click"
-                        | "mousemove"
-                        | "mousedown"
-                        | "mouseup"
-                ) || is_digits(t);
-                if !ok {
-                    return Err(format!("xdotool {}: unexpected token '{}'", sub, t));
+            let mut i = 0;
+            while i < rest.len() {
+                let t = rest[i].as_str();
+                match t {
+                    "--repeat" => {
+                        let n = rest
+                            .get(i + 1)
+                            .ok_or_else(|| format!("xdotool {}: --repeat needs a value", sub))?;
+                        if !matches!(n.parse::<u64>(), Ok(v) if (1..=MAX_REPEAT).contains(&v)) {
+                            return Err(format!(
+                                "xdotool {}: --repeat '{}' out of range 1..{}",
+                                sub, n, MAX_REPEAT
+                            ));
+                        }
+                        i += 2;
+                    }
+                    "--shell" | "--clearmodifiers" | "click" | "mousemove" | "mousedown"
+                    | "mouseup" => i += 1,
+                    _ if is_digits(t) => i += 1,
+                    _ => return Err(format!("xdotool {}: unexpected token '{}'", sub, t)),
                 }
             }
             Ok(args.to_vec())
@@ -359,17 +401,27 @@ fn validate_cliclick(args: &[String]) -> Result<Vec<String>, String> {
     if args.is_empty() {
         return Err("cliclick: expected at least one action".to_string());
     }
+    let mut total_delay: u64 = 0;
     for t in args {
         let (prefix, value) = t
             .split_once(':')
             .ok_or_else(|| format!("cliclick: invalid action token '{}'", t))?;
         let ok = match prefix {
             // Pointer actions: "." (current position) or explicit coordinates.
-            "p" | "c" | "rc" | "dc" | "tc" | "mc" | "dd" | "du" | "m" => {
+            // `dm` is the drag-continuation move: it posts leftMouseDragged where `m`
+            // posts mouseMoved, so a drag built from `m` is not seen as a drag at all.
+            "p" | "c" | "rc" | "dc" | "tc" | "mc" | "dd" | "du" | "m" | "dm" => {
                 is_cliclick_point(prefix, t)
             }
-            // Wait, in milliseconds.
-            "w" => is_bounded_delay(value),
+            // Wait, in milliseconds. Accumulated so the per-token bound cannot be
+            // sidestepped by chaining waits.
+            "w" => match value.parse::<u64>() {
+                Ok(n) if n <= MAX_DELAY_MS => {
+                    total_delay = total_delay.saturating_add(n);
+                    true
+                }
+                _ => false,
+            },
             // Key down / up / press: key names, optionally comma-separated.
             "kd" | "ku" | "kp" => {
                 !value.is_empty()
@@ -384,6 +436,12 @@ fn validate_cliclick(args: &[String]) -> Result<Vec<String>, String> {
         if !ok {
             return Err(format!("cliclick: invalid action token '{}'", t));
         }
+    }
+    if total_delay > MAX_TOTAL_DELAY_MS {
+        return Err(format!(
+            "cliclick: waits total {}ms, more than the {}ms permitted for one command",
+            total_delay, MAX_TOTAL_DELAY_MS
+        ));
     }
     Ok(args.to_vec())
 }
@@ -544,16 +602,18 @@ mod tests {
         // The last positional token wins, so the readback is checked against where
         // the drag ended rather than where it started.
         assert_eq!(
-            pos_of(&["cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700"]),
+            pos_of(&["cliclick", "dd:100,100", "w:50", "dm:900,700", "w:50", "du:900,700"]),
             Some(ExpectedPos { x: 900, y: 700 })
         );
         assert_eq!(
             pos_of(&[
-                "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
-                "m:700,500", "w:50", "m:900,700", "w:50", "du:900,700",
+                "cliclick", "dd:100,100", "w:50", "dm:400,300", "w:50",
+                "dm:700,500", "w:50", "dm:900,700", "w:50", "du:900,700",
             ]),
             Some(ExpectedPos { x: 900, y: 700 })
         );
+        // A drag-continuation move names a position like any other pointer token.
+        assert_eq!(pos_of(&["cliclick", "dm:12,34"]), Some(ExpectedPos { x: 12, y: 34 }));
     }
 
     #[test]
@@ -616,10 +676,10 @@ mod tests {
         // would record a hold that never existed, and the agent would then issue an
         // uncommanded release at shutdown for a button already up.
         for drag in [
-            vec!["cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700"],
+            vec!["cliclick", "dd:100,100", "w:50", "dm:900,700", "w:50", "du:900,700"],
             vec![
-                "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
-                "m:900,700", "w:50", "du:900,700",
+                "cliclick", "dd:100,100", "w:50", "dm:400,300", "w:50",
+                "dm:900,700", "w:50", "du:900,700",
             ],
             vec!["xdotool", "mousemove", "1", "1", "mousedown", "1",
                  "mousemove", "9", "9", "mouseup", "1"],
@@ -785,6 +845,7 @@ mod tests {
             argv(&["cliclick", "mc:."]),
             argv(&["cliclick", "dd:."]),
             argv(&["cliclick", "du:."]),
+            argv(&["cliclick", "dm:900,700"]),
             argv(&["cliclick", "c:.", "w:50"]),
             argv(&["cliclick", "kp:return"]),
             argv(&["cliclick", "kd:cmd", "kp:a", "ku:cmd"]),
@@ -806,11 +867,79 @@ mod tests {
     }
 
     #[test]
+    fn waits_are_bounded_in_aggregate_not_only_per_token() {
+        // The per-token bound reads like a bound on the command but is not one: each
+        // of these tokens is individually legal and the run stalls the agent, which
+        // serves one command at a time, for as long as the caller cares to make it.
+        let mut chained = vec!["cliclick".to_string()];
+        for _ in 0..40 {
+            chained.push("w:60000".to_string());
+        }
+        assert!(
+            validate(&chained).is_err(),
+            "40 legal waits chained to 40 minutes must be refused"
+        );
+
+        // Three maximal waits (180 s) is over the limit; two (120 s) is not.
+        assert!(validate(&argv(&["cliclick", "w:60000", "w:60000", "w:60000"])).is_err());
+        assert!(validate(&argv(&["cliclick", "w:60000", "w:60000"])).is_ok());
+    }
+
+    #[test]
+    fn the_longest_legitimate_drag_still_validates() {
+        // 16 waypoints at the maximum 5000 ms dwell: 18 waits totalling 90 s and 37
+        // tokens. The aggregate and argument-count bounds must clear this, or the
+        // documented drag grammar would be refused by the agent that serves it.
+        let mut drag = vec!["cliclick".to_string(), "dd:0,0".to_string(), "w:5000".to_string()];
+        for i in 0..17 {
+            drag.push(format!("dm:{},{}", i * 10, i * 10));
+            drag.push("w:5000".to_string());
+        }
+        drag.push("du:160,160".to_string());
+        assert_eq!(drag.len() - 1, 37, "argument count drifted from the documented worst case");
+        assert!(validate(&drag).is_ok(), "the maximal documented drag was refused");
+    }
+
+    #[test]
+    fn repeat_counts_are_bounded() {
+        // `here scroll_down 999999999` is a plausible typo. Unbounded, it wedged the
+        // agent and flooded the display, while the same action on the macOS path was
+        // refused above MAX_SCROLL_AMOUNT — the asymmetry this closes.
+        assert!(validate(&argv(&["xdotool", "click", "--repeat", "5", "4"])).is_ok());
+        assert!(validate(&argv(&["xdotool", "click", "--repeat", "1000", "4"])).is_ok());
+        assert!(validate(&argv(&["xdotool", "click", "--repeat", "1001", "4"])).is_err());
+        assert!(validate(&argv(&["xdotool", "click", "--repeat", "999999999", "4"])).is_err());
+        // Wider than u64, so a parse must reject rather than wrap or truncate.
+        assert!(validate(&argv(&["xdotool", "click", "--repeat", "18446744073709551616", "4"])).is_err());
+        assert!(validate(&argv(&["xdotool", "click", "--repeat", "0", "4"])).is_err());
+        assert!(validate(&argv(&["xdotool", "click", "--repeat", "abc", "4"])).is_err());
+        assert!(validate(&argv(&["xdotool", "click", "--repeat"])).is_err());
+        // The count still reads correctly when the repeat is chained after a move.
+        assert!(validate(&argv(&["xdotool", "mousemove", "10", "20", "click", "--repeat", "2", "1"])).is_ok());
+        assert!(validate(&argv(&["xdotool", "mousemove", "10", "20", "click", "--repeat", "5000", "1"])).is_err());
+    }
+
+    #[test]
+    fn the_argument_count_is_bounded() {
+        let mut many = vec!["cliclick".to_string()];
+        for _ in 0..100 {
+            many.push("c:1,1".to_string());
+        }
+        assert!(validate(&many).is_err(), "100 pointer actions in one command");
+        // The bound is on the argument list, not on a payload's length: typed text is
+        // one element however long it is.
+        let long_text = "a".repeat(100_000);
+        assert!(validate(&argv(&["xdotool", "type", &long_text])).is_ok());
+    }
+
+    #[test]
     fn cliclick_rejects_malformed_tokens() {
         for case in [
             argv(&["cliclick", "c:abc"]),
             argv(&["cliclick", "nope"]),
             argv(&["cliclick", "x:1,2"]),
+            argv(&["cliclick", "dm:abc"]),
+            argv(&["cliclick", "dm:900"]),
             argv(&["cliclick", "w:soon"]),
             argv(&["cliclick"]),
         ] {
@@ -859,17 +988,25 @@ mod tests {
     #[test]
     fn drag_token_sequences_are_accepted() {
         // The dwell/waypoint drag forms expand to a longer cliclick token run than
-        // the original fixed `dd w m w du`. The grammar has to accept the whole run.
+        // the original fixed `dd w dm w du`. The grammar has to accept the whole run.
+        //
+        // `dm` in particular: the controller emits it for every move inside a drag,
+        // because cliclick's `m` posts mouseMoved and nothing tracking a drag reacts
+        // to that. Omitting it here fails the drag closed at the agent — "cliclick:
+        // invalid action token 'dm:400,350'" — which is how the two halves of this
+        // fix are coupled.
         for case in [
             // 100 100 drag 900 700
-            argv(&["cliclick", "dd:100,100", "w:50", "m:900,700", "w:50", "du:900,700"]),
+            argv(&["cliclick", "dd:100,100", "w:50", "dm:900,700", "w:50", "du:900,700"]),
             // 100 100 drag 900 700 dwell 150
-            argv(&["cliclick", "dd:100,100", "w:150", "m:900,700", "w:150", "du:900,700"]),
+            argv(&["cliclick", "dd:100,100", "w:150", "dm:900,700", "w:150", "du:900,700"]),
             // 100 100 drag via 400 300 via 700 500 to 900 700
             argv(&[
-                "cliclick", "dd:100,100", "w:50", "m:400,300", "w:50",
-                "m:700,500", "w:50", "m:900,700", "w:50", "du:900,700",
+                "cliclick", "dd:100,100", "w:50", "dm:400,300", "w:50",
+                "dm:700,500", "w:50", "dm:900,700", "w:50", "du:900,700",
             ]),
+            // Negative coordinates: a second display left of or above the primary.
+            argv(&["cliclick", "dd:-10,-20", "w:50", "dm:-400,-300", "w:50", "du:-400,-300"]),
         ] {
             assert!(validate(&case).is_ok(), "should accept {:?}", case);
         }

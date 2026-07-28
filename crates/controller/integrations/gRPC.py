@@ -100,7 +100,15 @@ class GRPCClient:
                     with open(ca_path, 'rb') as f:
                         root_certs = f.read()
                 except OSError as e:
-                    logger.warning(f"Could not read CC_TLS_CA '{ca_path}': {e}")
+                    # Falling back to the system roots here would silently swap the
+                    # trust anchor the operator asked for: a mistyped path would turn
+                    # a pinned private CA into "any publicly trusted cert for this
+                    # name". Setting CC_TLS_CA is a request to pin, so an unreadable
+                    # one is a configuration error, not a degradation.
+                    raise ConnectionError(
+                        f"CC_TLS_CA is set to '{ca_path}' but it could not be read: {e}. "
+                        f"Fix the path or unset CC_TLS_CA to use the system trust store."
+                    )
             # When connecting by IP but the cert has a DNS SAN, allow overriding the
             # name the client verifies against.
             server_name = os.environ.get('CC_TLS_SERVER_NAME')

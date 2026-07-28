@@ -13,6 +13,7 @@ wrong thing:
   the handler rendered the resulting 403 as "check your internet connection", which
   sends the operator to debug a working network.
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -283,3 +284,112 @@ def test_tar_extraction_specifies_a_filter():
     source = Path(cli.__file__).read_text()
     assert "filter='data'" in source, \
         "tarfile.extractall must pass an explicit filter"
+
+
+# ---------------------------------------------------------------------------
+# Release asset integrity
+# ---------------------------------------------------------------------------
+# TLS to GitHub was the only integrity control on the update path, and v1.2.0 made
+# that worse rather than better: the staged swap succeeds against a running binary,
+# so a bad asset went from "fails noisily with ETXTBSY" to "installs silently".
+
+def _release(assets):
+    return {"tag_name": "v9.9.9",
+            "assets": [{"name": n, "browser_download_url": f"https://example.invalid/{n}"}
+                       for n in assets]}
+
+
+def _serve(body: str, monkeypatch):
+    class _Response:
+        status_code = 200
+        text = body
+        headers = {}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class _Requests:
+        @staticmethod
+        def get(url, headers=None, timeout=None):
+            return _Response()
+
+    monkeypatch.setitem(sys.modules, "requests", _Requests)
+
+
+def test_a_release_without_checksums_is_refused():
+    """Fail closed. Installing when the digests are absent means anyone who can strip
+    one asset from the response also strips the only integrity control there is."""
+    with pytest.raises(cli.IntegrityError) as excinfo:
+        cli._fetch_checksums(_release(["control-center-9.9.9-linux-x64.tar.gz"]))
+    assert "SHA256SUMS" in str(excinfo.value)
+
+
+def test_checksums_are_parsed_from_the_sha256sum_format(monkeypatch):
+    _serve(
+        "a" * 64 + "  control-center-9.9.9-linux-x64.tar.gz\n"
+        + "b" * 64 + " *control-center-9.9.9-windows-x64.zip\n",
+        monkeypatch)
+
+    sums = cli._fetch_checksums(_release(["SHA256SUMS", "control-center-9.9.9-linux-x64.tar.gz"]))
+    assert sums["control-center-9.9.9-linux-x64.tar.gz"] == "a" * 64
+    # sha256sum's binary-mode marker is part of the name field, not the name.
+    assert sums["control-center-9.9.9-windows-x64.zip"] == "b" * 64
+
+
+def test_an_empty_checksum_file_is_refused(monkeypatch):
+    _serve("\n# nothing usable here\n", monkeypatch)
+    with pytest.raises(cli.IntegrityError):
+        cli._fetch_checksums(_release(["SHA256SUMS"]))
+
+
+def test_a_matching_asset_verifies(tmp_path):
+    payload = tmp_path / "control-center-9.9.9-linux-x64.tar.gz"
+    payload.write_bytes(b"release bytes")
+    digest = hashlib.sha256(b"release bytes").hexdigest()
+
+    cli._verify_asset(str(payload), payload.name, {payload.name: digest})
+
+
+def test_a_tampered_asset_is_refused(tmp_path):
+    """The regression this exists for: a payload that is not what the release
+    published must never reach the extractor, let alone the staged swap."""
+    payload = tmp_path / "control-center-9.9.9-linux-x64.tar.gz"
+    payload.write_bytes(b"malicious bytes")
+    published = hashlib.sha256(b"release bytes").hexdigest()
+
+    with pytest.raises(cli.IntegrityError) as excinfo:
+        cli._verify_asset(str(payload), payload.name, {payload.name: published})
+    assert published in str(excinfo.value), "the operator is not shown what was expected"
+
+
+def test_an_asset_missing_from_the_checksum_file_is_refused(tmp_path):
+    payload = tmp_path / "control-center-9.9.9-linux-arm64.tar.gz"
+    payload.write_bytes(b"x")
+    with pytest.raises(cli.IntegrityError):
+        cli._verify_asset(str(payload), payload.name,
+                          {"control-center-9.9.9-linux-x64.tar.gz": "0" * 64})
+
+
+def test_verification_runs_before_extraction():
+    """Ordering is the property: verifying after extraction would already have handed
+    a tampered archive to the tar reader."""
+    source = Path(cli.__file__).read_text()
+    verify = source.index("_verify_asset(temp_file")
+    extract = source.index("Extracting archive...")
+    assert verify < extract, "the checksum is verified after the archive is extracted"
+
+
+def test_the_release_workflow_publishes_checksums():
+    workflow = (Path(cli.__file__).resolve().parents[3] / ".github/workflows/release.yml")
+    body = workflow.read_text()
+    assert "sha256sum control-center-*.tar.gz control-center-*.zip > SHA256SUMS" in body, \
+        "the release job must generate SHA256SUMS covering every published asset"
+
+
+@pytest.mark.parametrize("script", ["install/install.sh", "install/install.ps1"])
+def test_the_install_scripts_verify_what_they_download(script):
+    """The first-install path unpacks a release and puts it on PATH; it has the same
+    exposure as the updater and needs the same check."""
+    body = (Path(cli.__file__).resolve().parents[3] / script).read_text()
+    assert "SHA256SUMS" in body, f"{script} does not fetch the published digests"

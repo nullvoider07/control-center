@@ -104,6 +104,40 @@ class MacOSActuation:
         '~': (50, True),
     }
 
+    # Named key (the normalized cliclick kp: name) → US-ANSI virtual keycode.
+    #
+    # cliclick reaches these with `kd:<mod> kp:<key> ku:<mod>`, which posts three
+    # independent events and leaves the key event carrying no modifier flags of its
+    # own — it relies on the system having already applied the modifier keydown.
+    # A system hotkey matches on the flags the key event carries, so the two can
+    # disagree and the shortcut fires only sometimes: "press #{Space}" opened
+    # Spotlight intermittently and otherwise leaked the keystroke, and the rest of
+    # the step sequence, into whatever was frontmost. "key code N using {…}" carries
+    # the modifiers on the event itself, so there is no window for them to disagree.
+    #
+    # Media keys are absent deliberately: they are NX_KEYTYPE system-defined events
+    # with no virtual keycode, and cliclick's kp: is the only way to reach them.
+    #
+    # Values are the Carbon HIToolbox Events.h kVK_* constants.
+    KEY_KEYCODE_MAP = {
+        'return': 36, 'tab': 48, 'space': 49, 'delete': 51, 'esc': 53,
+        'home': 115, 'page-up': 116, 'fwd-delete': 117, 'end': 119,
+        'page-down': 121,
+        'arrow-left': 123, 'arrow-right': 124, 'arrow-down': 125, 'arrow-up': 126,
+        'f1': 122, 'f2': 120, 'f3': 99, 'f4': 118, 'f5': 96, 'f6': 97,
+        'f7': 98, 'f8': 100, 'f9': 101, 'f10': 109, 'f11': 103, 'f12': 111,
+        'f13': 105, 'f14': 107, 'f15': 113, 'f16': 106,
+    }
+
+    # Named keys routed through a keycode whether or not a modifier is present. These
+    # predate KEY_KEYCODE_MAP and already worked; the rest of the map is consulted
+    # only when there are modifiers, so no working unmodified path is relocated.
+    ALWAYS_KEYCODE_KEYS = frozenset({
+        'return', 'tab', 'delete', 'fwd-delete',
+        'page-up', 'page-down', 'home', 'end',
+        'arrow-left', 'arrow-right', 'arrow-down', 'arrow-up',
+    })
+
     # cliclick modifier name → AppleScript "using" clause element.
     OSA_MODIFIERS = {
         'cmd': 'command down', 'alt': 'option down',
@@ -369,19 +403,21 @@ class MacOSActuation:
         click = f"c:{x},{y}" if x is not None and y is not None else "c:."
         return ['__scroll__', click, str(key_code), str(amount)]
     
-    # Helper method to build the cliclick token sequence for a drag
-    def _build_drag_spec(self, x: int, y: int, rest: List[str]) -> str:
-        """Build the drag token sequence from the tokens following "drag".
+    # Helper method to parse the tokens following "drag"
+    def _parse_drag(self, rest: List[str]) -> Tuple[List[Tuple[int, int]], Tuple[int, int], int]:
+        """Parse the tokens after "drag" into (waypoints, destination, dwell_ms).
 
         Accepted forms (dwell is optional on both):
             <x2> <y2> [dwell <ms>]
             via <ax> <ay> [via …] to <x2> <y2> [dwell <ms>]
 
-        The single hardcoded 50 ms dwell and single intermediate point are enough for
-        a selection drag but not for drag-and-drop or overlay UIs, which need slower
-        movement or a real path. Raises ValueError with an operator-readable message
-        rather than degrading silently — a drag that lands wrong still records as a
-        successful step.
+        Raises ValueError with an operator-readable message rather than degrading
+        silently — a drag that lands wrong still records as a successful step.
+
+        Both the argv builder and the console echo read the destination from here.
+        The echo used to take it from the two tokens after "drag", which is the
+        destination in the plain form and the literal "via" in the waypoint form, so
+        it reported "X=via, Y=400" for a drag that ended at (850, 650).
         """
         tokens = list(rest)
 
@@ -398,13 +434,13 @@ class MacOSActuation:
                 )
             tokens = tokens[:-2]
 
-        def point(pair: List[str]) -> str:
+        def point(pair: List[str]) -> Tuple[int, int]:
             try:
-                return f"{int(pair[0])},{int(pair[1])}"
+                return (int(pair[0]), int(pair[1]))
             except (ValueError, IndexError):
                 raise ValueError(f"drag needs a pair of integer coordinates, got {pair!r}")
 
-        waypoints: List[str] = []
+        waypoints: List[Tuple[int, int]] = []
         if tokens and tokens[0] == 'via':
             while tokens and tokens[0] == 'via':
                 waypoints.append(point(tokens[1:3]))
@@ -422,13 +458,34 @@ class MacOSActuation:
         if len(tokens) > 2:
             raise ValueError(f"unexpected tokens after drag destination: {tokens[2:]}")
 
+        return waypoints, destination, dwell
+
+    # Helper method to build the cliclick token sequence for a drag
+    def _build_drag_spec(self, x: int, y: int, rest: List[str]) -> str:
+        """Build the drag token sequence from the tokens following "drag"."""
+        waypoints, destination, dwell = self._parse_drag(rest)
+
         # Press, then step through each waypoint, then release at the destination.
         # A dwell after every move is what gives the target time to track the drag.
+        #
+        # The moves are dm:, not m:. cliclick's m: posts mouseMoved; only dm:
+        # continues the drag and posts leftMouseDragged, which is the event anything
+        # tracking a drag listens for. With m: the target saw a press, a run of
+        # unrelated pointer motion and a release: the ⇧⌘4 selection overlay drew no
+        # rectangle and wrote no file while the command reported success.
         parts = [f"dd:{x},{y}", f"w:{dwell}"]
-        for wp in waypoints + [destination]:
-            parts.extend([f"m:{wp}", f"w:{dwell}"])
-        parts.append(f"du:{destination}")
+        for wx, wy in waypoints + [destination]:
+            parts.extend([f"dm:{wx},{wy}", f"w:{dwell}"])
+        parts.append(f"du:{destination[0]},{destination[1]}")
         return ' '.join(parts)
+
+    # Helper method to name the endpoint a drag command asks for
+    def _drag_destination(self, rest: List[str]) -> Optional[Tuple[int, int]]:
+        """Where a drag ends, for the console echo, or None if the tokens do not parse."""
+        try:
+            return self._parse_drag(rest)[1]
+        except ValueError:
+            return None
 
     # Method to build mouse command based on parsed input
     def build_mouse_command(self, command: str) -> Optional[Tuple[List[str], str]]:
@@ -585,27 +642,14 @@ class MacOSActuation:
             if explicit_code is not None:
                 return self._key_code_argv(explicit_code, modifiers, command)
 
-            # Map for osascript key codes
-            osascript_map = {
-                'return': 36, 'tab': 48, 'delete': 51, 'fwd-delete': 117,
-                'page-up': 116, 'page-down': 121, 'home': 115, 'end': 119,
-                'arrow-left': 123, 'arrow-right': 124, 'arrow-down': 125, 'arrow-up': 126,
-            }
-
             # Normalize special key
             normalized_key = main_key
             if main_key in self.SPECIAL_KEYS:
                 normalized_key = self.SPECIAL_KEYS[main_key]
 
-            # Check against keys that need osascript
-            target_keys = [
-                'return', 'tab', 'delete', 'fwd-delete',
-                'page-up', 'page-down', 'home', 'end',
-                'arrow-left', 'arrow-right', 'arrow-down', 'arrow-up',
-            ]
-
-            if normalized_key in target_keys:
-                return self._key_code_argv(osascript_map[normalized_key], modifiers, command)
+            if normalized_key in self.ALWAYS_KEYCODE_KEYS:
+                return self._key_code_argv(
+                    self.KEY_KEYCODE_MAP[normalized_key], modifiers, command)
 
             # Modified digit or punctuation: must be a keycode event, not typed text,
             # or macOS hotkeys such as ⇧⌘4 never match. Unmodified single characters
@@ -616,6 +660,15 @@ class MacOSActuation:
                 if needs_shift and 'shift' not in mods:
                     mods.append('shift')
                 return self._key_code_argv(code, mods, command)
+
+            # Modified named key: the modifiers must ride on the key event rather than
+            # on a preceding kd:, or the hotkey matches only some of the time (⌘Space).
+            # Unmodified named keys keep cliclick's kp: — nothing to match against.
+            # Lowercased because the bare-word forms ("press #Space") reach here
+            # verbatim, where the brace forms arrive already normalized.
+            if modifiers and normalized_key.lower() in self.KEY_KEYCODE_MAP:
+                return self._key_code_argv(
+                    self.KEY_KEYCODE_MAP[normalized_key.lower()], modifiers, command)
 
             # Handle Special Keys (cliclick fallback)
             if main_key in self.SPECIAL_KEYS:
@@ -733,7 +786,13 @@ class MacOSActuation:
                 pos_str = f"X={position_after[0]}, Y={position_after[1]}" if position_after else "X=?, Y=?"
 
                 if action_tok == 'drag' and len(tokens) >= 5:
-                    print(f"Executed: {command}, dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
+                    # Read the endpoint from the parser that built the argv, so the
+                    # reported destination cannot disagree with the actuated one.
+                    dest = self._drag_destination(tokens[3:])
+                    if dest:
+                        print(f"Executed: {command}, dragged from X={tokens[0]}, Y={tokens[1]} to X={dest[0]}, Y={dest[1]}, time taken: {ms}ms")
+                    else:
+                        print(f"Executed: {command}, at {pos_str}, time taken: {ms}ms")
                 elif action_tok in ('left', 'click', 'right', 'double', 'triple', 'middle'):
                     click_label = 'double' if action_tok == 'double' else ('triple' if action_tok == 'triple' else action_tok)
                     print(f"Executed: {command}, clicked {click_label} at {pos_str}, time taken: {ms}ms")

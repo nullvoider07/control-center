@@ -170,7 +170,6 @@ function Get-Package {
         $ProgressPreference = 'Continue'
         
         Write-Success "Downloaded successfully"
-        return $TMP_FILE
     } catch {
         Write-ErrorMsg "Download failed."
         Write-Host ""
@@ -180,6 +179,62 @@ function Get-Package {
         Write-Host ""
         exit 1
     }
+
+    Test-PackageChecksum -File $TMP_FILE -Name $FILE_NAME
+    return $TMP_FILE
+}
+
+# Check the download against the digest the release publishes. TLS to GitHub is
+# otherwise the only integrity control on a payload this script unpacks and puts on
+# PATH. Missing or mismatched digests abort rather than warn.
+function Test-PackageChecksum {
+    param($File, $Name)
+
+    $sumsUrl = "https://github.com/$REPO/releases/download/$LATEST_TAG/SHA256SUMS"
+
+    Write-Info "Verifying checksum..."
+
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        $sums = (Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing).Content
+        $ProgressPreference = 'Continue'
+    } catch {
+        Remove-Item $File -Force -ErrorAction SilentlyContinue
+        Write-ErrorMsg "Release $LATEST_TAG publishes no SHA256SUMS; cannot verify the download."
+        Write-Host ""
+        Write-Host "  Releases before v1.2.1 predate checksum publishing. Install one by"
+        Write-Host "  downloading and checking it yourself:"
+        Write-Host "    https://github.com/$REPO/releases/tag/$LATEST_TAG"
+        Write-Host ""
+        exit 1
+    }
+
+    $expected = $null
+    foreach ($line in $sums -split "`n") {
+        $parts = $line.Trim() -split '\s+'
+        if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $Name) {
+            $expected = $parts[0].ToLower()
+            break
+        }
+    }
+
+    if (-not $expected) {
+        Remove-Item $File -Force -ErrorAction SilentlyContinue
+        Write-ErrorMsg "SHA256SUMS lists no digest for $Name"
+        exit 1
+    }
+
+    $actual = (Get-FileHash -Path $File -Algorithm SHA256).Hash.ToLower()
+
+    if ($actual -ne $expected) {
+        Remove-Item $File -Force -ErrorAction SilentlyContinue
+        Write-ErrorMsg "Checksum mismatch for $Name - refusing to install."
+        Write-Host "    expected $expected"
+        Write-Host "    got      $actual"
+        exit 1
+    }
+
+    Write-Success "Checksum verified"
 }
 
 # ============================================================================

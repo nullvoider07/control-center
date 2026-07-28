@@ -200,6 +200,61 @@ download_package() {
     fi
 
     print_success "Downloaded successfully"
+
+    verify_package
+}
+
+# Check the download against the digest the release publishes. TLS to GitHub is
+# otherwise the only integrity control on a payload this script unpacks and puts on
+# PATH. Missing or mismatched digests abort rather than warn: a release that cannot
+# be verified is not one to install unattended.
+verify_package() {
+    local sums_url="https://github.com/$REPO/releases/download/$LATEST_TAG/SHA256SUMS"
+    local sums_file="/tmp/control-center-sums-$$"
+
+    print_info "Verifying checksum..."
+
+    if ! curl -sSL -f -o "$sums_file" "$sums_url"; then
+        rm -f "$sums_file" "$TMP_FILE"
+        print_error "Release $LATEST_TAG publishes no SHA256SUMS; cannot verify the download."
+        echo ""
+        echo "  Releases before v1.2.1 predate checksum publishing. Install one by"
+        echo "  downloading and checking it yourself:"
+        echo "    https://github.com/$REPO/releases/tag/$LATEST_TAG"
+        echo ""
+        exit 1
+    fi
+
+    local expected
+    expected=$(awk -v name="$FILE_NAME" '$2 == name || $2 == "*" name {print $1; exit}' "$sums_file")
+    if [ -z "$expected" ]; then
+        rm -f "$sums_file" "$TMP_FILE"
+        print_error "SHA256SUMS lists no digest for $FILE_NAME"
+        exit 1
+    fi
+
+    local actual
+    if command -v sha256sum &> /dev/null; then
+        actual=$(sha256sum "$TMP_FILE" | awk '{print $1}')
+    elif command -v shasum &> /dev/null; then
+        actual=$(shasum -a 256 "$TMP_FILE" | awk '{print $1}')
+    else
+        rm -f "$sums_file" "$TMP_FILE"
+        print_error "Neither sha256sum nor shasum is available; cannot verify the download."
+        exit 1
+    fi
+
+    rm -f "$sums_file"
+
+    if [ "$actual" != "$expected" ]; then
+        rm -f "$TMP_FILE"
+        print_error "Checksum mismatch for $FILE_NAME — refusing to install."
+        echo "    expected $expected"
+        echo "    got      $actual"
+        exit 1
+    fi
+
+    print_success "Checksum verified"
 }
 
 extract_package() {

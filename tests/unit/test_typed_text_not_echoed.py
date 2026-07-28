@@ -119,6 +119,105 @@ def test_batch_does_not_write_its_results_unrestricted():
     )
 
 
+# ---- typed text must not outlive the sitting that produced it --------------
+@pytest.mark.parametrize("command,expected", [
+    (f"type {SECRET}", True),
+    ("type a", True),
+    (f"  type {SECRET}  ", True),
+    ("type", False),            # no payload
+    ("press #c", False),
+    ("960 540 left", False),
+    ("position", False),
+    ("100 100 drag 900 700", False),
+])
+def test_carries_free_text_identifies_only_the_typed_payload(command, expected):
+    assert command_hints.carries_free_text(command) is expected
+
+
+def test_cross_session_history_excludes_typed_text():
+    """The encrypted store is replayed into readline on the next `connect`, so a
+    credential typed once sits one Up-arrow away for whoever is next at the terminal.
+    Encryption at rest defends against another user on the box, not against that."""
+    source = inspect.getsource(cli._interactive_mode)
+    appends = [line.strip() for line in source.splitlines() if "_history.append(" in line]
+    assert appends, "the connect loop no longer records history"
+    guard = "carries_free_text"
+    assert guard in source, "history is recorded without excluding typed text"
+    # The guard has to be on the append itself, not merely present in the function.
+    tree = ast.parse(source.lstrip())
+    guarded = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and guard in ast.dump(node.test)
+        and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                and c.func.attr == "append" for c in ast.walk(node))
+    ]
+    assert guarded, f"_history.append is not guarded by {guard}"
+
+
+def test_metrics_record_redacted_commands():
+    """command_history feeds the session data file and `export commands`. Redacting
+    at the source keeps typed text out of all of them rather than at each write."""
+    tree = ast.parse(inspect.getsource(cli._interactive_mode).lstrip())
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "record_command"
+    ]
+    assert calls, "record_command is no longer called from the connect loop"
+    for call in calls:
+        first = call.args[0] if call.args else None
+        assert (isinstance(first, ast.Call) and isinstance(first.func, ast.Attribute)
+                and first.func.attr == "redact"), \
+            "record_command receives the raw command line, not a redacted one"
+
+
+def test_every_export_command_restricts_what_it_delegates():
+    """The sweep below only sees writes made in cli.py. Four export commands delegate
+    to Exporter methods that write through a bare open(), so the mode is the process
+    umask unless the caller restricts it — and none of them did."""
+    source = Path(inspect.getfile(cli)).read_text()
+    tree = ast.parse(source)
+    lines = source.splitlines()
+
+    offenders = []
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        body = "\n".join(lines[func.lineno - 1: (func.end_lineno or func.lineno)])
+        if "exporter.export_" not in body:
+            continue
+        if "_restrict_export" in body or "_restrict_perms" in body:
+            continue
+        offenders.append(func.name)
+
+    assert not offenders, (
+        "export command(s) delegating a write without restricting its mode: "
+        + ", ".join(offenders)
+    )
+
+
+def test_restrict_export_handles_both_return_shapes(tmp_path):
+    """export_command_log returns one path; diagnostics and report return a
+    {label: path} bundle. Passing a bundle to the single-path helper raises, which
+    the command's `except Exception` would turn into "Export failed"."""
+    single = tmp_path / "commands.csv"
+    single.write_text("x")
+    bundle = {}
+    for name in ("session.json", "metrics.json"):
+        target = tmp_path / name
+        target.write_text("x")
+        bundle[name.split('.')[0]] = str(target)
+
+    cli._restrict_export(str(single))
+    cli._restrict_export(bundle)
+
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(single).st_mode) == 0o600
+        for target in bundle.values():
+            assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+
 # Writes of material that is public by definition and needs no restriction.
 PUBLIC_WRITES = {"ca_path"}
 
