@@ -2,6 +2,21 @@
 members = ["crates/server", "crates/agent", "crates/auth", "crates/common", "crates/tools"]
 resolver = "2"
 
+# Release profile. This lives at the workspace root because cargo ignores
+# [profile.*] in a non-root manifest — it warns and moves on. crates/server and
+# crates/agent both declared exactly these settings and got none of them: every
+# release built so far has had lto off, codegen-units at the default 16, and
+# symbols left in, whatever the manifests said.
+#
+# Cost: lto = true with codegen-units = 1 is a slower link, paid five times over in
+# the release matrix. That is what the declarations asked for; it is now applied
+# instead of silently discarded.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
 [workspace.package]
 version = "1.2.1"
 edition = "2024"

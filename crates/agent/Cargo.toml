@@ -42,11 +42,6 @@ tonic-build = "0.12"
 prost-build = "0.12.6"
 protoc-bin-vendored = "3.0"
 
-[profile.release]
-opt-level = 3
-lto = true
-strip = true
-
 [dependencies.openssl]
 version = "0.10"
 optional = true

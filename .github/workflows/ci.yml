@@ -98,6 +98,29 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace
 
+      - name: Each crate builds on its own
+        # cargo unifies dependency features across everything in a single invocation,
+        # and every other cargo call in this repo is --workspace. Both
+        # control-center-server and control-center-agent take tokio with
+        # features = ["full"], so any member that under-declares its own tokio
+        # features still compiles here — and only here. control-center-auth did
+        # exactly that: `cargo test --workspace` passed while
+        # `cargo test -p control-center-auth` could not resolve `tokio::test`,
+        # because `macros` reached it only from the other two.
+        #
+        # --all-targets is the part that matters. The auth library was declared
+        # correctly and only its test target was short, so a plain `cargo check -p`
+        # passed even with the defect present.
+        run: |
+          set -e
+          members=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys; print(' '.join(p['name'] for p in json.load(sys.stdin)['packages']))")
+          for m in $members; do
+            echo "::group::$m"
+            cargo check -p "$m" --all-targets
+            echo "::endgroup::"
+          done
+
       - name: Python tests
         run: python -m pytest tests/ -q -rs
 

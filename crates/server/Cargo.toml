@@ -40,12 +40,6 @@ tonic-build = "0.12"
 prost-build = "0.12.6"
 protoc-bin-vendored = "3.0"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
-
 [features]
 openssl-vendored = ["openssl/vendored"]
 prometheus = []
