@@ -18,7 +18,7 @@ codegen-units = 1
 strip = true
 
 [workspace.package]
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 authors = ["Kartik A (NullVoider)"]
 license = "GPL-3.0"

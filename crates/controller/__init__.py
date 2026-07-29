@@ -10,4 +10,4 @@ imports integrations, creating a cycle.
 # management.cli imports it for `--version`. Keep in step with Cargo.toml on a
 # release bump — v1.2.0 shipped with the CLI still reporting 1.1.0 because the
 # version lived in two unconnected places.
-__version__ = "1.2.1"
+__version__ = "1.2.2"

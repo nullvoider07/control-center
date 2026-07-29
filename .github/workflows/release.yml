@@ -730,7 +730,104 @@ jobs:
 
             **Unified package: Rust binaries + Python CLI in one download**
 
-            ## ✨ What's New in v1.2.1
+            ## ✨ What's New in v1.2.2
+
+            Command delivery, recording on Windows, and latency.
+
+            > **Redeploy the AHK watcher scripts on the Windows guest.**
+            > `keyboard_control.ahk` and `mouse_control.ahk` changed. They are copied
+            > to `C:\Program Files\AutoHotkey\` and run as scheduled tasks, so an
+            > updated package alone does not update them.
+
+            - **Fixed** — A command whose caller stopped waiting could actuate later,
+              against whatever was on screen by then. The 30-second timeout cleared
+              the in-flight map, which a command that had never been dispatched had
+              never entered — so it stayed in the shared command queue, and the next
+              agent to attach drained it and ran it. The operator saw
+              `DeadlineExceeded` and the recorded event said the command failed, then
+              the action happened anyway with no record of it. Reachable in ordinary
+              use whenever the agent restarts with a command in flight. The timeout
+              now clears both structures, both stream-exit paths fail everything
+              outstanding, and a reaper on the heartbeat tick covers a caller whose
+              RPC was cancelled rather than timed out.
+
+            - **Fixed** — Windows keyboard steps were recorded as their AutoHotkey
+              transport form. `press ^s` was stored as `{Ctrl down}s{Ctrl up}`,
+              because the expansion `Send` requires was also assigned to the reported
+              command. The agent's display formatter then stripped the outer braces
+              from it, producing `Ctrl down}s{Ctrl up` — a string whose first `}`
+              precedes its first `{`. Windows keyboard steps now record the command as
+              issued, matching the macOS traces, and the agent only unwraps a single
+              brace token so an explicit down/up sequence stays parseable whatever
+              sends it.
+
+            - **Faster** — The fixed delay on every command is substantially lower.
+              The agent's pre-readback settle drops from 50 ms to 10 ms on Linux and
+              macOS: it predates the verify-and-retry loop that now follows it, so it
+              was sized for a worst case the loop already handles. Measured on the
+              Linux harness, interleaved to keep machine state comparable, 60 moves
+              per run: p50 **74.9 → 25.2 ms**, p95 **91.1 → 43.1 ms**, with capture
+              unchanged at 60/60. On Windows, `keyboard_control.ahk` slept 500 ms
+              before every keystroke — a wait for a freshly launched window charged to
+              every command, including long runs of typing into an already-focused
+              one, and a case the controller already guards. That and the surrounding
+              pauses are cut, taking the fixed cost of a keystroke from roughly 625 ms
+              to 70 ms and a coordinate mouse command from roughly 325 ms to 55 ms.
+              Those two are arithmetic from the constants, not a measurement: the
+              watchers only run on a Windows guest.
+
+            - **Fixed** — `control-center update` never replaced `generate-token`,
+              although both installers install it, so it stayed at whatever version
+              was last installed from scratch. It shares the token format with the
+              server.
+
+            - **Changed** — Release binaries are now built with the settings the
+              manifests always declared. `[profile.release]` sat in the two crate
+              manifests, where cargo ignores it, so every release so far shipped with
+              LTO off and symbols left in. Moved to the workspace root: the smallest
+              binary drops 24% and is now stripped.
+
+            ### 🔒 Security
+
+            - **A live agent can no longer be displaced by another principal.**
+              Registration evicted the existing connection unconditionally, so any
+              holder of an `agent`-scoped token could register, take the slot, bind
+              its own command stream legitimately, and receive every subsequent
+              command — including the text of `type` commands. A different principal
+              may now take the slot only once the incumbent has stopped serving it:
+              no heartbeat for 90 seconds, or registered without ever attaching a
+              stream. An agent reconnecting under the same subject is unaffected, and
+              a half-open registration cannot lock the real agent out.
+              `CC_ALLOW_AGENT_TAKEOVER=true` restores the previous behaviour for a
+              deliberate hand-off between guests holding different credentials.
+
+            - **`generate-token --help` minted a live credential.** Both installers
+              print that command. The only argument guard was a count, so `--help` was
+              read as the user id and a 24-hour `execute`+`monitor` token was printed
+              to the terminal and into shell history.
+
+            - **Token lifetime is capped and tokens can be revoked.** A signed token
+              cannot be withdrawn, so its expiry was the only thing that ended it and
+              `generate-token admin 876000` minted a credential valid for a century.
+              `duration_hours` is now capped at 8760 (365 days), and
+              `CC_REVOKED_SUBJECTS` refuses named subjects at validation — which
+              withdraws one leaked credential without rotating `JWT_SECRET` and
+              invalidating the token baked into the guest image.
+
+            - **Files are created restricted rather than tightened afterwards.** The
+              session store and the command-history store wrote at the process umask
+              and then chmod-ed, leaving a window where the content was on disk
+              group- and world-readable.
+
+            - **The OAuth crate's dormant defects are fixed.** It is still unreachable
+              from the server, so none of this was exploitable, but a future wiring
+              would have inherited all of it: an unsalted SHA-256 `hash_password` that
+              nothing called is deleted rather than improved, PKCE verifiers now
+              expire and are swept instead of accumulating for the life of the
+              process, and an expired session is treated as absent at read time rather
+              than depending on a cleanup nothing scheduled.
+
+            ## ✨ Previously in v1.2.1
 
             Drag actuation, and integrity on the paths that install this software.
 
