@@ -203,3 +203,87 @@ def test_windows_cmd_escaping_helper_is_gone():
     """No cmd.exe is involved any more — `__write__` writes the file directly, so
     escaping <>|&" would corrupt the payload rather than protect it."""
     assert not hasattr(WindowsActuation, "_escape_cmd_special")
+
+
+# ---- Windows: the transport form must not become the record ----------------
+# argv carries the AHK expansion because `Send` needs it; human_command is what the
+# agent turns into the display string the server stores as CommandEvent.raw_command.
+# Reporting the expansion put "{Ctrl down}s{Ctrl up}" into the corpus, which the
+# agent's brace-unwrap then mangled to "Ctrl down}s{Ctrl up" — an unbalanced brace
+# that panicked the Memory Archive converter and voided the whole session.
+
+
+class _StubClient:
+    """Records what the controller sent; reports every command as succeeding."""
+
+    def __init__(self):
+        self.sent = []
+
+    def execute_command(self, argv, human_command):
+        self.sent.append((argv, human_command))
+        return {
+            'success': True,
+            'message': 'ok',
+            'execution_time_ms': 3,
+            'mouse_x': 0,
+            'mouse_y': 0,
+            'position_captured': False,
+            'metadata': {},
+        }
+
+
+def windows_sent(command: str):
+    """Run one command through the real execute_command and return (argv, human)."""
+    wa = windows()
+    wa.grpc_client = _StubClient()
+    assert wa.execute_command(command) is True, f"{command!r} was not executed"
+    assert len(wa.grpc_client.sent) == 1
+    return wa.grpc_client.sent[0]
+
+
+WINDOWS_RECORDING = [
+    # issued,        argv payload (AHK transport),                         recorded
+    ("press ^s",     "press {Ctrl down}s{Ctrl up}",                        "press ^s"),
+    ("press ^+n",    "press {Ctrl down}{Shift down}n{Shift up}{Ctrl up}",  "press ^+n"),
+    ("press ^{Tab}", "press {Ctrl down}{Tab}{Ctrl up}",                    "press ^{Tab}"),
+    ("^a",           "press {Ctrl down}a{Ctrl up}",                        "press ^a"),
+    ("press !{F4}",  "press {Alt down}{F4}{Alt up}",                       "press !{F4}"),
+    # Bare modifiers and unmodified keys need no expansion — the two agree already.
+    ("press {F5}",   "press {F5}",                                         "press {F5}"),
+    ("press {LWin}", "press {LWin}",                                       "press {LWin}"),
+    # Typed text stays on the `type` action and is never rewritten.
+    ("type a^b!c",   "type a^b!c",                                         "type a^b!c"),
+]
+
+
+@pytest.mark.parametrize("command,payload,recorded", WINDOWS_RECORDING)
+def test_windows_keyboard_records_the_command_not_the_transport(
+        command, payload, recorded):
+    argv, human = windows_sent(command)
+    assert argv == ['__write__', r'C:\keyboard_cmd.txt', payload], \
+        "the AHK expansion must still reach the guest unchanged"
+    assert human == recorded, "the recorded command is not the one that was issued"
+
+
+@pytest.mark.parametrize("command,_payload,_recorded", WINDOWS_RECORDING)
+def test_windows_never_reports_a_down_up_sequence(command, _payload, _recorded):
+    """The direct symptom: any ' down}' in human_command reaches the converter as an
+    unbalanced brace once the agent strips the outer pair."""
+    _argv, human = windows_sent(command)
+    assert " down}" not in human and " up}" not in human, human
+    assert human.count("{") == human.count("}"), human
+
+
+def test_windows_batch_records_the_same_form_as_interactive(tmp_path):
+    """execute_batch_file builds its own payload, so the split has to hold there too."""
+    script = tmp_path / "batch.txt"
+    script.write_text("press ^s\n960 540 left\n")
+
+    wa = windows()
+    wa.grpc_client = _StubClient()
+    wa.execute_batch_file(str(script))
+
+    sent = wa.grpc_client.sent
+    assert [human for _argv, human in sent] == ["press ^s", "960 540 left"]
+    assert sent[0][0] == ['__write__', r'C:\keyboard_cmd.txt',
+                          "press {Ctrl down}s{Ctrl up}"]

@@ -382,8 +382,15 @@ class WindowsActuation:
             # Write the AHK watcher file directly (agent uses fs, no cmd /c echo) — this
             # removes the `> file` / echo shell-injection surface and preserves special
             # characters verbatim (F5).
+            #
+            # The expansion is transport, not the record. `human_command` is parsed by
+            # the agent into the display string the server stores as CommandEvent
+            # .raw_command, so reporting the AHK wire form put "{Ctrl down}s{Ctrl up}"
+            # into the corpus where every other backend records the command as issued.
+            # The mouse branch below and macOS's parse_keyboard_command both report
+            # the canonical command; this was the one branch that did not.
             argv = ['__write__', r'C:\keyboard_cmd.txt', file_payload]
-            human_command = file_payload
+            human_command = processed_cmd
         else:
             argv = ['__write__', r'C:\mouse_cmd.txt', processed_cmd]
             human_command = processed_cmd
@@ -494,8 +501,9 @@ class WindowsActuation:
                         argv = ['__write__', r'C:\keyboard_cmd.txt', file_payload]
                     else:
                         argv = ['__write__', r'C:\mouse_cmd.txt', formatted_cmd]
-                        file_payload = formatted_cmd
-                    yield argv, file_payload, i, len(commands), command
+                    # Same split as execute_command: the AHK expansion travels in argv,
+                    # the canonical command is what gets reported and recorded.
+                    yield argv, formatted_cmd, i, len(commands), command
 
         success_count = 0
         total_count = 0

@@ -331,8 +331,17 @@ impl AgentServiceImpl {
                 // Keycode passthrough. Rendering the raw "code:21" here would put it
                 // in the recorded step text, so give it a readable name.
                 parts.push(format!("Key {}", code));
-            } else if key_part.starts_with('{') && key_part.ends_with('}') {
-                parts.push(key_part[1..key_part.len() - 1].to_string());
+            } else if let Some(inner) = key_part
+                .strip_prefix('{')
+                .and_then(|k| k.strip_suffix('}'))
+                .filter(|inner| !inner.contains('}'))
+            {
+                // Only a single brace token unwraps. An explicit down/up sequence
+                // such as "{Ctrl down}s{Ctrl up}" also starts with '{' and ends with
+                // '}', and stripping its outer braces yielded "Ctrl down}s{Ctrl up" —
+                // a string with an unbalanced brace that no downstream parser can
+                // read back as key tokens. Left whole it stays parseable.
+                parts.push(inner.to_string());
             } else if key_part.chars().count() == 1 {
                 parts.push(key_part.to_uppercase());
             } else {
@@ -1366,5 +1375,57 @@ mod tests {
         assert!(!version.is_empty());
         assert!(!version.contains("Unknown") || cfg!(debug_assertions));
     }
-    
+
+    fn service(os_type: OsType) -> AgentServiceImpl {
+        AgentServiceImpl {
+            os_type,
+            os_version: "test".to_string(),
+            capabilities: Vec::new(),
+            #[cfg(target_os = "macos")]
+            cliclick_path: None,
+            held_buttons: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn a_single_brace_token_still_unwraps() {
+        let svc = service(OsType::Windows);
+        assert_eq!(svc.format_keys_for_display("{LWin}"), "LWin");
+        assert_eq!(svc.format_keys_for_display("{Enter}"), "Return");
+        assert_eq!(svc.format_keys_for_display("^{Plus}"), "Ctrl+Plus");
+    }
+
+    #[test]
+    fn an_explicit_down_up_sequence_keeps_its_braces() {
+        // It starts with '{' and ends with '}', so the old unwrap turned
+        // "{Ctrl down}s{Ctrl up}" into "Ctrl down}s{Ctrl up": an unbalanced brace
+        // that the Memory Archive converter panicked on, voiding the capture
+        // session. Any caller can send this form, so the guard belongs here and not
+        // only in the Windows builder that used to produce it.
+        let svc = service(OsType::Windows);
+        for keys in [
+            "{Ctrl down}s{Ctrl up}",
+            "{Ctrl down}{Tab}{Ctrl up}",
+            "{Ctrl down}{Shift down}{Esc}{Shift up}{Ctrl up}",
+        ] {
+            let shown = svc.format_keys_for_display(keys);
+            assert_eq!(shown, keys, "the sequence was rewritten");
+            assert_eq!(
+                shown.matches('{').count(),
+                shown.matches('}').count(),
+                "unbalanced braces in {:?}",
+                shown
+            );
+        }
+    }
+
+    #[test]
+    fn a_canonical_windows_chord_reads_as_a_chord() {
+        // What the fixed controller now reports: "press ^s" reaches the agent
+        // verbatim, so the display string is the chord rather than the AHK wire form.
+        let svc = service(OsType::Windows);
+        assert_eq!(svc.format_keys_for_display("^s"), "Ctrl+S");
+        assert_eq!(svc.format_keys_for_display("^+n"), "Ctrl+Shift+N");
+        assert_eq!(svc.format_keys_for_display("!{Tab}"), "Alt+Tab");
+    }
 }
