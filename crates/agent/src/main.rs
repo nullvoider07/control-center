@@ -1419,6 +1419,63 @@ mod tests {
         }
     }
 
+    // ---- typed text is reported exactly as issued -------------------------
+    // S026: the record read "Typed: osascript -e \" because the agent re-derived the
+    // payload from the AppleScript, ending it at the first `"` — which was the second
+    // half of an escape sequence. a0bf3fe deleted that extractor; the command now
+    // arrives on the wire and only the verb is trimmed. This pins that.
+
+    const QUOTED_PAYLOADS: &[&str] = &[
+        r#"printf "Title\nBody" > note.txt"#,
+        r#"say "hi""#,
+        r#"osascript -e "tell app \"X\" to y""#,
+        r"ends with a backslash \",
+        r#"both "quoted" and trailing \"#,
+    ];
+
+    fn typed(svc: &AgentServiceImpl, command: &str) -> String {
+        let action = svc.parse_action_details(command);
+        let position = MousePosition { x: 0, y: 0, captured: false };
+        svc.build_detailed_message(&action, &position, command)
+    }
+
+    #[test]
+    fn typed_text_is_reported_byte_for_byte() {
+        let svc = service(OsType::Macos);
+        for payload in QUOTED_PAYLOADS {
+            let message = typed(&svc, &format!("type {payload}"));
+            assert_eq!(
+                message,
+                format!("Typed: {payload}"),
+                "the payload was altered on the way to the record"
+            );
+            assert!(!message.ends_with('\\') || payload.ends_with('\\'));
+        }
+    }
+
+    #[test]
+    fn typed_text_is_not_cut_at_the_first_quote() {
+        // The exact S026 signature, named separately so a regression identifies itself.
+        let svc = service(OsType::Macos);
+        let message = typed(
+            &svc,
+            r#"type osascript -e "tell application "System Events" to set picture of every desktop to "/Users/agentuser/corpus-seed/wall-A.jpg"""#,
+        );
+        assert_ne!(message, r"Typed: osascript -e \");
+        assert!(message.contains("wall-A.jpg"), "{message:?}");
+    }
+
+    #[test]
+    fn leading_whitespace_in_typed_text_is_not_carried_into_the_record() {
+        // Documented boundary, not an endorsement. The builders split the command at
+        // the first space (`split(maxsplit=1)`), so "type   x" actuates two leading
+        // spaces, while the verb trim here drops them from the record. Reachable from
+        // the console, which strips the line but not the gap after the verb. Pinned so
+        // that tightening it is a deliberate change rather than an accident.
+        let svc = service(OsType::Macos);
+        assert_eq!(typed(&svc, "type   x"), "Typed: x");
+    }
+
     #[test]
     fn a_canonical_windows_chord_reads_as_a_chord() {
         // What the fixed controller now reports: "press ^s" reaches the agent

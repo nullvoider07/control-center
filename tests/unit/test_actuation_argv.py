@@ -107,6 +107,78 @@ def test_macos_builders_never_emit_a_shell_string():
         assert human
 
 
+# ---- record fidelity: the record is the command as issued ------------------
+# The S026 truncation (`type osascript -e \`) came from the agent re-deriving
+# human_command out of the AppleScript by searching for the first `"`, which landed
+# on the second half of an escape sequence. a0bf3fe deleted that extractor and the
+# command is carried on the wire instead. These pin the property the deletion
+# established: escaping applies to the argv payload only, and never to the record.
+#
+# Asserted on the return value, not on stdout — typed text is deliberately redacted
+# in progress output (see test_typed_text_not_echoed.py), so a stdout assertion here
+# would contradict that test.
+
+QUOTED_PAYLOADS = [
+    'printf "Title\\nBody" > note.txt',            # the acceptance command
+    'say "hi"',                                    # bare quotes
+    'osascript -e "tell app \\"X\\" to y"',        # quotes already escaped by hand
+    'ends with a backslash \\',                    # trailing backslash
+    'both "quoted" and trailing \\',               # both at once
+    "mix \"double\" and 'single'",
+]
+
+
+@pytest.mark.parametrize("payload", QUOTED_PAYLOADS)
+def test_macos_type_records_the_command_as_issued(payload):
+    command = f"type {payload}"
+    _argv, human = macos().parse_keyboard_command(command)
+    assert human == command, "the builder altered the command it reports"
+
+
+@pytest.mark.parametrize("payload", QUOTED_PAYLOADS)
+def test_linux_type_records_the_command_as_issued(payload):
+    command = f"type {payload}"
+    argv, human = linux()._build_keyboard_command(command)
+    assert human == command, "the builder altered the command it reports"
+    assert argv == ["xdotool", "type", payload], "the payload is not one literal argv"
+
+
+def _is_applescript_string_literal(s: str) -> bool:
+    """Mirror of argv_policy::is_applescript_string_literal — `"…"` where the closing
+    quote is the final character and inner quotes are backslash-escaped."""
+    if len(s) < 2 or s[0] != '"':
+        return False
+    i = 1
+    while i < len(s):
+        if s[i] == '\\':
+            i += 2
+        elif s[i] == '"':
+            return i == len(s) - 1
+        else:
+            i += 1
+    return False
+
+
+@pytest.mark.parametrize("payload", QUOTED_PAYLOADS)
+def test_macos_escapes_the_argv_payload_and_only_that(payload):
+    """Escaping exists so the payload stays inside one closed AppleScript literal —
+    which is also what the agent's grammar requires. The same strings are pinned on
+    the agent side by argv_policy's `osascript_accepts_real_quoted_payloads`."""
+    argv, _human = macos().parse_keyboard_command(f"type {payload}")
+    assert argv[:2] == ["osascript", "-e"] and len(argv) == 3
+
+    prefix = 'tell application "System Events" to keystroke '
+    assert argv[2].startswith(prefix)
+    literal = argv[2][len(prefix):]
+    assert _is_applescript_string_literal(literal), \
+        f"the agent would reject this script: {argv[2]!r}"
+
+    # Reversing the two escapes must give back exactly what was typed: an escape
+    # that is not reversible is text the guest would receive altered.
+    unescaped = literal[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+    assert unescaped == payload
+
+
 # ---- controller/agent grammar agreement ------------------------------------
 ARGV_POLICY = Path(__file__).resolve().parents[2] / "crates/agent/src/argv_policy.rs"
 

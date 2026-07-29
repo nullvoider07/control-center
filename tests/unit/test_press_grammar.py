@@ -253,6 +253,19 @@ WINDOWS_RECORDING = [
     ("press {LWin}", "press {LWin}",                                       "press {LWin}"),
     # Typed text stays on the `type` action and is never rewritten.
     ("type a^b!c",   "type a^b!c",                                         "type a^b!c"),
+    # Quotes and backslashes: nothing on this path escapes or splits on them, so the
+    # payload reaches the AHK file and the record byte-identical. keyboard_control.ahk
+    # splits at the first space and hands the rest to SendText. The macOS and Linux
+    # halves of this property live in test_actuation_argv.py (QUOTED_PAYLOADS).
+    ('type printf "Title\\nBody" > note.txt',
+     'type printf "Title\\nBody" > note.txt',
+     'type printf "Title\\nBody" > note.txt'),
+    ('type osascript -e "tell app \\"X\\" to y"',
+     'type osascript -e "tell app \\"X\\" to y"',
+     'type osascript -e "tell app \\"X\\" to y"'),
+    ('type ends with a backslash \\',
+     'type ends with a backslash \\',
+     'type ends with a backslash \\'),
 ]
 
 

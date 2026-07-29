@@ -1029,6 +1029,16 @@ mod tests {
             (r"trailing\", r#"tell application "System Events" to keystroke "trailing\\""#),
             (r#""quoted phrase""#,
              r#"tell application "System Events" to keystroke "\"quoted phrase\"""#),
+            // The corpus command the "no quotes in a type command" workaround exists
+            // to avoid: quotes, an escaped newline and a redirection in one payload.
+            // Paired with test_actuation_argv.py's QUOTED_PAYLOADS, which asserts
+            // macos_actuation.py emits exactly these scripts.
+            (r#"printf "Title\nBody" > note.txt"#,
+             r#"tell application "System Events" to keystroke "printf \"Title\\nBody\" > note.txt""#),
+            (r#"osascript -e "tell app \"X\" to y""#,
+             r#"tell application "System Events" to keystroke "osascript -e \"tell app \\\"X\\\" to y\"""#),
+            (r"ends with a backslash \",
+             r#"tell application "System Events" to keystroke "ends with a backslash \\""#),
         ] {
             let case = argv(&["osascript", "-e", body]);
             assert!(

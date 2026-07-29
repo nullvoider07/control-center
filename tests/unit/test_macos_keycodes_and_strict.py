@@ -392,3 +392,29 @@ def test_rejection_message_always_offers_the_literal_escape():
     # see tests/unit/test_typed_text_not_echoed.py.
     assert "type <text>" in message
     assert "--lenient" in message
+
+
+# ---- typed text survives the whole macOS controller path -------------------
+# The builder-level halves of this live in tests/unit/test_actuation_argv.py
+# (QUOTED_PAYLOADS). This one goes through execute_command, so the dispatcher in
+# detect_command_type is covered too: a `type` payload full of quotes must not be
+# re-routed, re-split or altered on its way to human_command.
+
+@pytest.mark.parametrize("payload", [
+    'printf "Title\\nBody" > note.txt',
+    'say "hi"',
+    'osascript -e "tell app \\"X\\" to y"',
+    'ends with a backslash \\',
+])
+def test_typed_text_reaches_the_wire_as_issued(payload):
+    ma = macos()
+    ma.strict = True
+    ma.grpc_client = _StubClient()
+    command = f"type {payload}"
+    assert ma.execute_command(command) is True
+
+    (argv, human), = ma.grpc_client.sent
+    assert human == command, "the command was altered before it was recorded"
+    assert argv[:2] == ["osascript", "-e"] and len(argv) == 3, argv
+    # The payload is one argv element; there is no shell, so nothing re-parses it.
+    assert payload.split('"')[0] in argv[2]

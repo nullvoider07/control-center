@@ -29,15 +29,27 @@ from controller.os_specific.linux_actuation import LinuxActuation
 
 pytestmark = requires_stack
 
-# The acceptance forms from the fidelity brief, plus the verbatim S026 payload that
-# produced the truncated record. Each must survive into the record unaltered.
+# The verbatim payload from S026, whose record read `type osascript -e \`. Named
+# rather than indexed: the truncation assertion below is about this string
+# specifically, and reading it off the end of the list broke as soon as a payload
+# that legitimately ends in a backslash was added.
+S026_PAYLOAD = (
+    'osascript -e "tell application "System Events" to set picture of every '
+    'desktop to "/Users/agentuser/corpus-seed/wall-A.jpg""'
+)
+
+# The acceptance forms from the fidelity brief, plus S026. Each must survive into
+# the record unaltered.
 PAYLOADS = [
     'printf "hello world"',
     'osascript -e "tell application \\"System Events\\" to get name"',
     "sed -i '' 's/a/b/g' file.txt",
     'mix "double" and \'single\' and back\\slash',
-    'osascript -e "tell application "System Events" to set picture of every '
-    'desktop to "/Users/agentuser/corpus-seed/wall-A.jpg""',
+    S026_PAYLOAD,
+    # The corpus command the "no quotes in a type command" rule exists to avoid:
+    # quotes, an escaped newline and a redirection in one line.
+    'printf "Title\\nBody" > note.txt',
+    'ends with a backslash \\',
 ]
 
 
@@ -113,7 +125,7 @@ def test_typed_payload_is_recorded_verbatim(stack):
 def test_record_is_not_truncated_at_the_first_quote(stack):
     """The precise S026 signature: truncation at the first escaped quote, leaving a
     trailing backslash. Asserted separately so a regression names itself."""
-    payload = PAYLOADS[-1]
+    payload = S026_PAYLOAD
 
     with _Recorder(stack) as recorder:
         _send(stack, [f"type {payload}"])
