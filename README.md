@@ -520,7 +520,24 @@ issue it only to consumers that are entitled to see keystroke content.
 | `SERVER_ADDR` | Server binary | Bind address for the server (e.g., `0.0.0.0:50051`) |
 | `SINGLE_AGENT_MODE` | Server binary | `true` = only one agent allowed (default), `false` = multi-agent |
 | `CONTROL_CENTER_NETWORK` | Server binary | Network label for this server instance |
+| `CC_REVOKED_SUBJECTS` | Server binary | Comma-separated JWT subjects to refuse, whatever their signature or expiry. Read at startup |
+| `CC_ALLOW_AGENT_TAKEOVER` | Server binary | `true` lets a different principal displace a connected, responding agent. Off by default |
 | `RUST_LOG` | Agent + Server | Log level for Rust binaries (e.g., `info`, `debug`) |
+
+**Token lifetime and revocation.** A signed token cannot be withdrawn, so
+`generate-token` caps `duration_hours` at 8760 (365 days) — issue a short one and
+re-issue rather than minting a long-lived credential. To withdraw a token before it
+expires, add its subject to `CC_REVOKED_SUBJECTS` and restart the server; this leaves
+every other token working, unlike rotating `JWT_SECRET`, which also invalidates the
+token baked into the guest image.
+
+**Agent takeover.** In single-agent mode an agent re-registering takes its slot back,
+which is how it recovers from a crash. A *different* principal may only take the slot
+once the incumbent has stopped serving it — no heartbeat for 90 seconds, or
+registered without ever attaching a command stream. Otherwise registration is refused,
+because taking the slot means receiving every subsequent command, `type` payloads
+included. Set `CC_ALLOW_AGENT_TAKEOVER=true` for a deliberate hand-off between guests
+holding different agent credentials.
 
 **TLS variables:**
 
@@ -591,10 +608,18 @@ binaries can launch other programs if handed arbitrary arguments:
 | `xdotool` | Only the sub-commands `type`, `key`, `click`, `mousemove`, `mousedown`, `mouseup`, `getmouselocation`, with per-sub-command argument shapes. `exec`, `spawn`, and `behave` have no accepting branch |
 | `cliclick` | Only `prefix:value` action tokens from a fixed prefix set, so no option flags can be passed |
 | `osascript` | Only `-e` pairs whose script matches one of two anchored templates (`keystroke "<literal>"` and `key code <n> [using {…}]`). Free-form scripts, and therefore `do shell script`, are refused |
-| `__write__` | Writes only to `C:\keyboard_cmd.txt` or `C:\mouse_cmd.txt` (Windows AHK input files) |
+| `__write__` | Writes only to `C:\keyboard_cmd.txt` or `C:\mouse_cmd.txt` (Windows AHK input files). The **destination** is constrained; the **content** is not — see below |
 | `__scroll__` | A bounded scroll instruction the agent expands into a fixed cliclick + AppleScript sequence |
 
-Two subtleties worth knowing, because they are easy to get wrong:
+Three subtleties worth knowing, because they are easy to get wrong:
+
+- **`__write__` constrains where, not what.** Unlike the other rows, the file content
+  is passed through unvalidated. `keyboard_control.ahk` reads it, splits at the first
+  space and dispatches `type` to `SendText` and `press` to `Send`, so the content can
+  express any keystroke — which is exactly what an `execute`-scoped token already
+  authorises through the ordinary grammar. It is not a privilege gain, and it is
+  deliberately not validated twice; it is called out because the row above reads like
+  the content is checked, and it is not.
 
 - **Typed text is data, never syntax.** A payload such as
   `type hello$(id)` is typed literally — there is no interpreter for it to reach.

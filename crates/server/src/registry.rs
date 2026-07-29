@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Connected agent metadata
 #[derive(Debug, Clone)]
@@ -80,6 +80,19 @@ pub struct AgentMetadata {
     pub disconnect_reason: Option<String>,
 }
 
+/// How long an agent may go without a heartbeat before another principal is allowed
+/// to take its slot. The agent heartbeats every 30s, so this is three missed beats.
+const STALE_AGENT_AFTER: Duration = Duration::from_secs(90);
+
+/// Whether a live agent may be displaced by a different principal. Off by default;
+/// read per call so it can be flipped without a restart in a deployment that sets it
+/// from a supervisor.
+fn takeover_allowed() -> bool {
+    std::env::var("CC_ALLOW_AGENT_TAKEOVER")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 /// Server information for status response
 impl ConnectionRegistry {
     /// Create new registry
@@ -108,6 +121,41 @@ impl ConnectionRegistry {
 
         // 1:1 enforcement check
         if self.single_agent_mode {
+            // Eviction is how an agent recovers from a crash: it re-registers and
+            // takes its slot back. It was also how any other holder of an
+            // `agent`-scoped token could displace a live agent and receive every
+            // subsequent command, typed text included. bind_stream pins the subject
+            // to the connection, but the attacker registers their own connection
+            // first, so that check never fires.
+            //
+            // A different principal may take the slot only once the incumbent is no
+            // longer serving it — stale heartbeat, or registered but never attached
+            // (which would otherwise let a half-open registration lock the real agent
+            // out). CC_ALLOW_AGENT_TAKEOVER=true restores the old behaviour for
+            // deliberate hand-offs between differently-credentialed guests.
+            if let Some(existing) = connection_lock.as_ref() {
+                let same_principal = existing.auth_subject == auth_subject;
+                let incumbent_serving = existing.stream_bound
+                    && existing.last_heartbeat.elapsed() < STALE_AGENT_AFTER;
+                if !same_principal && incumbent_serving && !takeover_allowed() {
+                    warn!(
+                        "Refusing registration of {} (subject '{}'): connection {} is \
+                         held by a live agent registered as '{}'",
+                        agent_identity.agent_id,
+                        auth_subject,
+                        existing.connection_id,
+                        existing.auth_subject
+                    );
+                    return Err(format!(
+                        "An agent registered as '{}' is already connected and \
+                         responding. Disconnect it first, or set \
+                         CC_ALLOW_AGENT_TAKEOVER=true to permit hand-off between \
+                         different agent credentials.",
+                        existing.auth_subject
+                    ));
+                }
+            }
+
             if let Some(existing) = connection_lock.take() {
                 warn!(
                     "Single-agent mode: evicting stale connection {} (agent: {}, hostname: {}) \
@@ -571,5 +619,92 @@ mod tests {
         // Second consume returns None (already consumed)
         let signal2 = registry.consume_disconnect_signal().await;
         assert_eq!(signal2, None);
+    }
+
+    fn identity(agent_id: &str) -> crate::proto::AgentIdentity {
+        crate::proto::AgentIdentity {
+            agent_id: agent_id.to_string(),
+            hostname: format!("host-{agent_id}"),
+            os_type: 0,
+            os_version: "macOS 14".to_string(),
+            ip_address: "192.168.1.100".to_string(),
+            version: "1.0.0".to_string(),
+            capabilities: vec![],
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_agent_cannot_be_displaced_by_another_principal() {
+        // Eviction was unconditional, so any holder of an `agent`-scoped token could
+        // register, take the slot, bind its own stream legitimately, and receive every
+        // subsequent command — including the text of `type` commands.
+        let registry = ConnectionRegistry::new(true, 10, "127.0.0.1".to_string());
+
+        registry
+            .register_agent(&identity("agent-1"), "conn-1".to_string(),
+                            "192.168.1.100".to_string(), "real-agent".to_string())
+            .await
+            .unwrap();
+        registry.bind_stream("conn-1", "real-agent").await.unwrap();
+
+        let takeover = registry
+            .register_agent(&identity("agent-2"), "conn-2".to_string(),
+                            "192.168.1.101".to_string(), "other-agent".to_string())
+            .await;
+        assert!(takeover.is_err(), "a live agent was displaced");
+        assert!(takeover.unwrap_err().contains("real-agent"));
+
+        let current = registry.get_current_connection().await.unwrap();
+        assert_eq!(current.agent_id, "agent-1", "the wrong agent holds the slot");
+        assert_eq!(current.connection_id, "conn-1");
+    }
+
+    #[tokio::test]
+    async fn the_same_principal_still_reconnects() {
+        // The reason eviction exists: an agent that crashed re-registers and takes its
+        // slot back without operator involvement. That must keep working.
+        let registry = ConnectionRegistry::new(true, 10, "127.0.0.1".to_string());
+
+        registry
+            .register_agent(&identity("agent-1"), "conn-1".to_string(),
+                            "192.168.1.100".to_string(), "real-agent".to_string())
+            .await
+            .unwrap();
+        registry.bind_stream("conn-1", "real-agent").await.unwrap();
+
+        registry
+            .register_agent(&identity("agent-1"), "conn-2".to_string(),
+                            "192.168.1.100".to_string(), "real-agent".to_string())
+            .await
+            .expect("the registered agent could not reconnect");
+
+        let current = registry.get_current_connection().await.unwrap();
+        assert_eq!(current.connection_id, "conn-2");
+        assert!(!current.stream_bound, "the new connection starts unbound");
+    }
+
+    #[tokio::test]
+    async fn a_registration_that_never_attached_does_not_lock_the_slot() {
+        // Otherwise registering and never binding would be a way to keep the real
+        // agent out.
+        let registry = ConnectionRegistry::new(true, 10, "127.0.0.1".to_string());
+
+        registry
+            .register_agent(&identity("squatter"), "conn-1".to_string(),
+                            "192.168.1.9".to_string(), "squatter-sub".to_string())
+            .await
+            .unwrap();
+
+        registry
+            .register_agent(&identity("agent-1"), "conn-2".to_string(),
+                            "192.168.1.100".to_string(), "real-agent".to_string())
+            .await
+            .expect("an unattached registration blocked the real agent");
+
+        assert_eq!(
+            registry.get_current_connection().await.unwrap().agent_id,
+            "agent-1"
+        );
     }
 }

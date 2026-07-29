@@ -15,6 +15,7 @@ wrong thing:
 """
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -393,3 +394,38 @@ def test_the_install_scripts_verify_what_they_download(script):
     exposure as the updater and needs the same check."""
     body = (Path(cli.__file__).resolve().parents[3] / script).read_text()
     assert "SHA256SUMS" in body, f"{script} does not fetch the published digests"
+
+
+# ---------------------------------------------------------------------------
+# What the updater replaces
+# ---------------------------------------------------------------------------
+
+def test_the_updater_replaces_every_binary_the_installers_install():
+    """The update replaced three of the four installed binaries, so generate-token
+    stayed at whatever version was last installed from scratch. It shares the Claims
+    definition with the server, so a token-format change would leave it minting
+    tokens the updated server rejects — and nothing would say so."""
+    root = Path(cli.__file__).resolve().parents[3]
+    installed = {
+        line.split('=', 1)[1].strip().strip('"')
+        for line in (root / "install/install.sh").read_text().splitlines()
+        if line.startswith(("SERVER_BINARY=", "AGENT_BINARY=", "TOKEN_BINARY=",
+                            "CLI_BINARY="))
+    }
+    assert installed, "could not read the binary names out of install.sh"
+
+    source = Path(cli.__file__).read_text()
+    start = source.index("binaries = ['control-center',")
+    updated = set(re.findall(r"'([a-z-]+)'", source[start:source.index(']', start)]))
+
+    missing = installed - updated
+    assert not missing, f"the updater never replaces: {sorted(missing)}"
+
+
+def test_the_windows_and_posix_binary_lists_agree():
+    source = Path(cli.__file__).read_text()
+    win_start = source.index("binaries = ['control-center.exe',")
+    windows = set(re.findall(r"'([a-z.-]+)'", source[win_start:source.index(']', win_start)]))
+    posix_start = source.index("binaries = ['control-center',")
+    posix = set(re.findall(r"'([a-z-]+)'", source[posix_start:source.index(']', posix_start)]))
+    assert {name.removesuffix('.exe') for name in windows} == posix

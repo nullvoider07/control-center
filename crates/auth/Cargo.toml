@@ -28,10 +28,13 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
-sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# #[tokio::test] needs macros + rt. Declared here rather than relying on
+# feature unification from other workspace members, which made
+# `cargo test -p control-center-auth` fail to compile on its own.
+tokio = { version = "1.40", features = ["sync", "macros", "rt"] }
 
 [dependencies.openssl]
 version = "0.10"

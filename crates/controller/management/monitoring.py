@@ -149,7 +149,9 @@ def format_timestamp(timestamp):
     try:
         dt = datetime.fromtimestamp(timestamp)
         return dt.strftime('%Y-%m-%d %H:%M:%S')
-    except:
+    except Exception:
+        # Not a bare `except`: that caught KeyboardInterrupt and SystemExit too, so
+        # a Ctrl+C while rendering a status table was reported as "Unknown".
         return "Unknown"
 
 # Format duration in seconds to human-readable string

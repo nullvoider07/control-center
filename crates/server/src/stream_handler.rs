@@ -16,6 +16,11 @@ use crate::proto::{
 };
 use crate::registry::ConnectionRegistry;
 
+/// How long a command may wait, both for an agent to take it and for that agent to
+/// answer. The queue reaper and the per-call timeout must agree, so they read the
+/// same constant rather than repeating the literal.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Queued command waiting to be sent to agent
 struct QueuedCommand {
     request: CommandRequest,
@@ -65,7 +70,7 @@ impl StreamHandler {
             command_queue: Arc::new(RwLock::new(VecDeque::new())),
             pending_commands: Arc::new(RwLock::new(HashMap::new())),
             new_command_notify: Arc::new(tokio::sync::Notify::new()),
-            command_timeout: Duration::from_secs(30),
+            command_timeout: COMMAND_TIMEOUT,
         }
     }
     
@@ -105,10 +110,18 @@ impl StreamHandler {
             }
             Err(_) => {
                 error!("Command {} timed out after {:?}", command_id, self.command_timeout);
-                
-                // Clean up pending command
+
+                // Both structures, not just one. A command reaches `pending_commands`
+                // only once it has been dispatched; if no agent was attached it is
+                // still sitting in `command_queue`, where the next agent's drain loop
+                // would pick it up and actuate it — minutes or hours after its caller
+                // was told it timed out, and after the recorded event said it failed.
                 self.pending_commands.write().await.remove(&command_id);
-                
+                self.command_queue
+                    .write()
+                    .await
+                    .retain(|queued| queued.request.id != command_id);
+
                 Err(Status::deadline_exceeded(format!(
                     "Command execution timed out after {:?}",
                     self.command_timeout
@@ -117,6 +130,59 @@ impl StreamHandler {
         }
     }
     
+    /// A failure response for a command that will never be delivered.
+    fn undeliverable(id: String, reason: &str) -> CommandResponse {
+        CommandResponse {
+            id,
+            success: false,
+            message: reason.to_string(),
+            execution_time_ms: 0,
+            mouse_x: None,
+            mouse_y: None,
+            position_captured: None,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Fail and discard everything outstanding, so nothing survives to be delivered
+    /// to a later agent.
+    ///
+    /// A command that outlives its caller is worse than a lost one: the operator has
+    /// been told it failed, the recorded event says so, and then it actuates anyway
+    /// against whatever happens to be on screen when the next agent attaches.
+    async fn fail_outstanding(
+        command_queue: &Arc<RwLock<VecDeque<QueuedCommand>>>,
+        pending_commands: &Arc<RwLock<HashMap<String, PendingCommand>>>,
+        reason: &str,
+    ) {
+        // Drained before sending so no lock is held across the notifications.
+        let queued: Vec<QueuedCommand> = {
+            let mut queue = command_queue.write().await;
+            queue.drain(..).collect()
+        };
+        let pending: Vec<(String, PendingCommand)> = {
+            let mut pending = pending_commands.write().await;
+            pending.drain().collect()
+        };
+
+        if !queued.is_empty() || !pending.is_empty() {
+            warn!(
+                "Failing {} queued and {} in-flight command(s): {}",
+                queued.len(),
+                pending.len(),
+                reason
+            );
+        }
+
+        for command in queued {
+            let id = command.request.id.clone();
+            let _ = command.response_tx.send(Self::undeliverable(id, reason));
+        }
+        for (id, command) in pending {
+            let _ = command.response_tx.send(Self::undeliverable(id, reason));
+        }
+    }
+
     /// Handle agent stream (bidirectional)
     pub async fn handle_agent_stream(
         &self,
@@ -138,16 +204,24 @@ impl StreamHandler {
         // Spawn task to receive messages from agent
         let receiver_registry = registry.clone();
         let receiver_pending = pending_commands.clone();
+        let receiver_queue = command_queue.clone();
         let receiver_conn_id = connection_id.clone(); // Clone for first task
         tokio::spawn(async move {
             if let Err(e) = Self::handle_incoming_messages(
                 agent_stream,
                 receiver_conn_id,
                 receiver_registry,
-                receiver_pending,
+                receiver_pending.clone(),
             ).await {
                 error!("Error in incoming message handler: {}", e);
             }
+            // The agent is gone. Anything still outstanding has no way to reach it,
+            // and must not be left for whichever agent attaches next.
+            Self::fail_outstanding(
+                &receiver_queue,
+                &receiver_pending,
+                "Agent disconnected before the command was delivered",
+            ).await;
         });
         
         // Spawn task to send messages to agent
@@ -304,45 +378,24 @@ impl StreamHandler {
                             payload: Some(server_message::Payload::Disconnect(notice)),
                         })).await;
 
-                        // Fail queued commands so CLI callers unblock immediately
-                        let mut queue = command_queue.write().await;
-                        while let Some(queued) = queue.pop_front() {
-                            let _ = queued.response_tx.send(CommandResponse {
-                                id: queued.request.id.clone(),
-                                success: false,
-                                message: format!(
-                                    "Agent disconnected by operator: {}", reason
-                                ),
-                                execution_time_ms: 0,
-                                mouse_x: None,
-                                mouse_y: None,
-                                position_captured: None,
-                                metadata: std::collections::HashMap::new(),
-                            });
-                        }
-                        drop(queue);
-
-                        // Fail any in-flight pending commands too
-                        let mut pending = pending_commands.write().await;
-                        for (_, pending_cmd) in pending.drain() {
-                            let _ = pending_cmd.response_tx.send(CommandResponse {
-                                id: String::new(),
-                                success: false,
-                                message: format!(
-                                    "Agent disconnected by operator: {}", reason
-                                ),
-                                execution_time_ms: 0,
-                                mouse_x: None,
-                                mouse_y: None,
-                                position_captured: None,
-                                metadata: std::collections::HashMap::new(),
-                            });
-                        }
-                        drop(pending);
+                        // Fail queued and in-flight commands so CLI callers unblock
+                        // immediately and nothing is left for the next agent. The
+                        // in-flight arm used to report an empty command id, so a
+                        // caller could not match the failure to its request.
+                        Self::fail_outstanding(
+                            &command_queue,
+                            &pending_commands,
+                            &format!("Agent disconnected by operator: {}", reason),
+                        ).await;
 
                         registry.unregister_agent(&connection_id, Some(reason)).await;
                         break;
                     }
+
+                    // Reap anything whose caller has stopped waiting. queue_command
+                    // clears its own entry on timeout, but only while that future is
+                    // alive; a cancelled RPC leaves the entry behind.
+                    Self::reap_expired(&command_queue, &pending_commands, COMMAND_TIMEOUT).await;
 
                     // --- Regular heartbeat ---
                     let heartbeat = ServerHeartbeat {
@@ -426,7 +479,7 @@ impl StreamHandler {
                                     _request: queued.request,
                                     response_tx: queued.response_tx,
                                     sent_at: Instant::now(),
-                                    timeout: Duration::from_secs(30),
+                                    timeout: COMMAND_TIMEOUT,
                                 },
                             );
                         }
@@ -438,50 +491,81 @@ impl StreamHandler {
         }
         
         info!("Outgoing message handler ended for {}", connection_id);
+        // Nothing can be dispatched once this loop stops. Draining here covers the
+        // exits the incoming handler does not see — a closed server_tx, or a send
+        // failure mid-drain.
+        Self::fail_outstanding(
+            &command_queue,
+            &pending_commands,
+            "Agent stream ended before the command was delivered",
+        ).await;
         Ok(())
     }
     
-    /// Clean up expired pending commands
+    /// Clean up expired commands, queued as well as in flight.
     pub async fn cleanup_expired_commands(&self) {
-        let mut pending = self.pending_commands.write().await;
+        Self::reap_expired(&self.command_queue, &self.pending_commands, self.command_timeout).await;
+    }
+
+    /// Drop commands whose caller is no longer waiting.
+    ///
+    /// `queue_command` clears its own entry on timeout, but only if that future is
+    /// still running. When the caller's RPC is cancelled — client killed, channel
+    /// dropped — nothing runs, and a queued entry would otherwise sit there until an
+    /// agent attached and actuated it. Run from the heartbeat tick so the window is
+    /// one heartbeat rather than unbounded.
+    async fn reap_expired(
+        command_queue: &Arc<RwLock<VecDeque<QueuedCommand>>>,
+        pending_commands: &Arc<RwLock<HashMap<String, PendingCommand>>>,
+        queue_timeout: Duration,
+    ) {
         let now = Instant::now();
-        
-        // Collect expired command IDs
-        let expired: Vec<String> = pending
-            .iter()
-            .filter_map(|(command_id, pending_cmd)| {
-                let elapsed = now.duration_since(pending_cmd.sent_at);
-                if elapsed > pending_cmd.timeout {
-                    Some(command_id.clone())
-                } else {
-                    None
+
+        let stale: Vec<QueuedCommand> = {
+            let mut queue = command_queue.write().await;
+            let mut stale = Vec::new();
+            while let Some(front) = queue.front() {
+                // The queue is in insertion order, so the first live entry ends it.
+                if now.duration_since(front.queued_at) <= queue_timeout {
+                    break;
                 }
-            })
-            .collect();
-        
-        // Remove expired commands and send timeout responses
-        for command_id in expired {
-            if let Some(pending_cmd) = pending.remove(&command_id) {
-                let elapsed = now.duration_since(pending_cmd.sent_at);
-                
-                warn!(
-                    "Removing expired command {} (elapsed: {:?})",
-                    command_id,
-                    elapsed
-                );
-                
-                // Send timeout error (can now move response_tx)
-                let _ = pending_cmd.response_tx.send(CommandResponse {
-                    id: command_id.clone(),
-                    success: false,
-                    message: format!("Command timed out after {:?}", elapsed),
-                    execution_time_ms: elapsed.as_millis() as i64,
-                    mouse_x: None,
-                    mouse_y: None,
-                    position_captured: None,
-                    metadata: std::collections::HashMap::new(),
-                });
+                stale.push(queue.pop_front().expect("front() was Some"));
             }
+            stale
+        };
+        for command in stale {
+            let waited = now.duration_since(command.queued_at);
+            warn!(
+                "Discarding command {} never delivered to an agent (queued {:?} ago)",
+                command.request.id, waited
+            );
+            let id = command.request.id.clone();
+            let _ = command.response_tx.send(Self::undeliverable(
+                id,
+                "Command expired before an agent was available",
+            ));
+        }
+
+        let expired: Vec<(String, PendingCommand)> = {
+            let mut pending = pending_commands.write().await;
+            let ids: Vec<String> = pending
+                .iter()
+                .filter(|(_, cmd)| now.duration_since(cmd.sent_at) > cmd.timeout)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id).map(|cmd| (id, cmd)))
+                .collect()
+        };
+        for (command_id, command) in expired {
+            let elapsed = now.duration_since(command.sent_at);
+            warn!("Removing expired command {} (elapsed: {:?})", command_id, elapsed);
+            let mut response = Self::undeliverable(
+                command_id,
+                &format!("Command timed out after {:?}", elapsed),
+            );
+            response.execution_time_ms = elapsed.as_millis() as i64;
+            let _ = command.response_tx.send(response);
         }
     }
     
@@ -513,9 +597,95 @@ mod tests {
         
         // Queue a command (will timeout since no agent)
         let result = handler.queue_command(request).await;
-        
+
         // Should timeout since no agent to respond
         assert!(result.is_err());
+
+        // And it must not still be queued. It used to be: the timeout path cleared
+        // `pending_commands`, which a command that was never dispatched had never
+        // entered, leaving it in `command_queue` for the next agent to actuate long
+        // after the caller was told it timed out.
+        let (queued, pending) = handler.get_queue_stats().await;
+        assert_eq!((queued, pending), (0, 0), "the timed-out command is still queued");
+    }
+
+    fn queued(id: &str, at: Instant) -> (QueuedCommand, oneshot::Receiver<CommandResponse>) {
+        let (response_tx, response_rx) = oneshot::channel();
+        (
+            QueuedCommand {
+                request: CommandRequest {
+                    id: id.to_string(),
+                    human_command: "press #r".to_string(),
+                    argv: vec!["__write__".to_string()],
+                    ..Default::default()
+                },
+                response_tx,
+                queued_at: at,
+            },
+            response_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_reaper_discards_commands_whose_caller_stopped_waiting() {
+        // A cancelled RPC runs no timeout branch, so nothing would clear the entry.
+        let registry = Arc::new(ConnectionRegistry::new(true, 100, "127.0.0.1".to_string()));
+        let handler = StreamHandler::new(registry, "srv-test".to_string());
+
+        let (command, response_rx) = queued("cmd-abandoned", Instant::now());
+        handler.command_queue.write().await.push_back(command);
+
+        StreamHandler::reap_expired(
+            &handler.command_queue,
+            &handler.pending_commands,
+            Duration::ZERO,
+        ).await;
+
+        assert_eq!(handler.get_queue_stats().await.0, 0, "the stale command survived");
+        let response = response_rx.await.expect("the caller was never answered");
+        assert!(!response.success);
+        assert_eq!(response.id, "cmd-abandoned", "the failure must name its request");
+    }
+
+    #[tokio::test]
+    async fn a_live_command_is_not_reaped() {
+        let registry = Arc::new(ConnectionRegistry::new(true, 100, "127.0.0.1".to_string()));
+        let handler = StreamHandler::new(registry, "srv-test".to_string());
+
+        let (command, _rx) = queued("cmd-fresh", Instant::now());
+        handler.command_queue.write().await.push_back(command);
+
+        StreamHandler::reap_expired(
+            &handler.command_queue,
+            &handler.pending_commands,
+            COMMAND_TIMEOUT,
+        ).await;
+
+        assert_eq!(handler.get_queue_stats().await.0, 1, "a live command was discarded");
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_leaves_nothing_for_the_next_agent() {
+        let registry = Arc::new(ConnectionRegistry::new(true, 100, "127.0.0.1".to_string()));
+        let handler = StreamHandler::new(registry, "srv-test".to_string());
+
+        let (first, first_rx) = queued("cmd-1", Instant::now());
+        let (second, second_rx) = queued("cmd-2", Instant::now());
+        handler.command_queue.write().await.push_back(first);
+        handler.command_queue.write().await.push_back(second);
+
+        StreamHandler::fail_outstanding(
+            &handler.command_queue,
+            &handler.pending_commands,
+            "Agent disconnected before the command was delivered",
+        ).await;
+
+        assert_eq!(handler.get_queue_stats().await, (0, 0));
+        for (rx, id) in [(first_rx, "cmd-1"), (second_rx, "cmd-2")] {
+            let response = rx.await.expect("caller was never answered");
+            assert!(!response.success);
+            assert_eq!(response.id, id, "the failure must name its request");
+        }
     }
     
     #[tokio::test]

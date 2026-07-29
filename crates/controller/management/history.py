@@ -201,7 +201,12 @@ class ServerHistoryStore:
             ).encode()
             blob = self._fernet.encrypt(payload)
             tmp = self._path.with_name(self._path.name + '.tmp')
-            tmp.write_bytes(blob)
+            # Created 0600 rather than written then chmod-ed: in between, the file
+            # sits at the process umask. The ciphertext is not readable without the
+            # keyring key, but the mode should not depend on that.
+            descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, 'wb') as handle:
+                handle.write(blob)
             if os.name != 'nt':
                 os.chmod(tmp, 0o600)
             os.replace(tmp, self._path)

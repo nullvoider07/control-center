@@ -151,3 +151,47 @@ def test_gen_certs_emits_ca_and_server_material(tmp_path):
 
     if os.name != "nt":
         assert stat.S_IMODE(os.stat(key).st_mode) == 0o600
+
+
+# ---- files are created restricted, not restricted after the fact -----------
+# Writing at the process umask and chmod-ing afterwards leaves a window where the
+# content is on disk group- and world-readable. Asserted with os.chmod disabled, so
+# the test distinguishes "created 0600" from "fixed up to 0600".
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX perms only")
+def test_secure_write_creates_the_file_already_restricted(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "chmod", lambda *a, **kw: None)
+    old_umask = os.umask(0)
+    try:
+        p = tmp_path / "sub" / "session.json"
+        cli._secure_write(p, "sensitive typed history")
+    finally:
+        os.umask(old_umask)
+
+    assert p.read_text() == "sensitive typed history"
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600, \
+        "the file existed at the umask before being tightened"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX perms only")
+def test_history_flush_creates_the_file_already_restricted(tmp_path, monkeypatch):
+    from controller.management.history import ServerHistoryStore
+
+    pytest.importorskip("cryptography")
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key()
+    store = ServerHistoryStore(base_dir=tmp_path / "history", key_provider=lambda: key)
+    store.load(("srv-test", 1234))
+    assert store._path is not None, "the store did not activate"
+
+    monkeypatch.setattr(os, "chmod", lambda *a, **kw: None)
+    old_umask = os.umask(0)
+    try:
+        store.append("press ^s")
+    finally:
+        os.umask(old_umask)
+
+    assert store._path.exists(), "nothing was written"
+    assert stat.S_IMODE(os.stat(store._path).st_mode) == 0o600, \
+        "the history file existed at the umask before being tightened"

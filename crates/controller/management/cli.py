@@ -186,10 +186,18 @@ def _restrict_perms(path: Union[str, Path]) -> None:
         pass
 
 def _secure_write(path: Union[str, Path], text: str) -> None:
-    """Write text to path with owner-only permissions (0700 dir / 0600 file)."""
+    """Write text to path with owner-only permissions (0700 dir / 0600 file).
+
+    The file is created with the restrictive mode rather than chmod-ed after the
+    fact: between an open() at the process umask and the chmod, the content sits on
+    disk group- and world-readable. _restrict_perms still runs afterwards, because
+    O_CREAT does not change the mode of a file that already exists.
+    """
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text)
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        handle.write(text)
     _restrict_perms(p)
 
 def _restrict_export(result: Union[str, Path, Dict[str, str]]) -> None:
@@ -2741,14 +2749,23 @@ def update(check_only):
         try:
             try:
                 import requests
-                download_response = requests.get(download_url, stream=True, timeout=30)
+                # Same headers as the checksum fetch. Without them this request is
+                # anonymous even when a token is configured, so it can be refused by
+                # rate limiting that the checksum fetch just passed.
+                download_response = requests.get(
+                    download_url, headers=_github_headers(), stream=True, timeout=30)
                 download_response.raise_for_status()
                 with open(temp_file, 'wb') as f:
                     for chunk in download_response.iter_content(chunk_size=8192):
                         f.write(chunk)
             except ImportError:
                 import urllib.request
-                urllib.request.urlretrieve(download_url, temp_file)
+                # urlretrieve takes no timeout, so a stalled connection would hang
+                # the updater indefinitely.
+                request = urllib.request.Request(download_url, headers=_github_headers())
+                with urllib.request.urlopen(request, timeout=30) as response, \
+                        open(temp_file, 'wb') as f:
+                    shutil.copyfileobj(response, f)
 
             click.echo(click.style("Download complete", fg='green'))
 
@@ -2810,10 +2827,18 @@ def update(check_only):
             click.echo(f"Installing to {install_dir}...")
             install_dir.mkdir(parents=True, exist_ok=True)
             
+            # Every binary the installers place, or the update leaves a mixed
+            # installation. generate-token was missing here while install.sh and
+            # install.ps1 both install it, so it stayed at whatever version was last
+            # installed from scratch — and it shares the Claims definition with the
+            # server, so a change to the token format would have it minting tokens
+            # the updated server rejects.
             if os_name == 'windows':
-                binaries = ['control-center.exe', 'control-center-server.exe', 'control-center-agent.exe']
+                binaries = ['control-center.exe', 'control-center-server.exe',
+                            'control-center-agent.exe', 'generate-token.exe']
             else:
-                binaries = ['control-center', 'control-center-server', 'control-center-agent']
+                binaries = ['control-center', 'control-center-server',
+                            'control-center-agent', 'generate-token']
             
             for binary in binaries:
                 if not (extracted_bin_dir / binary).exists():
@@ -3006,9 +3031,22 @@ def uninstall(purge, yes):
                 try:
                     temp_path = binary_path.with_suffix('.delete_me')
                     if temp_path.exists():
-                        try: temp_path.unlink()
-                        except: pass
+                        try:
+                            temp_path.unlink()
+                        except OSError:
+                            pass
                     binary_path.rename(temp_path)
+                    # A running executable cannot be deleted on Windows, so the file
+                    # is renamed and a detached cmd removes it after this process
+                    # exits. The redirect and the `&` are cmd syntax, so this has to
+                    # stay a command string rather than an argv list.
+                    #
+                    # The path is interpolated into that string inside double quotes.
+                    # That is sound only because Windows forbids `"` in a path — which
+                    # is a property of the filesystem, not of this code, so it is
+                    # asserted rather than assumed.
+                    if '"' in str(temp_path):
+                        raise ValueError(f"refusing to shell-quote path: {temp_path}")
                     cmd = f'cmd /c ping 127.0.0.1 -n 3 > nul & del "{temp_path}"'
                     subprocess.Popen(cmd, shell=True,
                                      creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)

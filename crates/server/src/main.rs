@@ -107,6 +107,11 @@ pub struct ControlCenterService {
     rate_limiter: Arc<tokio::sync::RwLock<RateLimiter>>,
     metrics: Arc<tokio::sync::RwLock<ServerMetrics>>,
     event_tx: broadcast::Sender<proto::CommandEvent>,
+    /// Subjects whose tokens are refused regardless of signature or expiry, from
+    /// CC_REVOKED_SUBJECTS. Read once at startup: a revocation takes effect on the
+    /// next restart, which is the same requirement as rotating the secret but
+    /// without invalidating every other token.
+    revoked_subjects: std::collections::HashSet<String>,
 }
 
 // Metrics structure for monitoring server performance and security
@@ -131,6 +136,7 @@ impl ControlCenterService {
         stream_handler: Arc<stream_handler::StreamHandler>,
         listen_address: String,
         event_tx: broadcast::Sender<proto::CommandEvent>,
+        revoked_subjects: std::collections::HashSet<String>,
     ) -> Self {
         Self {
             jwt_secret,
@@ -144,6 +150,7 @@ impl ControlCenterService {
             rate_limiter: Arc::new(tokio::sync::RwLock::new(RateLimiter::new(100, 60))),
             metrics: Arc::new(tokio::sync::RwLock::new(ServerMetrics::default())),
             event_tx,
+            revoked_subjects,
         }
     }
     
@@ -162,6 +169,14 @@ impl ControlCenterService {
             &validation,
         ) {
             Ok(data) => {
+                // A signed token cannot be withdrawn, so without this the only answer
+                // to a leaked credential is rotating JWT_SECRET — which invalidates
+                // every other token too, including the one baked into the guest image.
+                // This revokes one principal and leaves the rest working.
+                if self.revoked_subjects.contains(&data.claims.sub) {
+                    warn!("Rejecting token for revoked subject '{}'", data.claims.sub);
+                    return Err(Status::unauthenticated("Token has been revoked"));
+                }
                 debug!("Token validated for user: {}", data.claims.sub);
                 Ok(data.claims)
             }
@@ -961,6 +976,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, _) = broadcast::channel::<proto::CommandEvent>(256);
 
     // Create service
+    // Comma-separated JWT subjects to refuse. The answer to a leaked credential that
+    // does not require rotating the secret and re-baking the guest image.
+    let revoked_subjects: std::collections::HashSet<String> = std::env::var("CC_REVOKED_SUBJECTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !revoked_subjects.is_empty() {
+        let mut names: Vec<&str> = revoked_subjects.iter().map(String::as_str).collect();
+        names.sort();
+        warn!("Refusing tokens for revoked subject(s): {}", names.join(", "));
+    }
+
     let service = ControlCenterService::new(
         jwt_secret.clone(),
         jwt_audience.clone(),
@@ -971,6 +1000,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_handler,
         listen_address,
         event_tx,
+        revoked_subjects,
     );
 
     info!("Server will listen on {}", addr);

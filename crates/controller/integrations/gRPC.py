@@ -268,7 +268,9 @@ class GRPCClient:
                 self.connected = False
                 return False
             return True
-        except:
+        except Exception:
+            # Bare `except` also swallowed KeyboardInterrupt, so a Ctrl+C landing
+            # inside this check was reported as a connection state.
             return self._connected
     
     # Public method to get agent information (OS, version, capabilities)
