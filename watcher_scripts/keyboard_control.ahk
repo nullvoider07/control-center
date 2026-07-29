@@ -25,7 +25,11 @@ if (A_Args.Length > 0 and A_Args[1] = "watcher") {
                 ; Ignore errors
             }
         }
-        Sleep 50
+        ; Poll interval, so it is also the average latency added to every command
+        ; before it is even read. 50ms here cost ~25ms per command for nothing;
+        ; FileExist at 100Hz is far cheaper than the position tracker already
+        ; running at the same rate in mouse_control.ahk.
+        Sleep 10
     }
     ExitApp
 }
@@ -48,8 +52,17 @@ ExitApp
 
 ; --- SHARED LOGIC ---
 ExecuteKeyboard(action, payload) {
-    ; CRITICAL: Wait for process to stabilize before sending input
-    Sleep 500
+    ; Settle before sending. This was 500ms on every command, which is a UI-launch
+    ; wait applied to every keystroke — including the long runs of ordinary typing
+    ; into an already-focused window that make up most of a capture session.
+    ;
+    ; The launch case is guarded on the controller side, where the knowledge
+    ; actually is: windows_actuation.py sleeps after the commands that open a UI
+    ; (`press #r`, `press #`, `press {LWin}`, `press !{Tab}`, `press ^+{Esc}`).
+    ; Duplicating that here as an unconditional wait taxed every other command to
+    ; re-guard a case already handled. What is left is the short pause for input to
+    ; be accepted at all.
+    Sleep 40
     
     switch action {
         case "type":
@@ -58,6 +71,8 @@ ExecuteKeyboard(action, payload) {
         case "press":
             Send payload
     }
-    
-    Sleep 100
+
+    ; Trailing settle. Delays when the watcher picks up the *next* command, so it is
+    ; paid by every command in a sequence.
+    Sleep 20
 }

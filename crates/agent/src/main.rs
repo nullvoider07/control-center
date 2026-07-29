@@ -585,10 +585,23 @@ impl AgentServiceImpl {
             return MousePosition { x: 0, y: 0, captured: false };
         }
 
+        // A short pause before the first readback so the common case is a single
+        // read. It is not the correctness mechanism — the loop below is, and it was
+        // added after this constant was chosen. With a verify-and-retry loop behind
+        // it, a settle long enough to cover the worst case just taxes every command
+        // that did not need it; a settle short enough to occasionally read early
+        // costs one 50ms re-read on those, and nothing on the rest.
+        //
+        // Measured on the Linux harness, interleaved 50/10/50/10 to keep the machine
+        // state comparable, 60 moves into a mapped window per run:
+        //   50ms settle -> p50 74.9 / 73.3ms, p95 91.1 / 87.7ms, 60/60 captured
+        //   10ms settle -> p50 25.2 / 27.4ms, p95 43.1 / 42.5ms, 60/60 captured
+        // No run at 10ms lost a capture, so the shorter settle is not being paid for
+        // in re-reads. Windows is left alone: it was already 20/10ms.
         #[cfg(target_os = "windows")]
         let settle_ms = if action.is_here_command { 10 } else { 20 };
         #[cfg(not(target_os = "windows"))]
-        let settle_ms = 50;
+        let settle_ms = 10;
 
         tokio::time::sleep(tokio::time::Duration::from_millis(settle_ms)).await;
         let mut position = self.capture_mouse_position().await;

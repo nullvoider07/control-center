@@ -22,7 +22,8 @@ if (A_Args.Length > 0 and A_Args[1] = "watcher") {
                 ; Ignore errors
             }
         }
-        Sleep 50
+        ; Poll interval, and so the average latency before a command is even read.
+        Sleep 10
     }
     ExitApp
 }
@@ -64,9 +65,12 @@ ExecuteCommand(args) {
         action := args[3]
         paramOffset := 4
 
-        ; Move and Wait
+        ; Move, then let the pointer settle before the click lands. 200ms was paid
+        ; by every coordinate mouse command; the agent re-reads and verifies the
+        ; position afterwards, so an occasional early read is corrected rather than
+        ; reported.
         MouseMove x, y, 0
-        Sleep 200
+        Sleep 25
     }
 
     ; 3. Perform Action
@@ -106,15 +110,20 @@ ExecuteCommand(args) {
             dest_x := args[paramOffset]
             dest_y := args[paramOffset+1]
 
+            ; Dwell either side of the drag so the target registers press, motion
+            ; and release as one gesture. 50ms matches DEFAULT_DRAG_DWELL_MS in
+            ; macos_actuation.py, so a drag dwells the same on both platforms.
             Click "Down"
-            Sleep 100
+            Sleep 50
             MouseMove dest_x, dest_y, 50
-            Sleep 100
+            Sleep 50
             Click "Up"
 
         default:
             ; Unknown action
     }
 
-    Sleep 100
+    ; Trailing settle. Delays pickup of the next command, so every command in a
+    ; sequence pays it.
+    Sleep 20
 }
