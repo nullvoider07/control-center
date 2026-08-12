@@ -1,7 +1,7 @@
 # Control Center - Desktop Actuation Tool
 
-**Version:** 1.2.2  
-**Last Updated:** July 2026  
+**Version:** 1.3.0  
+**Last Updated:** August 2026  
 **Developer:** Kartik A (NullVoider)
 
 ---
@@ -94,7 +94,8 @@ Control Center consists of three components:
 - ✅ **Line Editing & History**: The interactive console supports readline line editing (arrow-key cursor movement) and up/down command history that persists across `connect` sessions, is cleared when the server restarts, and is encrypted at rest (key in the OS keyring)
 - ✅ **Live Command Streaming**: WatchCommands gRPC stream for real-time event observation by external tools
 - ✅ **Auto OS Detection**: Server detects connected agent OS and dispatches commands to the correct backend automatically
-- ✅ **Position Tracking**: All mouse commands automatically report final cursor coordinates after execution
+- ✅ **Modifier-Held Mouse Actions**: Any pointer verb takes the same `^ + ! #` prefix `press` uses — `770 310 #left`, `here ^+double`, `200 300 !drag 900 640`. The modifier is held and released inside a single actuation, and the *agent* refuses an argv that would leave one held, rather than relying on the command builders to pair them
+- ✅ **Position Tracking**: All mouse commands automatically report final cursor coordinates after execution, and a drag reports its destination on every platform
 - ✅ **TLS by Default**: All gRPC traffic is encrypted; the server refuses to start without a certificate unless insecure mode is explicitly requested. `control-center gen-certs` generates local development material
 - ✅ **JWT Authentication**: Scope-based token authentication on every RPC that returns data or acts (`Ping` is the sole liveness exception)
 - ✅ **Shell-Free Actuation**: Commands travel as a structured argument vector and are executed directly. The agent never invokes a shell, and every argument is validated against an actuation grammar before a process is spawned
@@ -249,6 +250,8 @@ Commands are written to `C:\mouse_cmd.txt` and `C:\keyboard_cmd.txt` and picked 
 Mouse commands use `cliclick` (a command-line tool for simulating mouse events). Keyboard commands — including `type` and all modifier+key combinations — use `osascript` with AppleScript's `keystroke` and `key code` commands, each passed as a single argument. Accepted AppleScript is restricted to those two forms; a free-form script is refused.
 
 Scrolling is the one action needing two binaries (a `cliclick` focus click followed by an AppleScript key-repeat loop). It is sent as a bounded `__scroll__` instruction that the agent expands itself, so the two programs run in sequence without a shell and the action is still recorded as a single event.
+
+Middle click is the one action `cliclick` cannot perform at all — it has no middle-button command — so it is sent as a bounded `__middle__` instruction and the agent posts the event itself through JXA (`osascript -l JavaScript`), which reaches CoreGraphics' `CGEventCreateMouseEvent`. macOS supports the button natively; the gap was in the tool, not the platform. Modifiers ride on the event via `CGEventSetFlags` rather than a held key, so a failed script cannot leave one stuck down. As with `__scroll__`, the client sends only a click point and a list of modifier names — never script text.
 
 **Linux — xdotool**
 
@@ -610,6 +613,7 @@ binaries can launch other programs if handed arbitrary arguments:
 | `osascript` | Only `-e` pairs whose script matches one of two anchored templates (`keystroke "<literal>"` and `key code <n> [using {…}]`). Free-form scripts, and therefore `do shell script`, are refused |
 | `__write__` | Writes only to `C:\keyboard_cmd.txt` or `C:\mouse_cmd.txt` (Windows AHK input files). The **destination** is constrained; the **content** is not — see below |
 | `__scroll__` | A bounded scroll instruction the agent expands into a fixed cliclick + AppleScript sequence |
+| `__middle__` | A bounded middle-click instruction (click point + modifier names) the agent expands into a fixed JXA CoreGraphics call. No script text crosses the wire |
 
 Three subtleties worth knowing, because they are easy to get wrong:
 
@@ -717,15 +721,82 @@ The actuation command language is the same across all three platforms. The contr
 | `<x> <y> left` | Move to coordinates and left-click |
 | `<x> <y> right` | Move to coordinates and right-click |
 | `<x> <y> double` | Move to coordinates and double-click |
-| `<x> <y> middle` | Move to coordinates and middle-click |
+| `<x> <y> middle` | Move to coordinates and middle-click (macOS: working since 1.3.0) |
+| `<x> <y> click` | Alias for `left` (macOS only) |
 | `<x> <y> triple` | Move to coordinates and triple-click (macOS only) |
-| `<x> <y> scroll_up [n]` | Move to coordinates and scroll up (optionally n times) |
-| `<x> <y> scroll_down [n]` | Move to coordinates and scroll down (optionally n times) |
+| `<x> <y> scroll_up [n]` | Move to coordinates and scroll up (n notches, default 5) |
+| `<x> <y> scroll_down [n]` | Move to coordinates and scroll down (n notches, default 5) |
+| `<x> <y> scroll_left [n]` / `scroll_right [n]` | Horizontal scroll (macOS only) |
 | `<x> <y> drag <x2> <y2>` | Click and drag from (x,y) to (x2,y2) |
 | `<x> <y> drag <x2> <y2> dwell <ms>` | macOS: same, with a custom pause after the press and each move (1–5000 ms, default 50) |
 | `<x> <y> drag via <ax> <ay> [via …] to <x2> <y2>` | macOS: drag along a path (up to 16 waypoints) |
+| `<x> <y> hold` / `<x> <y> release` | Press and hold a button, then release it — see [Held Mouse Buttons](#held-mouse-buttons) |
 | `here <action>` | Perform action at the current cursor position |
+| `here drag <x2> <y2>` | Drag from the current position (Windows only) |
 | `position` | Query and return the current mouse cursor position |
+| `<x> <y> <mods><action>` | Hold modifier keys for the duration of the action |
+| `here <mods><action>` | Same, at the current cursor position |
+
+### Modifier-held mouse actions
+
+A pointer verb may carry the same modifier prefix `press` uses — `^` Ctrl, `+` Shift,
+`!` Alt/Option, `#` Cmd on macOS / Super on Linux / Win on Windows — combined in any
+order:
+
+```
+770 310 #left              Cmd-click (add to a discontiguous selection)
+770 310 +left              Shift-click (extend a range selection)
+200 300 !drag 900 640      Opt-drag (copy instead of move)
+here ^+double              Ctrl+Shift double-click at the cursor
+770 310 ^scroll_down 3     Ctrl-scroll (zoom, in applications that zoom)
+```
+
+The modifier is held and released inside a **single** actuation, so one command is
+still one recorded step and no modifier is left down between commands. There is
+deliberately no verb that presses a modifier in one command and releases it in
+another: if the second command never arrived, the guest would be left in a
+modifier-stuck state with nothing tracking it.
+
+This is enforced by the agent, not merely by the command builders. An argv carrying a
+`kd:` without its `ku:` (macOS) or a `keydown` without its `keyup` (Linux) is refused,
+because both set the modifier on the *system* — it outlives the process that pressed it
+and reinterprets every later command. The builders emit both halves, but the builder is
+not the boundary: anything holding the `execute` scope reaches the agent directly.
+
+**Windows is the exception, and it is a real one.** Modifiers there travel as content in
+`mouse_cmd.txt` and are released by an AutoHotkey `finally`, which is in-process only. If
+the watcher is killed mid-command the modifier stays down, and nothing on the host can
+observe or clear it. Restart the watcher, or press and release the modifier physically.
+
+Constraints worth knowing:
+
+- **`move` and `position` reject a prefix** rather than ignoring it. Accepting one
+  silently would record a gesture that was never performed.
+- **Only the coordinate and `here` forms take modifiers.** A bare `#left` is already
+  read as the keypress `press #left`, and that reading is unchanged.
+- **ASCII symbols only** on mouse actions (`#`, not `⌘`). `press` still accepts the
+  Unicode glyphs. The agent composes the recorded string from the same prefix and
+  reads the ASCII forms, so a glyph accepted here would actuate the gesture and record
+  it as typed text.
+- **Modifiers apply to the verbs each backend already has.** macOS adds `triple` and
+  the horizontal scroll directions; Linux and Windows have neither.
+- **macOS scroll is an arrow-key repeat, not a wheel event.** `#scroll_down` there is
+  Cmd+Down — a real gesture, but not the wheel-zoom that Cmd+scroll performs in
+  applications that zoom. Linux and Windows drive the real wheel buttons and do zoom.
+- **A modified `hold` carries the modifier at the press only.** It is released before
+  the command returns, because the matching `release` is a separate command; a drag
+  that needs the modifier held throughout should use the `drag` verb.
+- **A scroll always records its notch count, including when the command omits one.**
+  `770 310 scroll_down` performs 5 notches and records `Scrolled down 5 notches at
+  X=770, Y=310`. The recorded sentence is the only stored description of the gesture,
+  so a count left out of it is lost rather than implied — and an explicit count keeps
+  the record meaning the same distance if a backend default ever changes. The default
+  is one number shared by all three backends and the agent; a test fails if any of the
+  four drifts.
+
+This spans both halves: the controller emits the modifier tokens, the agent's grammar
+accepts them, and the agent names the modifier in the recorded string, so **the
+controller and the agent have to be upgraded together.**
 
 The default single-hop drag with its 50 ms dwells is enough for a selection drag,
 but drag-and-drop targets and some overlay UIs only track a slower or multi-step
@@ -911,6 +982,23 @@ against and report their plain readback.
 > valid screen coordinate. Without checking the flag, "the cursor was at the origin"
 > and "no position was captured" are indistinguishable.
 
+**A drag reports its destination, on every platform.** This changed on Windows in
+1.3.0 and is visible on the wire, so a consumer that reads these fields should know
+which side of the change a record came from:
+
+| | `500 400 drag 900 700` reports | `here drag 700 500` reports |
+|---|---|---|
+| Windows, before 1.3.0 | `(500, 400)` — the origin | the *pre-drag* position |
+| Windows, 1.3.0 onward | `(900, 700)` — the destination | `(700, 500)` — the destination |
+| macOS, Linux (unchanged) | the destination | n/a (`here drag` is Windows-only) |
+
+Both of the old Windows values carried `position_captured: true`, so nothing downstream
+could tell them from a correct reading. The cause was that Windows actuation is
+asynchronous — the agent writes a command file that the AutoHotkey watcher polls — so the
+readback raced the gesture and settled at its start. Records written by agents before
+1.3.0 are unaffected by the fix and still carry the old values; the `agent_version` field
+on each event identifies them.
+
 ### Held Mouse Buttons
 
 `<x> <y> hold` presses a button and leaves it down until a matching `release`. The
@@ -940,12 +1028,30 @@ a recording.
 |---------|---------|-------|-------|
 | Mouse backend | AHK v2 | cliclick | xdotool |
 | Keyboard backend | AHK v2 | osascript | xdotool |
+| Middle click | ✅ | ✅ (since 1.3.0) | ✅ |
+| Modifier-held mouse actions | ✅ | ✅ | ✅ |
 | Triple-click | ❌ | ✅ | ❌ |
+| `click` (alias for `left`) | ❌ | ✅ | ❌ |
+| Horizontal scroll (`scroll_left` / `scroll_right`) | ❌ | ✅ | ❌ |
+| `here drag` | ✅ | ❌ | ❌ |
+| Drag waypoints (`via …`) and `dwell` | ❌ | ✅ | ❌ |
+| Scroll mechanism | real wheel | arrow-key repeat | real wheel |
 | Media keys | ✅ | ✅ | ❌ |
 | Super key (`#`) | Win key | Cmd | Super |
 | `{LWin}`, `{RWin}` | ✅ | ❌ | ❌ |
 | Unicode modifier chars (⌘ ⌃ ⇧ ⌥) | ❌ | ✅ | ❌ |
 | Requires display | ❌ | ❌ | ✅ (DISPLAY) |
+
+These asymmetries are real rather than incidental, and a cross-platform corpus is
+non-uniform because of them. Two consequences worth knowing before scripting against
+several backends:
+
+- **`middle` was broken on macOS before 1.3.0**, not missing — it mapped to a cliclick
+  action that does not exist and failed with "Unrecognized action shortcut". Recordings
+  made before 1.3.0 contain no successful macOS middle click.
+- **macOS scroll is an arrow-key repeat, not a wheel event**, so `#scroll_down` there is
+  Cmd+Down rather than the wheel-zoom that Cmd+scroll performs in applications that
+  zoom. Windows and Linux drive the real wheel and do zoom.
 
 ---
 
@@ -1063,7 +1169,7 @@ control-center watch --host 192.168.1.10
 **Text output format:**
 
 ```
-[✓] 2026-02-25T12:58:04.286Z | mouse:left | 960 540 left | 42ms
+[✓] 2026-02-25T12:58:04.286Z | mouse:left | Left-clicked at X=960, Y=540 | 42ms
 [✗] 2026-02-25T12:58:05.100Z | keyboard:type | type badcommand | 3ms | ERROR: execution failed
 [heartbeat] 2026-02-25T12:58:10.000Z — agent alive (session: abc123)
 ```
@@ -1071,7 +1177,7 @@ control-center watch --host 192.168.1.10
 **JSON output format** (one JSON object per line):
 
 ```json
-{"session_id": "abc123", "agent_id": "...", "timestamp": "2026-02-25T12:58:04.286Z", "raw_command": "960 540 left", "action_type": "mouse", "action_subtype": "left", "success": true, "execution_time_ms": 42, "mouse_x": 960, "mouse_y": 540, "is_heartbeat": false, ...}
+{"session_id": "abc123", "agent_id": "...", "timestamp": "2026-02-25T12:58:04.286Z", "raw_command": "Left-clicked at X=960, Y=540", "action_type": "mouse", "action_subtype": "left", "success": true, "execution_time_ms": 42, "mouse_x": 960, "mouse_y": 540, "position_captured": true, "is_heartbeat": false, ...}
 ```
 
 ---
@@ -1713,7 +1819,7 @@ includes text typed into the guest, so it is not safe to expose unauthenticated.
 | `agent_version` | string | Agent version |
 | `os_type` | string | `WINDOWS` / `MACOS` / `LINUX` |
 | `timestamp` | string | ISO 8601 with milliseconds |
-| `raw_command` | string | Exact command as entered (e.g., `^a`, `960 540 left`) |
+| `raw_command` | string | The agent's rendered description of the step — `Left-clicked at X=960, Y=540`, `Scrolled down 5 notches at X=770, Y=310`, `Typed: hello`. **Not** the command as entered, despite the name. It falls back to the command as entered only when the agent errored or returned an empty message. See the note below on what in it is measured and what is taken from the caller |
 | `action_type` | string | `mouse` / `keyboard` / `position` |
 | `action_subtype` | string | `left`, `right`, `type`, `press`, etc. |
 | `is_here_command` | bool | True if command used the `here` keyword |
@@ -1725,6 +1831,16 @@ includes text typed into the guest, so it is not safe to expose unauthenticated.
 | `position_captured` | bool | Whether the coordinate was read back and matched the request. False for keyboard steps and for any mouse step whose position could not be verified; the coordinates are then `(0, 0)`, which is a valid screen position, so this flag is the only valid guard |
 | `is_heartbeat` | bool | True for keep-alive events, false for real commands |
 | `agent_alive` | bool | Always true while the stream is open |
+
+> **What in an event is measured, and what is taken on trust.** The coordinates,
+> `position_captured`, `success` and the timing are produced by the agent from what it
+> actually did. The *description of the gesture* is not: `action_type`,
+> `action_subtype` and `is_here_command` are parsed from the caller-supplied command
+> string, and so is the verb phrase the agent wraps around the measured coordinates in
+> `raw_command`. Nothing reconciles that string against the argument vector that was
+> validated and executed, so a caller holding the `execute` scope can perform one
+> gesture and have it recorded as another. Nothing observed suggests this has happened;
+> it is stated because a recording is used as ground truth downstream.
 
 **Consuming the stream programmatically:**
 
@@ -1923,7 +2039,7 @@ rollout during a pause in any recording or capture activity rather than mid-sess
 
 ---
 
-**Last Updated:** July 2026  
+**Last Updated:** August 2026  
 **Developer:** Kartik A (NullVoider)
 
 ---
