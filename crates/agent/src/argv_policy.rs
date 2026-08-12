@@ -32,6 +32,40 @@ pub enum Plan {
         click: String,
         key_code: u32,
         amount: u32,
+        /// Modifiers held for the scroll, as AppleScript `using`-clause elements
+        /// ("command down"). Empty when the command carries none.
+        ///
+        /// They ride on each arrow-key event rather than being posted as a separate
+        /// key-down first. A `kd:` would set the modifier globally and depend on a
+        /// later `ku:` in a *different* process to clear it: if the repeat loop failed,
+        /// the modifier would stay down across every later command with nothing
+        /// tracking it. `key code N using {…}` cannot leak that way.
+        modifiers: Vec<String>,
+    },
+    /// macOS middle click, posted as a CGEvent through JXA.
+    ///
+    /// cliclick has no middle button at all — its whole command set is
+    /// `c rc dc tc m dd du dm kd ku kp t w p cp` — so `middle` mapped to a `mc:` token
+    /// that does not exist and every middle click on macOS failed with
+    /// "Unrecognized action shortcut". macOS itself supports the button natively
+    /// (`kCGEventOtherMouseDown` with `kCGMouseButtonCenter`); the limitation was
+    /// cliclick's, not the platform's, and Linux and Windows have had `middle` working
+    /// all along.
+    ///
+    /// The agent composes the script from these bounded parameters. The client sends a
+    /// click token and a modifier list and never any script text: JXA is a full
+    /// scripting language, so accepting it over the wire would be accepting arbitrary
+    /// code execution.
+    MiddleClick {
+        click: String,
+        /// CGEventFlags bits for the modifiers held, 0 when none.
+        ///
+        /// Set on the event itself rather than bracketed with `kd:`/`ku:`, for the
+        /// same reason the scroll path rides its modifiers on each key event: a
+        /// bracket spanning two processes cannot be closed if the second one dies, and
+        /// `check_modifier_bracket` now requires a `kd:` to be closed inside the same
+        /// cliclick invocation, so spanning one was never available here.
+        flags: u64,
     },
 }
 
@@ -73,6 +107,41 @@ pub struct ButtonTransition {
     pub down: bool,
 }
 
+/// The verb and trailing arguments of a Windows watcher payload.
+///
+/// `mouse_control.ahk` accepts `here <verb> [args…]` and `<x> <y> <verb> [args…]`;
+/// anything else (a bare `position`) names no verb. The modifier prefix is stripped so
+/// `#drag` is still a drag — the same treatment `button_transition` gives a `#hold`.
+struct WatcherPayload<'a> {
+    /// The point named before the verb, which for every verb but `drag` is where the
+    /// command leaves the cursor. `None` for the `here` form, which names no point.
+    origin: Option<ExpectedPos>,
+    verb: &'a str,
+    args: &'a [&'a str],
+}
+
+fn parse_watcher_payload<'a>(tokens: &'a [&'a str]) -> Option<WatcherPayload<'a>> {
+    let (origin, verb_index) = if tokens.first() == Some(&"here") {
+        (None, 1)
+    } else {
+        let x = tokens.first()?.parse().ok()?;
+        let y = tokens.get(1)?.parse().ok()?;
+        (Some(ExpectedPos { x, y }), 2)
+    };
+    Some(WatcherPayload {
+        origin,
+        verb: tokens.get(verb_index)?.trim_start_matches(['^', '+', '!', '#']),
+        args: tokens.get(verb_index + 1..).unwrap_or(&[]),
+    })
+}
+
+/// The last `<x> <y>` pair in a token list.
+fn last_int_pair(tokens: &[&str]) -> Option<ExpectedPos> {
+    let y = tokens.last()?.parse().ok()?;
+    let x = tokens.get(tokens.len().checked_sub(2)?)?.parse().ok()?;
+    Some(ExpectedPos { x, y })
+}
+
 /// Coordinates parsed out of a `<prefix>:<x>,<y>` cliclick token.
 fn cliclick_token_pos(token: &str) -> Option<ExpectedPos> {
     let (prefix, value) = token.split_once(':')?;
@@ -104,10 +173,24 @@ impl Plan {
                 if !path.eq_ignore_ascii_case(r"C:\mouse_cmd.txt") {
                     return None;
                 }
-                let mut tokens = content.split_whitespace();
-                let x: i32 = tokens.next()?.parse().ok()?;
-                let y: i32 = tokens.next()?.parse().ok()?;
-                Some(ExpectedPos { x, y })
+                let tokens: Vec<&str> = content.split_whitespace().collect();
+                let payload = parse_watcher_payload(&tokens)?;
+                if payload.verb == "drag" {
+                    // A drag payload names both ends ("<origin> drag <destination>"),
+                    // and the destination is where it leaves the cursor. Same rule as
+                    // Bin::Cliclick below.
+                    //
+                    // Taking the leading pair — which is the acting point for every
+                    // other verb — meant the re-read loop was satisfied the instant the
+                    // cursor reached the START of the gesture. The agent then published
+                    // the point the drag left as `position_captured: true`. `here drag`
+                    // was worse: naming no leading pair, it predicted nothing and fell
+                    // to the "the cursor must not have moved" check, which a drag always
+                    // violates and which passed anyway because the read beat the
+                    // watcher.
+                    return last_int_pair(payload.args);
+                }
+                payload.origin
             }
             Plan::Run { bin, args } => match bin {
                 // The last `mousemove X Y` wins, so "mousemove X Y click 1" predicts
@@ -129,6 +212,34 @@ impl Plan {
             },
             // The focus click is the only pointer movement in a scroll.
             Plan::Scroll { click, .. } => cliclick_token_pos(click),
+            // Same shape: the click token is where the button is pressed.
+            Plan::MiddleClick { click, .. } => cliclick_token_pos(click),
+        }
+    }
+
+    /// Whether the cursor reaches `expected_pos` only after actuation this agent does
+    /// not wait for.
+    ///
+    /// The Windows watcher is asynchronous: the agent writes `C:\mouse_cmd.txt` and
+    /// returns, `mouse_control.ahk` picks it up on a 10ms poll, and a drag then ends
+    /// with a deliberately slow `MouseMove`. Measured on the guest, the cursor arrives
+    /// 110-166ms after the write — five runs each at 500px and 1190px, which differ
+    /// little because the AutoHotkey move interpolates in fixed steps rather than at a
+    /// fixed speed.
+    ///
+    /// Every other Windows command puts the cursor in place before its click, well
+    /// inside the default budget, and the other backends run their binary to
+    /// completion before returning. So this is true only for the case that needs it.
+    pub fn pointer_arrival_is_deferred(&self) -> bool {
+        match self {
+            Plan::Write { path, content } => {
+                if !path.eq_ignore_ascii_case(r"C:\mouse_cmd.txt") {
+                    return false;
+                }
+                let tokens: Vec<&str> = content.split_whitespace().collect();
+                parse_watcher_payload(&tokens).is_some_and(|p| p.verb == "drag")
+            }
+            _ => false,
         }
     }
 
@@ -144,7 +255,15 @@ impl Plan {
                     return None;
                 }
                 // The AutoHotkey watcher only drives the left button.
-                let action = content.split_whitespace().last()?;
+                //
+                // The modifier prefix is stripped first: "900 700 #hold" is still a
+                // hold, and matching the token whole would return None — leaving a
+                // button that is physically down untracked, so the console never warns
+                // and the shutdown release never fires for it.
+                let action = content
+                    .split_whitespace()
+                    .last()?
+                    .trim_start_matches(['^', '+', '!', '#']);
                 match action {
                     "hold" => Some(ButtonTransition { button: MouseButton::Left, down: true }),
                     "release" => Some(ButtonTransition { button: MouseButton::Left, down: false }),
@@ -180,6 +299,9 @@ impl Plan {
                 Bin::Osascript => None,
             },
             Plan::Scroll { .. } => None,
+            // Down and up are posted together in the one command, so nothing is left
+            // held for the shutdown release to chase.
+            Plan::MiddleClick { .. } => None,
         }
     }
 }
@@ -222,6 +344,13 @@ const MAX_REPEAT: u64 = 1_000;
 /// actuation layer emits is a 16-waypoint drag at 37 cliclick tokens.
 const MAX_ARGS: usize = 64;
 
+/// Keys `xdotool keydown`/`keyup` may hold across a pointer action.
+///
+/// Only the four modifiers. The chained pointer branch accepts these so a click can
+/// carry Ctrl or Shift; admitting the whole keysym space there would turn the mouse
+/// path into a second, unaudited way to press any key.
+const POINTER_MODIFIERS: &[&str] = &["ctrl", "shift", "alt", "super"];
+
 /// Validate an argv vector against the actuation grammar.
 pub fn validate(argv: &[String]) -> Result<Plan, String> {
     let bin = argv.first().map(|s| s.as_str()).unwrap_or("");
@@ -240,6 +369,7 @@ pub fn validate(argv: &[String]) -> Result<Plan, String> {
     match bin {
         "__write__" => validate_write(args),
         "__scroll__" => validate_scroll(args),
+        "__middle__" => validate_middle(args),
         "xdotool" => validate_xdotool(args).map(|args| Plan::Run {
             bin: Bin::Xdotool,
             args,
@@ -272,9 +402,46 @@ fn validate_write(args: &[String]) -> Result<Plan, String> {
     })
 }
 
+/// CGEventFlags bits, from CoreGraphics. Named here rather than passed through from
+/// the client so the wire carries a closed set of modifier names, never a bitmask a
+/// caller could aim at flags this grammar never intended.
+const CG_FLAG_SHIFT: u64 = 0x0002_0000;
+const CG_FLAG_CONTROL: u64 = 0x0004_0000;
+const CG_FLAG_ALTERNATE: u64 = 0x0008_0000;
+const CG_FLAG_COMMAND: u64 = 0x0010_0000;
+
+fn validate_middle(args: &[String]) -> Result<Plan, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err("__middle__ requires <click-token> [modifiers]".to_string());
+    }
+    if !is_cliclick_point("c", &args[0]) {
+        return Err(format!("Invalid middle-click token: '{}'", args[0]));
+    }
+    // A closed enumeration mapped here, matching validate_scroll: only bounded
+    // parameters cross the wire, and an unknown name is refused rather than ignored.
+    let mut flags = 0u64;
+    if let Some(list) = args.get(1) {
+        if list.is_empty() {
+            return Err("__middle__: empty modifier list".to_string());
+        }
+        for name in list.split(',') {
+            flags |= match name {
+                "cmd" => CG_FLAG_COMMAND,
+                "alt" => CG_FLAG_ALTERNATE,
+                "ctrl" => CG_FLAG_CONTROL,
+                "shift" => CG_FLAG_SHIFT,
+                _ => return Err(format!("__middle__: '{}' is not a modifier", name)),
+            };
+        }
+    }
+    Ok(Plan::MiddleClick { click: args[0].clone(), flags })
+}
+
 fn validate_scroll(args: &[String]) -> Result<Plan, String> {
-    if args.len() != 3 {
-        return Err("__scroll__ requires <click-token> <key-code> <amount>".to_string());
+    if args.len() < 3 || args.len() > 4 {
+        return Err(
+            "__scroll__ requires <click-token> <key-code> <amount> [modifiers]".to_string(),
+        );
     }
     if !is_cliclick_point("c", &args[0]) {
         return Err(format!("Invalid scroll click token: '{}'", args[0]));
@@ -291,10 +458,33 @@ fn validate_scroll(args: &[String]) -> Result<Plan, String> {
     if amount == 0 || amount > MAX_SCROLL_AMOUNT {
         return Err(format!("Scroll amount {} out of range 1..{}", amount, MAX_SCROLL_AMOUNT));
     }
+    // A closed enumeration, mapped here rather than carried as script text: the agent
+    // authors the AppleScript, and only bounded parameters cross the wire.
+    let modifiers = match args.get(3) {
+        None => Vec::new(),
+        Some(list) => {
+            let mut out: Vec<String> = Vec::new();
+            for name in list.split(',') {
+                let clause = match name {
+                    "cmd" => "command down",
+                    "alt" => "option down",
+                    "ctrl" => "control down",
+                    "shift" => "shift down",
+                    _ => return Err(format!("__scroll__: '{}' is not a modifier", name)),
+                };
+                if !out.iter().any(|c| c == clause) {
+                    out.push(clause.to_string());
+                }
+            }
+            out
+        }
+    };
+
     Ok(Plan::Scroll {
         click: args[0].clone(),
         key_code,
         amount,
+        modifiers,
     })
 }
 
@@ -366,11 +556,48 @@ fn validate_xdotool(args: &[String]) -> Result<Vec<String>, String> {
         // `--repeat` is read with its value rather than as a bare token: digits appear
         // here as coordinates, button numbers and repeat counts, and only the repeat
         // count multiplies into an unbounded amount of actuation.
-        "getmouselocation" | "click" | "mousemove" | "mousedown" | "mouseup" => {
+        //
+        // `keydown`/`keyup` hold a modifier across the pointer action. Their key
+        // argument is restricted to POINTER_MODIFIERS: this branch exists so a click
+        // can be modified, not so any key can be pressed through the pointer path.
+        // Verified against xdotool 3.x on an Xvfb display, where the resulting
+        // ButtonPress carries state 0x4 (ControlMask) for `keydown ctrl … click 1`.
+        //
+        // That the release "cannot be lost because it is one invocation" is a property
+        // of the argv, not of this branch admitting the verbs — a bare `keydown ctrl`
+        // is also one invocation and strands the modifier on the X server. The pairing
+        // is enforced by `check_pointer_modifier_bracket` at the end of this arm.
+        "getmouselocation" | "click" | "mousemove" | "mousedown" | "mouseup"
+        | "keydown" | "keyup" => {
             let mut i = 0;
+            // The sub-command's own key argument, when the chain opens with a hold.
+            if matches!(sub, "keydown" | "keyup") {
+                let k = rest
+                    .first()
+                    .ok_or_else(|| format!("xdotool {}: expected a key", sub))?;
+                if !POINTER_MODIFIERS.contains(&k.as_str()) {
+                    return Err(format!(
+                        "xdotool {}: '{}' may not be held for a pointer action",
+                        sub, k
+                    ));
+                }
+                i = 1;
+            }
             while i < rest.len() {
                 let t = rest[i].as_str();
                 match t {
+                    "keydown" | "keyup" => {
+                        let k = rest.get(i + 1).ok_or_else(|| {
+                            format!("xdotool {}: {} needs a key", sub, t)
+                        })?;
+                        if !POINTER_MODIFIERS.contains(&k.as_str()) {
+                            return Err(format!(
+                                "xdotool {}: '{}' may not be held for a pointer action",
+                                sub, k
+                            ));
+                        }
+                        i += 2;
+                    }
                     "--repeat" => {
                         let n = rest
                             .get(i + 1)
@@ -389,10 +616,88 @@ fn validate_xdotool(args: &[String]) -> Result<Vec<String>, String> {
                     _ => return Err(format!("xdotool {}: unexpected token '{}'", sub, t)),
                 }
             }
+            check_pointer_modifier_bracket(args)?;
             Ok(args.to_vec())
         }
         other => Err(format!("xdotool sub-command '{}' is not permitted", other)),
     }
+}
+
+/// Require a held modifier to be released inside the same xdotool invocation.
+///
+/// `xdotool keydown ctrl` sets the modifier on the X server, not on the process: it
+/// stays down after the command completes and after the process exits, and every later
+/// keystroke and click in that session is reinterpreted through it. Measured on an Xvfb
+/// display before this check existed: a `KeyPress` read `state=0x0`, then a bare
+/// `keydown ctrl` was accepted, and every subsequent key from a *separate* command read
+/// `state=0x4` (ControlMask) — including after the holding process had exited.
+///
+/// This is the same defect as the cliclick `kd:`/`ku:` stranding that
+/// [`check_modifier_bracket`] guards, on the backend the modifier work opened up.
+/// `linux_actuation.py`'s `out()` does emit both halves and says so — "no argv can
+/// carry a keydown without its keyup" — but that is a property of the builder, and the
+/// builder is not the boundary. This validates argv from any caller holding the execute
+/// scope. The original finding had exactly this shape: `macos_actuation.py`'s `emit()`
+/// made the same true-of-itself claim while the agent checked nothing.
+///
+/// The accepted shape is the one the builder emits: every `keydown` in a leading run,
+/// every `keyup` in a trailing run, the same modifiers in each, and at least one
+/// pointer action bracketed between them.
+fn check_pointer_modifier_bracket(args: &[String]) -> Result<(), String> {
+    let key_at = |i: usize, verb: &str| -> Result<&str, String> {
+        args.get(i + 1)
+            .map(String::as_str)
+            .ok_or_else(|| format!("xdotool: {} needs a key", verb))
+    };
+
+    let mut i = 0;
+    let mut downs: Vec<&str> = Vec::new();
+    while i < args.len() && args[i] == "keydown" {
+        downs.push(key_at(i, "keydown")?);
+        i += 2;
+    }
+    let action_start = i;
+    while i < args.len() && args[i] != "keydown" && args[i] != "keyup" {
+        i += 1;
+    }
+    let action_end = i;
+    let mut ups: Vec<&str> = Vec::new();
+    while i < args.len() && args[i] == "keyup" {
+        ups.push(key_at(i, "keyup")?);
+        i += 2;
+    }
+
+    // Structure first, and before the "no modifiers here" exit. A keydown sitting in
+    // the INTERIOR of the chain leaves both runs empty at this point, so exiting early
+    // on that emptiness would wave through exactly the shape being guarded against.
+    if i != args.len() {
+        return Err(
+            "xdotool: a modifier hold must open the chain and close it, with the \
+             pointer action between"
+                .to_string(),
+        );
+    }
+    if downs.is_empty() && ups.is_empty() {
+        return Ok(());
+    }
+    if action_end == action_start {
+        return Err("xdotool: a modifier hold must bracket at least one action".to_string());
+    }
+    let (mut held, mut released) = (downs.clone(), ups.clone());
+    held.sort_unstable();
+    released.sort_unstable();
+    if held != released {
+        // Releasing a different modifier strands what was actually held, so this is
+        // rejected as firmly as releasing nothing — the same reasoning as the cliclick
+        // bracket, where "there is a keyup somewhere" would have admitted it.
+        let released_names = if ups.is_empty() { "none".to_string() } else { ups.join(",") };
+        return Err(format!(
+            "xdotool: modifiers held ({}) are not the ones released ({})",
+            downs.join(","),
+            released_names
+        ));
+    }
+    Ok(())
 }
 
 /// cliclick: every argument is a `prefix:value` action token. cliclick has no
@@ -410,7 +715,11 @@ fn validate_cliclick(args: &[String]) -> Result<Vec<String>, String> {
             // Pointer actions: "." (current position) or explicit coordinates.
             // `dm` is the drag-continuation move: it posts leftMouseDragged where `m`
             // posts mouseMoved, so a drag built from `m` is not seen as a drag at all.
-            "p" | "c" | "rc" | "dc" | "tc" | "mc" | "dd" | "du" | "m" | "dm" => {
+            // `mc` is deliberately absent: cliclick has no middle-click action, so a
+            // policy that accepted it was claiming a vocabulary the binary does not
+            // have, and every such command failed at execution. Middle click goes
+            // through the __middle__ sentinel instead.
+            "p" | "c" | "rc" | "dc" | "tc" | "dd" | "du" | "m" | "dm" => {
                 is_cliclick_point(prefix, t)
             }
             // Wait, in milliseconds. Accumulated so the per-token bound cannot be
@@ -443,7 +752,81 @@ fn validate_cliclick(args: &[String]) -> Result<Vec<String>, String> {
             total_delay, MAX_TOTAL_DELAY_MS
         ));
     }
+    check_modifier_bracket(args)?;
     Ok(args.to_vec())
+}
+
+/// The modifiers a `kd:`/`ku:` token names, deduplicated and ordered so two tokens
+/// naming the same set compare equal regardless of how they were written.
+fn bracket_modifiers(token: &str) -> Vec<&str> {
+    let mut names: Vec<&str> = token
+        .split_once(':')
+        .map_or("", |(_, v)| v)
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Require a modifier hold to be balanced inside the one invocation.
+///
+/// `kd:` sets the modifier globally: it stays down until some later `ku:` clears it,
+/// across every subsequent command and the rest of the login session. So an argv
+/// carrying a `kd:` without the matching `ku:` does not fail — it succeeds, and leaves
+/// the machine reinterpreting later clicks and keystrokes through a modifier nothing
+/// is tracking. Measured on the macOS guest before this check existed:
+/// `cliclick kd:cmd c:770,310` was accepted, and Cmd was still held after the command
+/// completed and after the process exited.
+///
+/// The controller can only emit both halves or neither (`emit()` in
+/// macos_actuation.py brackets the whole gesture), but the controller is not the
+/// boundary — this validates argv from any caller holding the execute scope, and the
+/// invariant has to hold where it is enforced rather than where it is intended.
+///
+/// The accepted shape is the one the builder emits: `kd:` first, `ku:` last, naming
+/// the same modifiers, with at least one action between them. `ku:` naming a
+/// *different* modifier is rejected too — it releases something else and strands what
+/// was actually held, which a "there is a ku: somewhere" check would admit.
+fn check_modifier_bracket(args: &[String]) -> Result<(), String> {
+    let idx = |p: &str| -> Vec<usize> {
+        args.iter()
+            .enumerate()
+            .filter(|(_, t)| t.starts_with(p))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let downs = idx("kd:");
+    let ups = idx("ku:");
+
+    if downs.is_empty() && ups.is_empty() {
+        return Ok(());
+    }
+    if downs.len() != 1 || ups.len() != 1 {
+        return Err(format!(
+            "cliclick: a modifier hold needs exactly one kd: and one ku:, got {} and {}",
+            downs.len(),
+            ups.len()
+        ));
+    }
+    let (down, up) = (downs[0], ups[0]);
+    if down != 0 {
+        return Err("cliclick: kd: must be the first token of a modifier hold".to_string());
+    }
+    if up != args.len() - 1 {
+        return Err("cliclick: ku: must be the last token of a modifier hold".to_string());
+    }
+    if up <= down + 1 {
+        return Err("cliclick: a modifier hold must bracket at least one action".to_string());
+    }
+    if bracket_modifiers(&args[down]) != bracket_modifiers(&args[up]) {
+        return Err(format!(
+            "cliclick: '{}' is not released by '{}'",
+            args[down], args[up]
+        ));
+    }
+    Ok(())
 }
 
 /// osascript: only `-e <body>` pairs, each body matching one of the two templates the
@@ -573,6 +956,83 @@ mod tests {
             .button_transition()
     }
 
+    fn deferred(parts: &[&str]) -> bool {
+        validate(&argv(parts))
+            .expect("should validate")
+            .pointer_arrival_is_deferred()
+    }
+
+    #[test]
+    fn a_windows_drag_predicts_its_destination_not_its_origin() {
+        // The watcher payload names both ends. Taking the leading pair — the acting
+        // point for every other verb — satisfied the re-read loop the moment the cursor
+        // reached the START of the gesture, so the agent published the point the drag
+        // left and reported position_captured=true. Measured on the guest:
+        // "500 400 drag 900 700" reported (500, 400) while the cursor ended at (900, 700).
+        assert_eq!(
+            pos_of(&["__write__", r"C:\mouse_cmd.txt", "500 400 drag 900 700"]),
+            Some(ExpectedPos { x: 900, y: 700 })
+        );
+        // `here drag` names no leading pair, so it predicted nothing and fell to the
+        // "the cursor must not have moved" check — which a drag always violates, and
+        // which passed anyway because the readback beat the watcher. It reported the
+        // pre-drag position as captured.
+        assert_eq!(
+            pos_of(&["__write__", r"C:\mouse_cmd.txt", "here drag 700 500"]),
+            Some(ExpectedPos { x: 700, y: 500 })
+        );
+        // A held modifier does not stop it being a drag.
+        assert_eq!(
+            pos_of(&["__write__", r"C:\mouse_cmd.txt", "500 400 #drag 900 700"]),
+            Some(ExpectedPos { x: 900, y: 700 })
+        );
+        assert_eq!(
+            pos_of(&["__write__", r"C:\mouse_cmd.txt", "here ^+drag 700 500"]),
+            Some(ExpectedPos { x: 700, y: 500 })
+        );
+    }
+
+    #[test]
+    fn every_other_windows_verb_still_predicts_the_point_it_names() {
+        // The drag rule must not disturb the verbs whose coordinate is where they act.
+        assert_eq!(
+            pos_of(&["__write__", r"C:\mouse_cmd.txt", "770 310 left"]),
+            Some(ExpectedPos { x: 770, y: 310 })
+        );
+        assert_eq!(
+            pos_of(&["__write__", r"C:\mouse_cmd.txt", "770 310 #scroll_down 3"]),
+            Some(ExpectedPos { x: 770, y: 310 })
+        );
+        assert_eq!(
+            pos_of(&["__write__", r"C:\mouse_cmd.txt", "900 700 ^+hold"]),
+            Some(ExpectedPos { x: 900, y: 700 })
+        );
+        // `here` forms other than drag still predict nothing: they act wherever the
+        // cursor is and genuinely do not move it, so the before/after check is sound.
+        assert_eq!(pos_of(&["__write__", r"C:\mouse_cmd.txt", "here left"]), None);
+        assert_eq!(pos_of(&["__write__", r"C:\mouse_cmd.txt", "here !scroll_up"]), None);
+        assert_eq!(pos_of(&["__write__", r"C:\mouse_cmd.txt", "position"]), None);
+    }
+
+    #[test]
+    fn only_the_windows_drag_waits_longer_for_the_cursor_to_arrive() {
+        // The longer re-read budget exists for one case: the watcher performs a drag
+        // asynchronously and its slow MouseMove lands 110-166ms after the write. Every
+        // other command is in place well inside the default budget, and widening it for
+        // them would charge a wait they do not need.
+        assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "500 400 drag 900 700"]));
+        assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "here drag 700 500"]));
+        assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "500 400 #drag 900 700"]));
+
+        assert!(!deferred(&["__write__", r"C:\mouse_cmd.txt", "770 310 left"]));
+        assert!(!deferred(&["__write__", r"C:\mouse_cmd.txt", "here left"]));
+        assert!(!deferred(&["__write__", r"C:\mouse_cmd.txt", "position"]));
+        assert!(!deferred(&["__write__", r"C:\keyboard_cmd.txt", "type hello"]));
+        // The other backends run their binary to completion before returning.
+        assert!(!deferred(&["cliclick", "dd:100,100", "w:50", "du:900,700"]));
+        assert!(!deferred(&["xdotool", "mousemove", "900", "700", "click", "1"]));
+    }
+
     // ---- expected end position ---------------------------------------------
     // The agent compares its cursor readback against this. Getting it wrong in
     // either direction is costly: too permissive and a stale read is reported as
@@ -668,6 +1128,230 @@ mod tests {
             button_of(&["__write__", r"C:\mouse_cmd.txt", "900 700 release"]),
             Some(ButtonTransition { button: MouseButton::Left, down: false })
         );
+        // A modifier-held hold is still a hold. Matching the prefixed token whole
+        // returned None, so the button went untracked: no console warning while it was
+        // down, and no automatic release when the session ended.
+        assert_eq!(
+            button_of(&["__write__", r"C:\mouse_cmd.txt", "900 700 #hold"]),
+            Some(ButtonTransition { button: MouseButton::Left, down: true })
+        );
+        assert_eq!(
+            button_of(&["__write__", r"C:\mouse_cmd.txt", "900 700 ^+release"]),
+            Some(ButtonTransition { button: MouseButton::Left, down: false })
+        );
+    }
+
+    #[test]
+    fn a_pointer_chain_may_hold_a_modifier() {
+        // The Linux form. Verified end-to-end on an Xvfb display: each of these argvs
+        // exits 0 and the resulting ButtonPress carries the modifier — state 0x5 for
+        // ctrl+shift, 0x8 for alt, 0x4 on the three button-5 events of a ctrl-scroll.
+        for parts in [
+            vec!["xdotool", "keydown", "ctrl", "mousemove", "770", "310", "click", "1",
+                 "keyup", "ctrl"],
+            vec!["xdotool", "keydown", "ctrl", "keydown", "shift", "mousemove", "770",
+                 "310", "click", "1", "keyup", "shift", "keyup", "ctrl"],
+            vec!["xdotool", "keydown", "alt", "click", "--repeat", "2", "1", "keyup", "alt"],
+            vec!["xdotool", "keydown", "ctrl", "mousemove", "200", "300", "mousedown", "1",
+                 "mousemove", "900", "640", "mouseup", "1", "keyup", "ctrl"],
+            vec!["xdotool", "keydown", "super", "mousemove", "770", "310", "click",
+                 "--repeat", "3", "5", "keyup", "super"],
+        ] {
+            validate(&argv(&parts))
+                .unwrap_or_else(|e| panic!("{parts:?} was refused: {e}"));
+        }
+
+        // The hold must not become a second way to press arbitrary keys through the
+        // pointer path, and it must not be left dangling without a key.
+        for parts in [
+            vec!["xdotool", "keydown", "Return", "click", "1", "keyup", "Return"],
+            vec!["xdotool", "keydown", "a", "click", "1", "keyup", "a"],
+            vec!["xdotool", "keydown", "ctrl+shift", "click", "1", "keyup", "ctrl+shift"],
+            vec!["xdotool", "click", "1", "keydown"],
+            vec!["xdotool", "keydown"],
+        ] {
+            assert!(validate(&argv(&parts)).is_err(), "should reject {parts:?}");
+        }
+    }
+
+    #[test]
+    fn a_held_modifier_does_not_disturb_what_the_argv_reports() {
+        // The keydown/keyup tokens sit around the pointer chain, so the position the
+        // readback is checked against and the button the tracker follows must both
+        // still be found.
+        let click = ["xdotool", "keydown", "ctrl", "mousemove", "770", "310", "click", "1",
+                     "keyup", "ctrl"];
+        assert_eq!(pos_of(&click), Some(ExpectedPos { x: 770, y: 310 }));
+        assert_eq!(button_of(&click), None);
+
+        let hold = ["xdotool", "keydown", "ctrl", "mousemove", "770", "310", "mousedown", "1",
+                    "keyup", "ctrl"];
+        assert_eq!(pos_of(&hold), Some(ExpectedPos { x: 770, y: 310 }));
+        assert_eq!(
+            button_of(&hold),
+            Some(ButtonTransition { button: MouseButton::Left, down: true })
+        );
+
+        let drag = ["xdotool", "keydown", "ctrl", "mousemove", "200", "300", "mousedown", "1",
+                    "mousemove", "900", "640", "mouseup", "1", "keyup", "ctrl"];
+        assert_eq!(pos_of(&drag), Some(ExpectedPos { x: 900, y: 640 }));
+        assert_eq!(
+            button_of(&drag),
+            Some(ButtonTransition { button: MouseButton::Left, down: false })
+        );
+    }
+
+    #[test]
+    fn a_modifier_held_pointer_action_is_accepted_and_still_reads_as_one() {
+        // The controller brackets the pointer tokens with kd:/ku: to hold a modifier
+        // across the gesture. The bracket must not disturb what the agent derives from
+        // the argv: the position it verifies the readback against, and the button it
+        // tracks for the shutdown release. A `ku:` token appears *after* the pointer
+        // token, so both are read by scanning back past it.
+        for (argv_parts, pos, button) in [
+            (
+                vec!["cliclick", "kd:cmd", "c:770,310", "ku:cmd"],
+                Some(ExpectedPos { x: 770, y: 310 }),
+                None,
+            ),
+            (
+                vec!["cliclick", "kd:cmd,shift", "dd:770,310", "ku:cmd,shift"],
+                Some(ExpectedPos { x: 770, y: 310 }),
+                Some(ButtonTransition { button: MouseButton::Left, down: true }),
+            ),
+            (
+                vec![
+                    "cliclick", "kd:alt", "dd:200,300", "w:50", "dm:900,640", "w:50",
+                    "du:900,640", "ku:alt",
+                ],
+                Some(ExpectedPos { x: 900, y: 640 }),
+                Some(ButtonTransition { button: MouseButton::Left, down: false }),
+            ),
+        ] {
+            validate(&argv(&argv_parts))
+                .unwrap_or_else(|e| panic!("{argv_parts:?} was refused: {e}"));
+            assert_eq!(pos_of(&argv_parts), pos, "{argv_parts:?}");
+            assert_eq!(button_of(&argv_parts), button, "{argv_parts:?}");
+        }
+    }
+
+    #[test]
+    fn cliclick_is_not_offered_a_middle_click_it_cannot_perform() {
+        // The vocabulary test above once listed `mc:.` as accepted. cliclick has no
+        // such action -- the policy was vouching for a token the binary rejects at
+        // execution, which is how `middle` looked implemented on macOS for so long.
+        assert!(validate(&argv(&["cliclick", "mc:."])).is_err());
+        assert!(validate(&argv(&["cliclick", "mc:960,540"])).is_err());
+    }
+
+    #[test]
+    fn a_middle_click_is_accepted_and_carries_only_bounded_parameters() {
+        // `middle` mapped to a cliclick `mc:` token that does not exist — cliclick has
+        // no middle button — so every middle click on macOS failed at execution with
+        // "Unrecognized action shortcut". It is posted as a CGEvent now, and the only
+        // things crossing the wire are a click token and modifier names.
+        assert_eq!(
+            validate(&argv(&["__middle__", "c:960,540"])).unwrap(),
+            Plan::MiddleClick { click: "c:960,540".to_string(), flags: 0 },
+        );
+        assert_eq!(
+            validate(&argv(&["__middle__", "c:."])).unwrap(),
+            Plan::MiddleClick { click: "c:.".to_string(), flags: 0 },
+        );
+        // Modifier names map to CGEventFlags here, so a caller cannot hand over a raw
+        // bitmask aimed at flags this grammar never intended.
+        assert_eq!(
+            validate(&argv(&["__middle__", "c:960,540", "cmd"])).unwrap(),
+            Plan::MiddleClick { click: "c:960,540".to_string(), flags: 0x0010_0000 },
+        );
+        assert_eq!(
+            validate(&argv(&["__middle__", "c:.", "ctrl,shift"])).unwrap(),
+            Plan::MiddleClick { click: "c:.".to_string(), flags: 0x0004_0000 | 0x0002_0000 },
+        );
+
+        // The click point predicts where the button goes down, so the readback has
+        // something to verify against; `c:.` names no point, as with scroll.
+        assert_eq!(
+            pos_of(&["__middle__", "c:960,540"]),
+            Some(ExpectedPos { x: 960, y: 540 })
+        );
+        assert_eq!(pos_of(&["__middle__", "c:."]), None);
+        // Down and up are posted together, so nothing is left held.
+        assert_eq!(button_of(&["__middle__", "c:960,540"]), None);
+
+        for bad in [
+            vec!["__middle__"],                                  // no click token
+            vec!["__middle__", "rc:960,540"],                    // wrong click prefix
+            vec!["__middle__", "c:960,540", "bogus"],            // unknown modifier
+            vec!["__middle__", "c:960,540", ""],                 // empty modifier list
+            vec!["__middle__", "c:960,540", "cmd shift"],        // space-separated
+            vec!["__middle__", "c:960,540", "cmd", "extra"],     // arity
+            // A raw flag bitmask is not a modifier name and must not be accepted.
+            vec!["__middle__", "c:960,540", "1048576"],
+        ] {
+            assert!(
+                validate(&argv(&bad)).is_err(),
+                "{bad:?} must be refused",
+            );
+        }
+    }
+
+    #[test]
+    fn a_modifier_hold_that_is_not_closed_is_refused() {
+        // Each of these was accepted by the policy and executed on the macOS guest,
+        // leaving Cmd physically held after the command finished — verified by reading
+        // NSEvent.modifierFlags in the guest, which reported CMD down until it was
+        // cleared out of band. A stranded modifier does not announce itself: it
+        // silently re-reads every later click and keystroke as a chord.
+        for (bad, why) in [
+            (vec!["cliclick", "kd:cmd", "c:770,310"], "kd: with no ku:"),
+            (vec!["cliclick", "kd:cmd"], "kd: alone, no action and no ku:"),
+            (vec!["cliclick", "c:770,310", "ku:cmd"], "ku: with no kd:"),
+            // The case a "there is a ku: somewhere" check would admit: shift is
+            // released, cmd is left held.
+            (vec!["cliclick", "kd:cmd", "c:770,310", "ku:shift"], "ku: releases a different modifier"),
+            (vec!["cliclick", "kd:cmd,shift", "c:770,310", "ku:cmd"], "ku: releases only part of the set"),
+            (vec!["cliclick", "kd:cmd", "c:1,2", "kd:shift", "c:3,4", "ku:cmd"], "two kd: tokens"),
+            (vec!["cliclick", "kd:cmd", "ku:cmd"], "brackets no action at all"),
+            (vec!["cliclick", "c:1,2", "kd:cmd", "c:3,4", "ku:cmd"], "kd: is not first"),
+            (vec!["cliclick", "kd:cmd", "c:1,2", "ku:cmd", "c:3,4"], "ku: is not last"),
+        ] {
+            assert!(
+                validate(&argv(&bad)).is_err(),
+                "{why}: {bad:?} must be refused — it strands a modifier",
+            );
+        }
+    }
+
+    #[test]
+    fn the_bracketed_forms_the_controller_emits_are_still_accepted() {
+        // The guard must not be tightened into rejecting real traffic. These are the
+        // shapes macos_actuation.py's emit() produces, plus the unbracketed forms.
+        for good in [
+            vec!["cliclick", "kd:cmd", "c:770,310", "ku:cmd"],
+            vec!["cliclick", "kd:cmd,shift", "c:770,310", "ku:cmd,shift"],
+            // Same set, written in the other order: it releases everything held, so it
+            // is balanced and must not be refused on spelling.
+            vec!["cliclick", "kd:cmd,shift", "c:770,310", "ku:shift,cmd"],
+            vec![
+                "cliclick", "kd:alt", "dd:200,300", "w:50", "dm:900,640", "w:50",
+                "du:900,640", "ku:alt",
+            ],
+            // The keyboard path brackets too — `press #k` and friends — so the guard
+            // covers more than the mouse work that prompted it. These are the shapes
+            // macos_actuation.py emits at 832/840/848/855.
+            vec!["cliclick", "kd:cmd", "kp:a", "ku:cmd"],
+            vec!["cliclick", "kd:cmd", "t:h", "ku:cmd"],
+            vec!["cliclick", "kd:cmd", "kp:space", "ku:cmd"],
+            // A modifier bracketing nothing but a wait. "At least one action between"
+            // has to keep meaning "any token", or this legitimate command breaks.
+            vec!["cliclick", "kd:cmd", "w:50", "ku:cmd"],
+            vec!["cliclick", "c:770,310"],
+            vec!["cliclick", "p:."],
+        ] {
+            validate(&argv(&good))
+                .unwrap_or_else(|e| panic!("{good:?} is emitted by the controller but was refused: {e}"));
+        }
     }
 
     #[test]
@@ -842,7 +1526,6 @@ mod tests {
             argv(&["cliclick", "rc:."]),
             argv(&["cliclick", "dc:."]),
             argv(&["cliclick", "tc:."]),
-            argv(&["cliclick", "mc:."]),
             argv(&["cliclick", "dd:."]),
             argv(&["cliclick", "du:."]),
             argv(&["cliclick", "dm:900,700"]),
@@ -1076,6 +1759,55 @@ mod tests {
     // ---- sentinels ---------------------------------------------------------
 
     #[test]
+    fn an_xdotool_keydown_must_be_released_in_the_same_command() {
+        // Found in the pre-release audit, not by a test failing. `xdotool keydown ctrl`
+        // sets the modifier on the X SERVER: measured on Xvfb, a later key from a
+        // separate command read state=0x4 against a control of 0x0, and kept reading it
+        // after the holding process exited. Every command afterwards is reinterpreted
+        // through a modifier nothing tracks — the mouse-button tracker follows buttons,
+        // not keys, so the shutdown release cannot chase it either.
+        //
+        // This is the cliclick kd:/ku: stranding on the other backend, admitted by
+        // opening the pointer chain to keydown/keyup for modifier-held clicks.
+        for stranding in [
+            argv(&["xdotool", "keydown", "ctrl"]),
+            argv(&["xdotool", "keydown", "ctrl", "click", "1"]),
+            argv(&["xdotool", "keydown", "ctrl", "keydown", "shift", "click", "1", "keyup", "shift"]),
+            // Releasing something else strands what was actually held.
+            argv(&["xdotool", "keydown", "ctrl", "click", "1", "keyup", "shift"]),
+            // A hold that brackets nothing is not a modified action.
+            argv(&["xdotool", "keydown", "ctrl", "keyup", "ctrl"]),
+            // The hold has to open and close the chain, not sit inside it.
+            argv(&["xdotool", "click", "1", "keydown", "ctrl", "click", "1", "keyup", "ctrl"]),
+            // A release with nothing held clears a modifier this command never set.
+            argv(&["xdotool", "click", "1", "keyup", "ctrl"]),
+        ] {
+            assert!(validate(&stranding).is_err(), "should reject {:?}", stranding);
+        }
+    }
+
+    #[test]
+    fn a_balanced_modifier_held_click_is_still_accepted() {
+        // The shapes linux_actuation.py's out() actually emits. A guard that rejected
+        // these would take modifier-held clicks away from Linux entirely, which is the
+        // capability this release exists to add.
+        for ok in [
+            argv(&["xdotool", "keydown", "ctrl", "click", "1", "keyup", "ctrl"]),
+            argv(&[
+                "xdotool", "keydown", "ctrl", "keydown", "shift", "mousemove", "770", "310",
+                "click", "1", "keyup", "shift", "keyup", "ctrl",
+            ]),
+            argv(&["xdotool", "keydown", "super", "mousemove", "10", "20", "click", "3",
+                   "keyup", "super"]),
+            // No modifier at all: the common path, unchanged.
+            argv(&["xdotool", "mousemove", "770", "310", "click", "1"]),
+            argv(&["xdotool", "getmouselocation", "--shell"]),
+        ] {
+            assert!(validate(&ok).is_ok(), "should accept {:?}: {:?}", ok, validate(&ok));
+        }
+    }
+
+    #[test]
     fn write_sentinel_is_path_constrained() {
         assert!(validate(&argv(&["__write__", r"C:\mouse_cmd.txt", "960 540 left"])).is_ok());
         assert!(validate(&argv(&["__write__", r"C:\Windows\System32\evil.bat", "x"])).is_err());
@@ -1086,7 +1818,12 @@ mod tests {
     fn scroll_sentinel_is_bounded() {
         assert_eq!(
             validate(&argv(&["__scroll__", "c:.", "125", "5"])).unwrap(),
-            Plan::Scroll { click: "c:.".to_string(), key_code: 125, amount: 5 }
+            Plan::Scroll {
+                click: "c:.".to_string(),
+                key_code: 125,
+                amount: 5,
+                modifiers: Vec::new(),
+            }
         );
         assert!(validate(&argv(&["__scroll__", "c:960,540", "126", "3"])).is_ok());
         for case in [
@@ -1095,6 +1832,40 @@ mod tests {
             argv(&["__scroll__", "c:.", "125", "100000"]), // amount above range
             argv(&["__scroll__", "rc:.", "125", "5"]),    // wrong click prefix
             argv(&["__scroll__", "c:.", "125"]),          // arity
+        ] {
+            assert!(validate(&case).is_err(), "should reject {:?}", case);
+        }
+    }
+
+    #[test]
+    fn a_scroll_modifier_list_is_a_closed_enumeration() {
+        // The agent writes the AppleScript; the wire carries only names it resolves
+        // itself, so nothing a caller sends can become script text.
+        assert_eq!(
+            validate(&argv(&["__scroll__", "c:.", "125", "5", "cmd,shift"])).unwrap(),
+            Plan::Scroll {
+                click: "c:.".to_string(),
+                key_code: 125,
+                amount: 5,
+                modifiers: vec!["command down".to_string(), "shift down".to_string()],
+            }
+        );
+        // A repeat is one key held, as everywhere else in the grammar.
+        assert_eq!(
+            validate(&argv(&["__scroll__", "c:.", "125", "5", "cmd,cmd"])).unwrap(),
+            Plan::Scroll {
+                click: "c:.".to_string(),
+                key_code: 125,
+                amount: 5,
+                modifiers: vec!["command down".to_string()],
+            }
+        );
+        for case in [
+            argv(&["__scroll__", "c:.", "125", "5", ""]),               // empty list
+            argv(&["__scroll__", "c:.", "125", "5", "command down"]),   // clause text
+            argv(&["__scroll__", "c:.", "125", "5", "cmd, shift"]),     // stray space
+            argv(&["__scroll__", "c:.", "125", "5", "fn"]),             // not a modifier
+            argv(&["__scroll__", "c:.", "125", "5", "cmd", "extra"]),   // arity
         ] {
             assert!(validate(&case).is_err(), "should reject {:?}", case);
         }

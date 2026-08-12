@@ -43,6 +43,31 @@ if (A_Args.Length < 1) {
 ExecuteCommand(A_Args)
 ExitApp
 
+; Split a modifier prefix off an action token: "#left" -> action "left", with the
+; matching down/up Send sequences. The symbols are the same alphabet the keyboard
+; watcher uses. A repeated symbol is one key held, and the releases are emitted in
+; reverse order: last pressed, first released.
+SplitModifiers(token, &downSeq, &upSeq) {
+    downMap := Map("^", "{Ctrl down}", "+", "{Shift down}", "!", "{Alt down}", "#", "{LWin down}")
+    upMap   := Map("^", "{Ctrl up}",   "+", "{Shift up}",   "!", "{Alt up}",   "#", "{LWin up}")
+    downSeq := ""
+    upSeq := ""
+    seen := Map()
+    i := 1
+    while (i <= StrLen(token)) {
+        ch := SubStr(token, i, 1)
+        if (!downMap.Has(ch))
+            break
+        if (!seen.Has(ch)) {
+            seen[ch] := true
+            downSeq .= downMap[ch]
+            upSeq := upMap[ch] . upSeq
+        }
+        i++
+    }
+    return SubStr(token, i)
+}
+
 ExecuteCommand(args) {
     ; 1. Handle standalone position query
     if (args[1] = "position") {
@@ -73,7 +98,18 @@ ExecuteCommand(args) {
         Sleep 25
     }
 
-    ; 3. Perform Action
+    ; 3. Hold any modifiers named by the action's prefix.
+    ;
+    ; Pressed after the move so the pointer is already in place, and released in a
+    ; `finally` so an action that throws cannot leave a modifier physically down —
+    ; which would silently turn every later click in the session into a modified one.
+    action := SplitModifiers(action, &modDown, &modUp)
+    if (modDown != "")
+        Send modDown
+
+    try {
+
+    ; 4. Perform Action
     switch action {
         case "move":
             ; Just move (already done above)
@@ -96,12 +132,15 @@ ExecuteCommand(args) {
         case "release":
             Click "Up"
 
+        ; 5 matches the default in macos_actuation.py and linux_actuation.py. It was
+        ; 3 here, so "here scroll_down" with no count scrolled a different distance on
+        ; Windows than the same command did everywhere else.
         case "scroll_up":
-            amount := (args.Length >= paramOffset) ? args[paramOffset] : 3
+            amount := (args.Length >= paramOffset) ? args[paramOffset] : 5
             Click "WheelUp", amount
 
         case "scroll_down":
-            amount := (args.Length >= paramOffset) ? args[paramOffset] : 3
+            amount := (args.Length >= paramOffset) ? args[paramOffset] : 5
             Click "WheelDown", amount
 
         case "drag":
@@ -121,6 +160,11 @@ ExecuteCommand(args) {
 
         default:
             ; Unknown action
+    }
+
+    } finally {
+        if (modUp != "")
+            Send modUp
     }
 
     ; Trailing settle. Delays pickup of the next command, so every command in a

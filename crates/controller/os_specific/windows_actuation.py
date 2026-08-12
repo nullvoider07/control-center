@@ -35,6 +35,33 @@ class WindowsActuation:
     # modifier, so Ctrl+Plus must be written "^{Plus}".
     BRACE_CHAR_MAP = {'{Plus}': '{+}'}
 
+    # Modifier symbol → display name, shared by the `press` echo and the mouse echo so
+    # a Ctrl-click and a Ctrl-chord name the key identically.
+    MODIFIER_DISPLAY = {'^': 'Ctrl', '+': 'Shift', '!': 'Alt', '#': 'Win'}
+
+    # Modifier symbols accepted as a prefix on a MOUSE action. Unlike the other two
+    # backends this list is not resolved to a backend key name here: the mouse command
+    # travels to the guest as text and mouse_control.ahk maps the symbol to
+    # "{Ctrl down}" itself. The prefix is still parsed here so a malformed one is
+    # refused before it reaches a watcher that would silently do nothing with it.
+    MOUSE_MODIFIER_SYMBOLS = {'^': 'ctrl', '+': 'shift', '!': 'alt', '#': 'win'}
+
+    # Notches a scroll performs when the command names no count. One constant per
+    # backend, used by both the argv builder and the console echo, because those two
+    # disagreed: the backends scrolled 5 while the echo told the operator "1 notch".
+    # test_scroll_default_count_is_the_same_on_every_backend reads this and its
+    # counterparts, and fails if any of them drifts.
+    DEFAULT_SCROLL_NOTCHES = 5
+
+
+    # Pointer verbs a modifier may be held across — the verbs this backend already
+    # has, and no others. `move` and `position` are excluded because no held modifier
+    # changes what they do.
+    MOUSE_MODIFIER_ACTIONS = frozenset({
+        'left', 'right', 'middle', 'double', 'drag', 'hold', 'release',
+        'scroll_up', 'scroll_down',
+    })
+
     # Class-level default so instances built without __init__ (tests, replay
     # helpers) still have a defined policy rather than raising on attribute access.
     strict = True
@@ -188,7 +215,7 @@ class WindowsActuation:
             "{Enter}"   -> "Enter"
             "{F5}"      -> "F5"
         """
-        modifier_display = {'^': 'Ctrl', '+': 'Shift', '!': 'Alt', '#': 'Win'}
+        modifier_display = self.MODIFIER_DISPLAY
         special_display = {
             '{LCtrl}': 'Ctrl', '{RCtrl}': 'Ctrl',
             '{LShift}': 'Shift', '{RShift}': 'Shift',
@@ -230,6 +257,96 @@ class WindowsActuation:
                 parts.append(key_part)
 
         return '+'.join(parts) if parts else keys
+
+    # Helper method to split a modifier prefix off a mouse action token
+    def _split_mouse_modifiers(self, token: str) -> Tuple[List[str], str]:
+        """Split "<mods><action>" into (modifier symbols, action).
+
+        The symbols are returned rather than a backend key name: the mouse command
+        travels to the guest verbatim and mouse_control.ahk does the mapping. This
+        exists to refuse a malformed prefix at the controller — the watcher's `switch`
+        has no error path, so an unrecognised action there does nothing at all and the
+        step still reports success.
+        """
+        mods: List[str] = []
+        i = 0
+        while i < len(token) and token[i] in self.MOUSE_MODIFIER_SYMBOLS:
+            if token[i] not in mods:
+                mods.append(token[i])
+            i += 1
+
+        action = token[i:]
+        if not mods:
+            return [], action
+
+        if not action:
+            raise ValueError(f"{token!r} is a modifier prefix with no mouse action after it")
+
+        if action not in self.MOUSE_MODIFIER_ACTIONS:
+            if action in self.MOUSE_ACTIONS:
+                raise ValueError(
+                    f"{action!r} does not take a modifier prefix; modifiers apply to "
+                    f"{', '.join(sorted(self.MOUSE_MODIFIER_ACTIONS))}"
+                )
+            raise ValueError(
+                f"unknown mouse action {action!r} after the modifier prefix {token[:i]!r}"
+            )
+
+        return mods, action
+
+    # Helper method to decide whether a token names a mouse action
+    def _is_mouse_action_token(self, token: str) -> bool:
+        """Whether a token names a mouse action, with or without a modifier prefix.
+
+        Routing only. A malformed prefix is admitted so the builder can refuse it by
+        name rather than the router rejecting it as an unrecognised command.
+        """
+        if token in self.MOUSE_ACTIONS:
+            return True
+        stripped = token.lstrip(''.join(self.MOUSE_MODIFIER_SYMBOLS))
+        return bool(stripped) and stripped != token
+
+    # Helper method to name the modifiers held during a mouse action, for the echo
+    def _describe_mouse_modifiers(self, token: str) -> Tuple[str, str]:
+        """(display prefix, bare action) for the console echo, e.g. ("Ctrl+", "left").
+
+        Never raises: the command has already actuated by the time the echo runs.
+        """
+        parts: List[str] = []
+        i = 0
+        while i < len(token) and token[i] in self.MOUSE_MODIFIER_SYMBOLS:
+            name = self.MODIFIER_DISPLAY[token[i]]
+            if name not in parts:
+                parts.append(name)
+            i += 1
+        return (''.join(f"{p}+" for p in parts), token[i:])
+
+    # Helper method to validate a mouse command before it reaches the guest watcher
+    def _check_mouse_command(self, command: str) -> bool:
+        """Refuse a mouse command whose modifier prefix does not parse.
+
+        Windows mouse commands are not built into argv here — they are written to
+        C:\\mouse_cmd.txt and parsed on the guest — so this is the only place a bad
+        prefix can be caught before it becomes a step that reports success and moves
+        nothing.
+        """
+        tokens = command.strip().split()
+        if not tokens:
+            return False
+        if tokens[0] == 'here':
+            index = 1
+        elif len(tokens) >= 3 and tokens[0].lstrip('-').isdigit():
+            index = 2
+        else:
+            return True
+        if len(tokens) <= index:
+            return True
+        try:
+            self._split_mouse_modifiers(tokens[index])
+        except ValueError as e:
+            print(f"[✗] {e}")
+            return False
+        return True
 
     # Convert AHK modifier prefix notation to explicit down/up syntax for reliable execution
     def _convert_modifiers_to_explicit(self, keys: str) -> str:
@@ -293,7 +410,7 @@ class WindowsActuation:
                 int(tokens[0])
                 int(tokens[1])
                 # Has coordinates - likely mouse command
-                if len(tokens) >= 3 and tokens[2] in self.MOUSE_ACTIONS:
+                if len(tokens) >= 3 and self._is_mouse_action_token(tokens[2]):
                     return 'mouse', command
                 elif len(tokens) == 2:
                     # Just coordinates, assume move
@@ -303,7 +420,7 @@ class WindowsActuation:
         
         # Check for "here" keyword (mouse)
         if tokens[0] == 'here':
-            if len(tokens) >= 2 and tokens[1] in self.MOUSE_ACTIONS:
+            if len(tokens) >= 2 and self._is_mouse_action_token(tokens[1]):
                 return 'mouse', command
             else:
                 return 'invalid', command
@@ -392,6 +509,8 @@ class WindowsActuation:
             argv = ['__write__', r'C:\keyboard_cmd.txt', file_payload]
             human_command = processed_cmd
         else:
+            if not self._check_mouse_command(processed_cmd):
+                return False
             argv = ['__write__', r'C:\mouse_cmd.txt', processed_cmd]
             human_command = processed_cmd
 
@@ -427,19 +546,29 @@ class WindowsActuation:
                 action_tok = tokens[1] if is_here and len(tokens) >= 2 else (tokens[2] if len(tokens) >= 3 else None)
                 pos_str = f"X={position_after[0]}, Y={position_after[1]}" if position_after else "X=?, Y=?"
 
+                # A modifier held across the action changes what the action does, so
+                # the echo names it. Split off here so the verb branches below stay a
+                # match on the bare verb.
+                mod_prefix = ''
+                if action_tok is not None:
+                    mod_prefix, action_tok = self._describe_mouse_modifiers(action_tok)
+
                 if action_tok == 'drag' and len(tokens) >= 5:
-                    print(f"Executed: {command}, dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
+                    print(f"Executed: {command}, {mod_prefix}dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
                 elif action_tok in ('left', 'right', 'double', 'middle'):
-                    print(f"Executed: {command}, clicked {action_tok} at {pos_str}, time taken: {ms}ms")
+                    print(f"Executed: {command}, clicked {mod_prefix}{action_tok} at {pos_str}, time taken: {ms}ms")
                 elif action_tok in ('scroll_up', 'scroll_down'):
                     direction = 'up' if action_tok == 'scroll_up' else 'down'
                     count_idx = 2 if is_here else 3
                     try:
                         n = int(tokens[count_idx])
                     except (IndexError, ValueError):
-                        n = 1
+                        # The command named no count, so the backend performs the
+                        # default — say that number rather than 1, which described
+                        # neither the gesture nor the record.
+                        n = self.DEFAULT_SCROLL_NOTCHES
                     notch_str = "1 notch" if n == 1 else f"{n} notches"
-                    print(f"Executed: {command}, scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
+                    print(f"Executed: {command}, {mod_prefix}scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
                 elif action_tok == 'move':
                     print(f"Executed: {command}, moved to {pos_str}, time taken: {ms}ms")
                 else:
@@ -500,6 +629,8 @@ class WindowsActuation:
                             file_payload = f'type {kb_content}'
                         argv = ['__write__', r'C:\keyboard_cmd.txt', file_payload]
                     else:
+                        if not self._check_mouse_command(formatted_cmd):
+                            continue
                         argv = ['__write__', r'C:\mouse_cmd.txt', formatted_cmd]
                     # Same split as execute_command: the AHK expansion travels in argv,
                     # the canonical command is what gets reported and recorded.
@@ -543,6 +674,10 @@ class WindowsActuation:
 ║ <x> <y> drag <x2> <y2> → Drag from (x,y) to (x2,y2)      ║
 ║ here <action>          → Action at current position      ║
 ║ position               → Get current mouse position      ║
+║                                                          ║
+║ <x> <y> <mods><action> → Hold modifiers for the action   ║
+║ here <mods><action>    → e.g. ^left, +left, ^scroll_down ║
+║   Modifiers: ^ + ! # (as in press); not on move/position ║
 ╠══════════════════════════════════════════════════════════╣
 ║ KEYBOARD COMMANDS                                        ║
 ╠══════════════════════════════════════════════════════════╣
@@ -566,6 +701,9 @@ class WindowsActuation:
 ║ #                      → Press Windows key (Start menu)  ║
 ║ {LWin}                 → Press Windows key (alternative) ║
 ║ 200 200 drag 800 600   → Drag operation                  ║
+║ 770 310 ^left          → Ctrl-click (multi-select)       ║
+║ 770 310 +left          → Shift-click (extend selection)  ║
+║ 770 310 ^scroll_down 3 → Ctrl-scroll (zoom out)          ║
 ║ position               → Get mouse coordinates           ║
 ╠══════════════════════════════════════════════════════════╣
 ║ POSITION TRACKING                                        ║

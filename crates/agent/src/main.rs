@@ -41,6 +41,29 @@ use proto::{
 const MAX_POSITION_REREADS: u32 = 3;
 const POSITION_REREAD_INTERVAL_MS: u64 = 50;
 
+/// Re-reads allowed for a command whose cursor arrives asynchronously — see
+/// `Plan::pointer_arrival_is_deferred`, which today means a Windows drag.
+///
+/// Measured on the guest, a drag's cursor reaches its destination 110-166ms after the
+/// command file is written. The default budget's last read falls at 170ms, clearing the
+/// worst observed case by 4ms — close enough that an ordinarily busy VM would report a
+/// false negative on a drag that actually landed. This carries the window to ~620ms.
+///
+/// It costs nothing on the common path: re-reads happen only while the position still
+/// disagrees, so a command that verifies immediately pays none of them, and only a
+/// command that would otherwise have reported an unverified coordinate waits longer.
+const DEFERRED_POSITION_REREADS: u32 = 12;
+
+/// Notches a scroll command performs when it names no count. Every backend applies
+/// this same number — macos_actuation.py and linux_actuation.py resolve it when they
+/// build the command, mouse_control.ahk when it reads one — so the agent can state it
+/// in the record for a command that omitted it.
+///
+/// The four must not drift apart: the agent would then report a count the backend did
+/// not perform. `test_scroll_default_count_is_the_same_on_every_backend` reads all
+/// four and fails if any one moves.
+const DEFAULT_SCROLL_NOTCHES: u32 = 5;
+
 // Mouse position data structure
 #[derive(Debug, Clone)]
 struct MousePosition {
@@ -72,6 +95,14 @@ struct ActionDetails {
     action_type: String,  // "left", "right", "double", "drag", etc.
     is_mouse: bool,
     is_here_command: bool,
+    /// Modifier keys held for the duration of a pointer action, resolved to this
+    /// platform's display names ("Cmd", "Option", …). Empty for every other command.
+    ///
+    /// Kept separate from `action_type` so the verb match stays exact: a Cmd-click is
+    /// a click, and only the record's wording differs. Folding the prefix into the
+    /// verb would drop the action out of `is_mouse` and record a pointer gesture as
+    /// typed text.
+    modifiers: Vec<String>,
 }
 
 /// Agent implementation
@@ -267,13 +298,51 @@ impl AgentServiceImpl {
         capabilities
     }
     
-    // Convert a key string with modifiers into a human-readable format
-    fn format_keys_for_display(&self, keys: &str) -> String {
-        let mod_names: &[(&str, &str)] = match self.os_type {
+    // Modifier symbol → this platform's display name. One table, so a chord and a
+    // modifier-held pointer action name the same key the same way.
+    fn modifier_names(&self) -> &'static [(&'static str, &'static str)] {
+        match self.os_type {
             OsType::Macos   => &[("#", "Cmd"),   ("!", "Option"), ("^", "Ctrl"), ("+", "Shift")],
             OsType::Windows => &[("#", "Win"),   ("!", "Alt"),    ("^", "Ctrl"), ("+", "Shift")],
             OsType::Linux   => &[("#", "Super"), ("!", "Alt"),    ("^", "Ctrl"), ("+", "Shift")],
-        };
+        }
+    }
+
+    // Split a modifier prefix off a pointer action token: "#left" → (["Cmd"], "left").
+    //
+    // A token that is nothing but modifiers ("#") keeps its prefix and is returned
+    // whole, so it fails the `is_mouse` match below rather than being read as a verb
+    // with no name. The controller cannot emit that form; this is what stops a
+    // malformed one from being recorded as a successful gesture.
+    fn split_mouse_modifiers(&self, token: &str) -> (Vec<String>, String) {
+        let table = self.modifier_names();
+        let mut names: Vec<String> = Vec::new();
+        let mut rest = token;
+
+        while let Some(ch) = rest.chars().next() {
+            let sym = &rest[..ch.len_utf8()];
+            match table.iter().find(|(s, _)| *s == sym) {
+                Some((_, name)) => {
+                    // Deduplicated, order preserved: "#+left" reads "Cmd+Shift+…" the
+                    // way it was typed, matching how a chord is rendered.
+                    if !names.iter().any(|n| n == name) {
+                        names.push((*name).to_string());
+                    }
+                    rest = &rest[ch.len_utf8()..];
+                }
+                None => break,
+            }
+        }
+
+        if names.is_empty() || rest.is_empty() {
+            return (Vec::new(), token.to_string());
+        }
+        (names, rest.to_string())
+    }
+
+    // Convert a key string with modifiers into a human-readable format
+    fn format_keys_for_display(&self, keys: &str) -> String {
+        let mod_names = self.modifier_names();
 
         let special_name = |k: &str| -> Option<&'static str> {
             match k {
@@ -357,32 +426,42 @@ impl AgentServiceImpl {
 
         let is_here = tokens.get(0) == Some(&"here");
 
-        let action_type = if tokens.len() >= 3 && tokens[0].parse::<i32>().is_ok() {
-            // Coordinate-based: "960 540 left"
-            tokens.get(2).unwrap_or(&"move").to_string()
+        // The pointer verb may carry a modifier prefix ("770 310 #left"). It is split
+        // off rather than matched as part of the verb: a Cmd-click is still a click,
+        // and an unsplit "#left" falls out of `is_mouse` below and records the gesture
+        // as typed text.
+        let (modifiers, action_type) = if tokens.len() >= 3 && tokens[0].parse::<i32>().is_ok() {
+            // Coordinate-based: "960 540 left", "770 310 #left"
+            self.split_mouse_modifiers(tokens[2])
         } else if is_here && tokens.len() >= 2 {
-            // Here command: "here left", "here hold", "here release"
-            tokens[1].to_string()
-        } else if tokens.get(0) == Some(&"position") {
-            "position".to_string()
-        } else if tokens.get(0) == Some(&"press") {
-            // "press {Enter}", "press ^c" — keyboard, not mouse
-            "press".to_string()
-        } else if command.contains("click") {
-            "click".to_string()
-        } else if command.contains("drag") {
-            "drag".to_string()
-        } else if command.contains("type") || command.contains("key") {
-            "keyboard".to_string()
+            // Here command: "here left", "here hold", "here +left"
+            self.split_mouse_modifiers(tokens[1])
         } else {
-            "unknown".to_string()
+            let bare = if tokens.first() == Some(&"position") {
+                "position"
+            } else if tokens.first() == Some(&"press") {
+                // "press {Enter}", "press ^c" — keyboard, not mouse
+                "press"
+            } else if command.contains("click") {
+                "click"
+            } else if command.contains("drag") {
+                "drag"
+            } else if command.contains("type") || command.contains("key") {
+                "keyboard"
+            } else {
+                "unknown"
+            };
+            (Vec::new(), bare.to_string())
         };
 
         let is_mouse = matches!(
             action_type.as_str(),
             "left" | "right" | "middle" | "double" | "triple"
             | "click" | "drag" | "move"
-            | "scroll_up" | "scroll_down"
+            // scroll_left/scroll_right are macOS-only verbs, but they are verbs the
+            // controller emits: without them here a horizontal scroll was recorded as
+            // "Typed: 960 540 scroll_left 3".
+            | "scroll_up" | "scroll_down" | "scroll_left" | "scroll_right"
             | "hold" | "release"     // mouse button hold/release
             | "position"             // position query
         );
@@ -391,6 +470,7 @@ impl AgentServiceImpl {
             action_type,
             is_mouse,
             is_here_command: is_here,
+            modifiers,
         }
     }
     
@@ -524,6 +604,51 @@ impl AgentServiceImpl {
             return format!("Executed: {}", command);
         }
 
+        // Scroll renders its own line, because the notch count is part of the gesture
+        // and the record has to carry it. Without it "here scroll_down 5" and
+        // "here scroll_down 1" stored the same string, so a captured scroll step could
+        // not be replayed from the record and S074 had to be re-recorded.
+        //
+        // The count is already here — `command` is the command as issued — so nothing
+        // new crosses the wire. It is read from the position the controllers already
+        // parse it from: after the verb, which is token 2 for `here` and token 3 for
+        // the coordinate form.
+        if let Some(direction) = action.action_type.strip_prefix("scroll_") {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let count_index = if action.is_here_command { 2 } else { 3 };
+            let count = tokens
+                .get(count_index)
+                .and_then(|t| t.parse::<u32>().ok());
+
+            let prefix = if action.modifiers.is_empty() {
+                String::new()
+            } else {
+                format!("{}+", action.modifiers.join("+"))
+            };
+
+            // A bare `scroll_down` still scrolls DEFAULT_SCROLL_NOTCHES, so the record
+            // states that number rather than omitting it. This sentence is the only
+            // surviving description of the gesture — the command as typed is not
+            // persisted downstream — so an omission here is not restraint, it is the
+            // count being lost for good.
+            //
+            // It also decouples the record from the tool that replays it: a bare
+            // scroll recorded against a backend whose default was 3 replays as 5 once
+            // the defaults are aligned, and nothing in a countless record reveals the
+            // change. An explicit count pins the step to what actually happened.
+            let count = count.unwrap_or(DEFAULT_SCROLL_NOTCHES);
+            return match count {
+                1 => format!(
+                    "{}Scrolled {} 1 notch at X={}, Y={}",
+                    prefix, direction, position.x, position.y
+                ),
+                n => format!(
+                    "{}Scrolled {} {} notches at X={}, Y={}",
+                    prefix, direction, n, position.x, position.y
+                ),
+            };
+        }
+
         // Mouse actions with position
         let action_name = match action.action_type.as_str() {
             "left"         => "Left-clicked",
@@ -531,33 +656,121 @@ impl AgentServiceImpl {
             "middle"       => "Middle-clicked",
             "double"       => "Double-clicked",
             "triple"       => "Triple-clicked",
+            // `click` is the controller's alias for `left` and builds the identical
+            // argv, so it must record identically too. Without this arm it fell to the
+            // generic case below and the same gesture recorded as "Performed action",
+            // which names no button and no click — a worse record for the operator who
+            // used the documented alias.
+            "click"        => "Left-clicked",
             "drag"         => "Dragged",
             "move"         => "Moved cursor to",
-            "scroll_up"    => "Scrolled up at",
-            "scroll_down"  => "Scrolled down at",
             "hold"         => "Held button at",
             "release"      => "Released button at",
-            _              => "Performed action at",
+            // No trailing preposition: the format strings below supply "at X=…", and
+            // "Performed action at" produced "Performed action at at X=".
+            _              => "Performed action",
         };
 
-        if action.is_here_command {
-            format!("{} at X={}, Y={}", action_name, position.x, position.y)
-        } else if action.action_type == "drag" {
-            let tokens: Vec<&str> = command.split_whitespace().collect();
-            if tokens.len() >= 5 {
-                if let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
-                    tokens[0].parse::<i32>(),
-                    tokens[1].parse::<i32>(),
-                    tokens[3].parse::<i32>(),
-                    tokens[4].parse::<i32>(),
-                ) {
-                    return format!("Dragged from X={}, Y={} to X={}, Y={}", x1, y1, x2, y2);
-                }
-            }
-            format!("Dragged to X={}, Y={}", position.x, position.y)
+        // "Cmd+Left-clicked at …". A modifier held during a pointer action is part of
+        // the gesture — a Cmd-click adds to a selection where a plain click replaces
+        // it — so a record that drops it describes something that did not happen.
+        let action_name = if action.modifiers.is_empty() {
+            action_name.to_string()
         } else {
-            format!("{} at X={}, Y={}", action_name, position.x, position.y)
+            format!("{}+{}", action.modifiers.join("+"), action_name)
+        };
+
+        // A drag renders its own line, because the record has to carry the whole path.
+        // Three shapes were losing part of it, all of them the S074 failure again —
+        // a step that cannot be replayed from its own record:
+        //
+        //   `here drag 900 700`      returned from the is_here_command branch and
+        //                            recorded "Dragged at X=…", one point, reading
+        //                            like a stationary action. Destination lost.
+        //   `x y drag via … to …`    failed the integer parse on the `via` token and
+        //                            fell through to a destination-only string.
+        //                            Origin lost.
+        //   both forms               never recorded the waypoints at all, so a
+        //                            path-dependent drag could not be reproduced.
+        //
+        // The points are read from `command`, which is the command as issued, so
+        // nothing new crosses the wire. The origin is deliberately omitted rather than
+        // guessed for the `here` form: that form starts wherever the cursor already
+        // is, the pre-command read is not available here, and a "from" taken from the
+        // post-drag readback would name the destination twice.
+        if action.action_type == "drag" {
+            let (origin, waypoints, destination) =
+                Self::parse_drag_path(command, action.is_here_command);
+            let mut out = action_name;
+            if let Some((x, y)) = origin {
+                out.push_str(&format!(" from X={}, Y={}", x, y));
+            }
+            for (x, y) in waypoints {
+                out.push_str(&format!(" via X={}, Y={}", x, y));
+            }
+            match destination {
+                Some((x, y)) => out.push_str(&format!(" to X={}, Y={}", x, y)),
+                // The command named no destination this could read. The readback is
+                // then the only surviving evidence of where the drag ended.
+                None => out.push_str(&format!(" to X={}, Y={}", position.x, position.y)),
+            }
+            return out;
         }
+
+        format!("{} at X={}, Y={}", action_name, position.x, position.y)
+    }
+
+    /// The points a drag command names: its origin (absent for the `here` form, which
+    /// starts from wherever the cursor already is), any `via` waypoints in order, and
+    /// its destination.
+    ///
+    /// Reads the grammar the controllers build from — `<x2> <y2> [dwell <ms>]` or
+    /// `via <ax> <ay> [via …] to <x2> <y2> [dwell <ms>]` — so the record cannot
+    /// disagree with the gesture about which points were visited. A trailing
+    /// `dwell <ms>` is timing rather than geometry and is not part of the path.
+    fn parse_drag_path(
+        command: &str,
+        is_here: bool,
+    ) -> (Option<(i32, i32)>, Vec<(i32, i32)>, Option<(i32, i32)>) {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+
+        let pair = |a: Option<&&str>, b: Option<&&str>| -> Option<(i32, i32)> {
+            match (
+                a.and_then(|t| t.parse::<i32>().ok()),
+                b.and_then(|t| t.parse::<i32>().ok()),
+            ) {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => None,
+            }
+        };
+
+        // The verb sits at index 1 for `here`, index 2 for the coordinate form, and
+        // the path follows it. The coordinate form's leading pair is the origin.
+        let (verb_index, origin) = if is_here {
+            (1, None)
+        } else {
+            (2, pair(tokens.first(), tokens.get(1)))
+        };
+
+        let mut rest: &[&str] = tokens.get(verb_index + 1..).unwrap_or(&[]);
+        if rest.len() >= 2 && rest[rest.len() - 2] == "dwell" {
+            rest = &rest[..rest.len() - 2];
+        }
+
+        let mut waypoints = Vec::new();
+        let mut i = 0;
+        while rest.get(i) == Some(&"via") {
+            match pair(rest.get(i + 1), rest.get(i + 2)) {
+                Some(point) => waypoints.push(point),
+                None => break,
+            }
+            i += 3;
+        }
+        if rest.get(i) == Some(&"to") {
+            i += 1;
+        }
+
+        (origin, waypoints, pair(rest.get(i), rest.get(i + 1)))
     }
     
     // Capture mouse position after a successful mouse action, verifying it against
@@ -580,6 +793,7 @@ impl AgentServiceImpl {
         ok: bool,
         expected: Option<argv_policy::ExpectedPos>,
         before: Option<MousePosition>,
+        deferred_arrival: bool,
     ) -> MousePosition {
         if !(action.is_mouse && ok) {
             return MousePosition { x: 0, y: 0, captured: false };
@@ -650,13 +864,18 @@ impl AgentServiceImpl {
             return MousePosition { x: 0, y: 0, captured: false };
         };
 
-        for attempt in 0..MAX_POSITION_REREADS {
+        let rereads = if deferred_arrival {
+            DEFERRED_POSITION_REREADS
+        } else {
+            MAX_POSITION_REREADS
+        };
+        for attempt in 0..rereads {
             if position.captured && position.x == want.x && position.y == want.y {
                 return position;
             }
             debug!(
                 "Position readback {:?} != requested ({}, {}), re-read {}/{}",
-                (position.x, position.y), want.x, want.y, attempt + 1, MAX_POSITION_REREADS
+                (position.x, position.y), want.x, want.y, attempt + 1, rereads
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(
                 POSITION_REREAD_INTERVAL_MS,
@@ -709,6 +928,8 @@ impl AgentServiceImpl {
         };
         let expected = plan.expected_pos();
         let transition = plan.button_transition();
+        // Read before `run_plan` consumes the plan.
+        let deferred_arrival = plan.pointer_arrival_is_deferred();
 
         // A command that names no coordinate is verified against the cursor not
         // having moved, so the "before" sample has to be taken before it runs.
@@ -723,7 +944,7 @@ impl AgentServiceImpl {
             self.record_button_transition(transition, expected).await;
         }
         let position = self
-            .capture_position_if_mouse(&action, result.is_ok(), expected, before)
+            .capture_position_if_mouse(&action, result.is_ok(), expected, before, deferred_arrival)
             .await;
         (result, position, action)
     }
@@ -872,23 +1093,82 @@ impl AgentServiceImpl {
                 click,
                 key_code,
                 amount,
+                modifiers,
             } => {
+                // The focus click stays unmodified. It exists only to give the window
+                // the keys, and holding Cmd through it would make it a Cmd-click —
+                // changing the selection before the scroll even starts.
                 self.spawn_actuation(
                     argv_policy::Bin::Cliclick,
                     &[click, "w:50".to_string()],
                 )?;
+                let key_line = if modifiers.is_empty() {
+                    format!("key code {}", key_code)
+                } else {
+                    format!("key code {} using {{{}}}", key_code, modifiers.join(", "))
+                };
                 self.spawn_actuation(
                     argv_policy::Bin::Osascript,
                     &[
                         "-e".to_string(),
                         format!("tell application \"System Events\" to repeat {} times", amount),
                         "-e".to_string(),
-                        format!("key code {}", key_code),
+                        key_line,
                         "-e".to_string(),
                         "delay 0.02".to_string(),
                         "-e".to_string(),
                         "end repeat".to_string(),
                     ],
+                )?;
+                Ok("ok".to_string())
+            }
+            argv_policy::Plan::MiddleClick { click, flags } => {
+                // cliclick cannot middle-click, so this posts the CGEvent directly
+                // through JXA's Objective-C bridge — a tool already installed, rather
+                // than a new dependency or a compiled helper.
+                //
+                // The script is composed here, and every value interpolated into it is
+                // an integer this agent parsed: the coordinates from a validated
+                // cliclick point token and the flags from a closed list of modifier
+                // names. No client-supplied text reaches it, which is the same
+                // property the scroll path holds and the reason neither accepts a
+                // script over the wire.
+                //
+                // Constants are numeric rather than named so a gap in the bridge's
+                // metadata cannot silently resolve to undefined and post nothing:
+                //   25 kCGEventOtherMouseDown   26 kCGEventOtherMouseUp
+                //    2 kCGMouseButtonCenter      0 kCGHIDEventTap
+                let point = match click.strip_prefix("c:") {
+                    // The `here` form: read the cursor rather than moving it.
+                    Some(".") | None => {
+                        "$.CGEventGetLocation($.CGEventCreate($()))".to_string()
+                    }
+                    Some(coords) => {
+                        let (x, y) = coords.split_once(',').ok_or_else(|| {
+                            format!("middle click: malformed point '{}'", click)
+                        })?;
+                        let x: i32 = x.parse().map_err(|_| {
+                            format!("middle click: malformed x in '{}'", click)
+                        })?;
+                        let y: i32 = y.parse().map_err(|_| {
+                            format!("middle click: malformed y in '{}'", click)
+                        })?;
+                        format!("$.CGPointMake({}, {})", x, y)
+                    }
+                };
+                let script = format!(
+                    "ObjC.import('CoreGraphics');\
+                     var p = {point};\
+                     var d = $.CGEventCreateMouseEvent($(), 25, p, 2);\
+                     $.CGEventSetFlags(d, {flags});\
+                     $.CGEventPost(0, d);\
+                     var u = $.CGEventCreateMouseEvent($(), 26, p, 2);\
+                     $.CGEventSetFlags(u, {flags});\
+                     $.CGEventPost(0, u);"
+                );
+                self.spawn_actuation(
+                    argv_policy::Bin::Osascript,
+                    &["-l".to_string(), "JavaScript".to_string(), "-e".to_string(), script],
                 )?;
                 Ok("ok".to_string())
             }
@@ -1487,6 +1767,277 @@ mod tests {
         // that tightening it is a deliberate change rather than an accident.
         let svc = service(OsType::Macos);
         assert_eq!(typed(&svc, "type   x"), "Typed: x");
+    }
+
+    // ---- modifier-held pointer actions -------------------------------------
+    // A Cmd-click adds to a selection where a plain click replaces it, so the two are
+    // different gestures. The record is composed here, not in the controller: before
+    // the prefix was split off the verb, "770 310 #left" failed the `is_mouse` match
+    // and was stored as "Typed: 770 310 #left" — a pointer action recorded as text,
+    // with no coordinate captured.
+
+    fn recorded(svc: &AgentServiceImpl, command: &str, x: i32, y: i32) -> String {
+        let action = svc.parse_action_details(command);
+        let position = MousePosition { x, y, captured: true };
+        svc.build_detailed_message(&action, &position, command)
+    }
+
+    #[test]
+    fn a_modifier_held_click_names_the_modifier_in_the_record() {
+        let svc = service(OsType::Macos);
+        assert_eq!(
+            recorded(&svc, "770 310 #left", 770, 310),
+            "Cmd+Left-clicked at X=770, Y=310"
+        );
+        assert_eq!(
+            recorded(&svc, "770 310 #+left", 770, 310),
+            "Cmd+Shift+Left-clicked at X=770, Y=310"
+        );
+        assert_eq!(
+            recorded(&svc, "here +left", 12, 34),
+            "Shift+Left-clicked at X=12, Y=34"
+        );
+        assert_eq!(
+            recorded(&svc, "200 300 !drag 900 640", 900, 640),
+            "Option+Dragged from X=200, Y=300 to X=900, Y=640"
+        );
+    }
+
+    #[test]
+    fn a_modified_pointer_action_is_still_a_pointer_action() {
+        // `is_mouse` gates the position readback. If the prefix stayed on the verb the
+        // command would report no coordinate at all, on top of the wrong wording.
+        let svc = service(OsType::Macos);
+        for command in ["770 310 #left", "here !double", "200 300 ^drag 900 640"] {
+            let action = svc.parse_action_details(command);
+            assert!(action.is_mouse, "{command:?} was not read as a mouse action");
+            assert!(!action.modifiers.is_empty(), "{command:?} lost its modifier");
+        }
+    }
+
+    #[test]
+    fn the_modifier_name_follows_the_platform() {
+        // The same symbol is Cmd on macOS and Super on Linux, as it already is for a
+        // chord. One table drives both.
+        assert_eq!(
+            recorded(&service(OsType::Linux), "770 310 #left", 770, 310),
+            "Super+Left-clicked at X=770, Y=310"
+        );
+        assert_eq!(
+            recorded(&service(OsType::Windows), "770 310 !left", 770, 310),
+            "Alt+Left-clicked at X=770, Y=310"
+        );
+    }
+
+    #[test]
+    fn an_unmodified_action_reads_exactly_as_before() {
+        let svc = service(OsType::Macos);
+        assert_eq!(recorded(&svc, "770 310 left", 770, 310), "Left-clicked at X=770, Y=310");
+        // The doubled "at" is pre-existing and deliberately pinned, not endorsed: the
+        // action-name table mixes conventions ("Left-clicked" without the preposition,
+        // "Held button at" with it) and the format string appends " at X=…" to both.
+        // Every hold, release and scroll step already in the corpus reads this way, so
+        // correcting it is a record-format change for ma-core to agree to, not a
+        // cleanup to slip in beside a feature.
+        assert_eq!(recorded(&svc, "here hold", 5, 6), "Held button at at X=5, Y=6");
+        assert_eq!(
+            recorded(&svc, "200 300 drag 900 640", 900, 640),
+            "Dragged from X=200, Y=300 to X=900, Y=640"
+        );
+        assert_eq!(recorded(&svc, "position", 1, 2), "Position: X=1, Y=2");
+    }
+
+    #[test]
+    fn a_token_of_modifiers_alone_is_not_read_as_a_verb() {
+        // The controller cannot emit this. If one ever arrives it must not resolve to
+        // some default click — an unnamed gesture recorded as a real one is the
+        // failure this whole path exists to prevent.
+        let svc = service(OsType::Macos);
+        let action = svc.parse_action_details("770 310 #");
+        assert!(!action.is_mouse);
+        assert!(action.modifiers.is_empty());
+        assert_eq!(action.action_type, "#");
+    }
+
+    #[test]
+    fn a_horizontal_scroll_is_recorded_as_a_scroll() {
+        // scroll_left/scroll_right are macOS verbs the controller emits, but they were
+        // missing from the mouse-verb match, so they recorded as "Typed: 960 540
+        // scroll_left 3". Same defect class as the modifier prefix, found alongside it.
+        let svc = service(OsType::Macos);
+        assert_eq!(
+            recorded(&svc, "960 540 scroll_left 3", 960, 540),
+            "Scrolled left 3 notches at X=960, Y=540"
+        );
+        assert_eq!(
+            recorded(&svc, "960 540 scroll_right 3", 960, 540),
+            "Scrolled right 3 notches at X=960, Y=540"
+        );
+    }
+
+    // ---- the scroll repeat count reaches the record -------------------------
+    // "here scroll_down 5" and "here scroll_down 1" stored the same string, so a
+    // captured scroll could not be replayed from the record (S074). The count was
+    // always on the wire — human_command is the command as issued — and only the
+    // rendering dropped it.
+
+    #[test]
+    fn a_scroll_records_how_far_it_scrolled() {
+        let svc = service(OsType::Macos);
+        assert_eq!(
+            recorded(&svc, "here scroll_down 5", 770, 310),
+            "Scrolled down 5 notches at X=770, Y=310"
+        );
+        assert_eq!(
+            recorded(&svc, "960 540 scroll_up 3", 960, 540),
+            "Scrolled up 3 notches at X=960, Y=540"
+        );
+        // Singular, matching the console echo's existing wording.
+        assert_eq!(
+            recorded(&svc, "here scroll_up 1", 770, 310),
+            "Scrolled up 1 notch at X=770, Y=310"
+        );
+    }
+
+    #[test]
+    fn a_drag_records_every_point_it_visited() {
+        // Each of these lost part of the path on hardware. A record that cannot
+        // reproduce the gesture is the S074 failure: the step looks fine and replays
+        // as something else.
+        let svc = service(OsType::Macos);
+
+        // The plain coordinate form is unchanged, byte for byte. Memory Archive's
+        // converter already parses this wording, so the fix must not disturb it.
+        assert_eq!(
+            recorded(&svc, "500 400 drag 900 700", 900, 700),
+            "Dragged from X=500, Y=400 to X=900, Y=700"
+        );
+
+        // Waypoints were never recorded, and the `via` token failed the old integer
+        // parse so the origin was dropped with them.
+        assert_eq!(
+            recorded(&svc, "500 400 drag via 700 500 via 800 600 to 900 700", 900, 700),
+            "Dragged from X=500, Y=400 via X=700, Y=500 via X=800, Y=600 to X=900, Y=700"
+        );
+
+        // The `here` form recorded "Dragged at X=…", one point, reading like a
+        // stationary action. It names no origin because it has none to name — it
+        // starts wherever the cursor is — but the destination is in the command.
+        assert_eq!(
+            recorded(&svc, "here drag 900 700", 900, 700),
+            "Dragged to X=900, Y=700"
+        );
+        assert_eq!(
+            recorded(&svc, "here drag via 700 500 to 900 700", 900, 700),
+            "Dragged via X=700, Y=500 to X=900, Y=700"
+        );
+
+        // A trailing dwell is timing, not geometry, and must not be read as a point.
+        assert_eq!(
+            recorded(&svc, "500 400 drag 900 700 dwell 1200", 900, 700),
+            "Dragged from X=500, Y=400 to X=900, Y=700"
+        );
+
+        // Modifiers still prefix the whole thing.
+        assert_eq!(
+            recorded(&svc, "500 400 #drag 900 700", 900, 700),
+            "Cmd+Dragged from X=500, Y=400 to X=900, Y=700"
+        );
+    }
+
+    #[test]
+    fn the_click_alias_records_as_the_click_it_performs() {
+        // `click` and `left` build the identical argv, so the same gesture must not
+        // record two different ways. `click` had no arm in the phrase map and fell to
+        // the generic case, which named neither a button nor a click — and carried a
+        // doubled preposition from "Performed action at" + " at X=".
+        let svc = service(OsType::Macos);
+        assert_eq!(
+            recorded(&svc, "770 310 click", 770, 310),
+            "Left-clicked at X=770, Y=310"
+        );
+        assert_eq!(
+            recorded(&svc, "770 310 click", 770, 310),
+            recorded(&svc, "770 310 left", 770, 310),
+        );
+        assert_eq!(
+            recorded(&svc, "here #click", 770, 310),
+            "Cmd+Left-clicked at X=770, Y=310"
+        );
+    }
+
+    #[test]
+    fn every_mouse_verb_has_a_phrase_of_its_own() {
+        // `click` reached the generic arm and recorded "Performed action at at X=…" —
+        // a gesture named after nothing, for a verb the help text advertises. Rather
+        // than test the generic arm (no verb reaches it now), assert the property that
+        // failed: every verb `parse_action_details` classifies as a mouse action must
+        // render as itself. A verb added to that list without a phrase fails here
+        // instead of shipping an unnamed record.
+        let svc = service(OsType::Macos);
+        for command in [
+            "770 310 left", "770 310 right", "770 310 middle", "770 310 double",
+            "770 310 triple", "770 310 click", "770 310 move", "770 310 hold",
+            "770 310 release", "500 400 drag 900 700",
+            "770 310 scroll_up", "770 310 scroll_down",
+            "770 310 scroll_left", "770 310 scroll_right",
+            "position",
+        ] {
+            let action = svc.parse_action_details(command);
+            assert!(action.is_mouse, "{command:?} is no longer a mouse action");
+            let got = recorded(&svc, command, 770, 310);
+            assert!(
+                !got.contains("Performed action"),
+                "{command:?} has no phrase of its own and recorded as {got:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_scroll_that_names_no_count_records_the_default() {
+        // A command that names no count still scrolls DEFAULT_SCROLL_NOTCHES, and the
+        // record says so. The record is the only surviving description of the gesture,
+        // so a silent omission loses the count rather than being cautious about it —
+        // and a countless record would replay differently against a backend whose
+        // default had moved.
+        let svc = service(OsType::Macos);
+        assert_eq!(
+            recorded(&svc, "here scroll_down", 770, 310),
+            "Scrolled down 5 notches at X=770, Y=310"
+        );
+        assert_eq!(
+            recorded(&svc, "960 540 scroll_down", 960, 540),
+            "Scrolled down 5 notches at X=960, Y=540"
+        );
+        // A non-numeric token in the count position is not a count, so the default
+        // applies — the same thing the backends do with it.
+        assert_eq!(
+            recorded(&svc, "here scroll_down fast", 770, 310),
+            "Scrolled down 5 notches at X=770, Y=310"
+        );
+    }
+
+    #[test]
+    fn the_recorded_default_is_the_one_the_backends_apply() {
+        // Guards the constant itself rather than a sentence built from it: if
+        // DEFAULT_SCROLL_NOTCHES moves without the three backends moving with it, the
+        // agent starts reporting a count that was never performed. The cross-backend
+        // half of this lives in tests/unit/test_actuation_argv.py, which reads all
+        // four sources including this file.
+        assert_eq!(DEFAULT_SCROLL_NOTCHES, 5);
+    }
+
+    #[test]
+    fn a_modified_scroll_records_both_the_modifier_and_the_count() {
+        let svc = service(OsType::Macos);
+        assert_eq!(
+            recorded(&svc, "770 310 #scroll_down 3", 770, 310),
+            "Cmd+Scrolled down 3 notches at X=770, Y=310"
+        );
+        assert_eq!(
+            recorded(&svc, "here #+scroll_up 5", 770, 310),
+            "Cmd+Shift+Scrolled up 5 notches at X=770, Y=310"
+        );
     }
 
     #[test]

@@ -64,6 +64,43 @@ class MacOSActuation:
         '{Fn}': 'fn'
     }
 
+    # Modifier symbol → display name, shared by the `press` echo and the mouse echo so
+    # a Cmd-click and a Cmd-chord name the key identically.
+    MODIFIER_DISPLAY = {'^': 'Ctrl', '+': 'Shift', '!': 'Option', '#': 'Cmd',
+                        '⌃': 'Ctrl', '⇧': 'Shift', '⌥': 'Option', '⌘': 'Cmd'}
+
+    # Modifier symbols accepted as a prefix on a MOUSE action, and the cliclick key
+    # name each resolves to.
+    #
+    # Deliberately the ASCII subset of MODIFIER_MAP. The Unicode glyphs remain valid
+    # for `press`, but the guest agent composes the recorded string from this same
+    # prefix and reads the ASCII symbols only; the two halves ship separately, so a
+    # glyph accepted here would actuate a Cmd-click and record it as typed text. The
+    # mouse grammar is held to what both sides agree on, and the Unicode form is
+    # refused with a message naming the ASCII equivalent.
+    MOUSE_MODIFIER_SYMBOLS = {'^': 'ctrl', '+': 'shift', '!': 'alt', '#': 'cmd'}
+
+    # Notches a scroll performs when the command names no count. One constant per
+    # backend, used by both the argv builder and the console echo, because those two
+    # disagreed: the builders scrolled 5 while the echo told the operator "1 notch".
+    # test_scroll_default_count_is_the_same_on_every_backend reads this and its
+    # counterparts, and fails if any of them drifts.
+    DEFAULT_SCROLL_NOTCHES = 5
+
+    # Pointer verbs a modifier may be held across. `move` and `position` are absent
+    # because no held modifier changes what they do — accepting the prefix and
+    # ignoring it would record a gesture that was never performed.
+    # The scroll verbs are included, with a caveat worth knowing: macOS scroll here is
+    # an arrow-key repeat, not a wheel event (see build_scroll_command), so "#scroll_down"
+    # actuates Cmd+Down — a real gesture, but not the wheel-zoom that Cmd+scroll is in
+    # apps that zoom. On Linux and Windows the same command drives the real wheel
+    # buttons and does zoom.
+    MOUSE_MODIFIER_ACTIONS = frozenset({
+        'left', 'click', 'right', 'middle', 'double', 'triple',
+        'hold', 'release', 'drag',
+        'scroll_up', 'scroll_down', 'scroll_left', 'scroll_right',
+    })
+
     # Brace names that stand for a literal character. The modifier symbols are
     # consumed by the prefix parser and can never appear as a target key, so these
     # names are the only way to reach them: "#{Plus}" is Cmd+Plus, where "#+" would
@@ -209,8 +246,7 @@ class MacOSActuation:
             "{F11}"     -> "F11"
             "{Enter}"   -> "Return"
         """
-        modifier_display = {'^': 'Ctrl', '+': 'Shift', '!': 'Option', '#': 'Cmd',
-                            '⌃': 'Ctrl', '⇧': 'Shift', '⌥': 'Option', '⌘': 'Cmd'}
+        modifier_display = self.MODIFIER_DISPLAY
         special_display = {
             '{Enter}': 'Return', '{Return}': 'Return', '{Esc}': 'Esc',
             '{Tab}': 'Tab', '{Space}': 'Space',
@@ -283,6 +319,89 @@ class MacOSActuation:
             )
         return code
 
+    # Helper method to split a modifier prefix off a mouse action token
+    def _split_mouse_modifiers(self, token: str) -> Tuple[List[str], str]:
+        """Split "<mods><action>" into (cliclick modifier names, action).
+
+        Returns ([], token) when there is no prefix at all.
+
+        Raises ValueError with an operator-readable message when a prefix is present
+        but the result cannot be actuated. It never falls back to the unmodified
+        action: a plain click where a Cmd-click was intended succeeds, looks right in
+        the console and records as a different gesture than the one performed.
+        """
+        mods: List[str] = []
+        i = 0
+        while i < len(token) and token[i] in self.MOUSE_MODIFIER_SYMBOLS:
+            mod = self.MOUSE_MODIFIER_SYMBOLS[token[i]]
+            if mod not in mods:
+                mods.append(mod)
+            i += 1
+
+        action = token[i:]
+
+        if not mods:
+            # A Unicode glyph is a modifier the operator plainly meant; refusing it
+            # with the ASCII equivalent beats failing as an unknown action.
+            head = token[:1]
+            if head in self.MODIFIER_MAP:
+                ascii_form = next(
+                    (sym for sym, name in self.MOUSE_MODIFIER_SYMBOLS.items()
+                     if name == self.MODIFIER_MAP[head]),
+                    None,
+                )
+                raise ValueError(
+                    f"{head!r} is not accepted as a mouse modifier; write it as "
+                    f"{ascii_form!r} — the guest renders the record from this prefix "
+                    f"and reads the ASCII symbols only"
+                )
+            return [], action
+
+        if not action:
+            raise ValueError(f"{token!r} is a modifier prefix with no mouse action after it")
+
+        if action not in self.MOUSE_MODIFIER_ACTIONS:
+            if action in self.MOUSE_ACTIONS:
+                raise ValueError(
+                    f"{action!r} does not take a modifier prefix; modifiers apply to "
+                    f"{', '.join(sorted(self.MOUSE_MODIFIER_ACTIONS))}"
+                )
+            raise ValueError(
+                f"unknown mouse action {action!r} after the modifier prefix "
+                f"{token[:i]!r}"
+            )
+
+        return mods, action
+
+    # Helper method to decide whether a token names a mouse action
+    def _is_mouse_action_token(self, token: str) -> bool:
+        """Whether a token names a mouse action, with or without a modifier prefix.
+
+        Routing only. A token whose prefix is malformed is admitted so the builder can
+        refuse it by name; otherwise the router would reject it as an unrecognised
+        command and the operator would not learn which part was wrong.
+        """
+        if token in self.MOUSE_ACTIONS:
+            return True
+        stripped = token.lstrip(''.join(self.MOUSE_MODIFIER_SYMBOLS))
+        return bool(stripped) and stripped != token
+
+    # Helper method to name the modifiers held during a mouse action, for the echo
+    def _describe_mouse_modifiers(self, token: str) -> Tuple[str, str]:
+        """(display prefix, bare action) for the console echo, e.g. ("Cmd+", "left").
+
+        Never raises: by the time the echo runs the command has already actuated, and
+        a display helper must not be able to turn a completed action into an error.
+        """
+        parts: List[str] = []
+        i = 0
+        while i < len(token) and token[i] in self.MOUSE_MODIFIER_SYMBOLS:
+            name = self.MODIFIER_DISPLAY[token[i]]
+            if name not in parts:
+                parts.append(name)
+            i += 1
+        return (''.join(f"{p}+" for p in parts), token[i:])
+
     # Helper method to extract coordinates from command (if present)
     def _extract_coordinates_from_command(self, command: str) -> Optional[Tuple[int, int]]:
         """
@@ -328,7 +447,7 @@ class MacOSActuation:
                 int(tokens[0])
                 int(tokens[1])
                 # Has coordinates - likely mouse command
-                if len(tokens) >= 3 and tokens[2] in self.MOUSE_ACTIONS:
+                if len(tokens) >= 3 and self._is_mouse_action_token(tokens[2]):
                     return 'mouse', command
                 elif len(tokens) == 2:
                     # Just coordinates, assume move
@@ -338,7 +457,7 @@ class MacOSActuation:
         
         # Check for "here" keyword (mouse)
         if tokens[0] == 'here':
-            if len(tokens) >= 2 and tokens[1] in self.MOUSE_ACTIONS:
+            if len(tokens) >= 2 and self._is_mouse_action_token(tokens[1]):
                 return 'mouse', command
             else:
                 return 'invalid', command
@@ -378,13 +497,21 @@ class MacOSActuation:
     
     # Helper method to build the scroll argv
     def build_scroll_command(self, x: Optional[int], y: Optional[int],
-                              direction: str, amount: int) -> Optional[List[str]]:
+                              direction: str, amount: int,
+                              modifiers: Optional[List[str]] = None) -> Optional[List[str]]:
         """Build the `__scroll__` argv for a scroll action.
 
         Scrolling is the one action needing two binaries (a cliclick focus click, then
         an AppleScript key-repeat loop), so it is sent as a sentinel the agent expands
         itself rather than as a compound shell string. The agent authors both scripts;
         only the bounded parameters below cross the wire.
+
+        Held modifiers are appended as a fifth element and ride on each arrow-key
+        event, which is why they cannot be stranded: there is no separate key-down to
+        leave outstanding if the repeat loop fails. Note that this makes macOS scroll
+        an arrow-key gesture — "#scroll_down" is Cmd+Down, not the wheel-zoom that
+        Cmd+scroll performs in apps that zoom. Linux and Windows drive the real wheel
+        buttons and do zoom.
         """
         # Map direction to AppleScript Key Codes
         # 126=Up, 125=Down, 123=Left, 124=Right
@@ -401,7 +528,10 @@ class MacOSActuation:
 
         # Focus click (ensures the window receives the keys), then the repeat count.
         click = f"c:{x},{y}" if x is not None and y is not None else "c:."
-        return ['__scroll__', click, str(key_code), str(amount)]
+        argv = ['__scroll__', click, str(key_code), str(amount)]
+        if modifiers:
+            argv.append(','.join(modifiers))
+        return argv
     
     # Helper method to parse the tokens following "drag"
     def _parse_drag(self, rest: List[str]) -> Tuple[List[Tuple[int, int]], Tuple[int, int], int]:
@@ -505,56 +635,109 @@ class MacOSActuation:
             # cliclick args contain no whitespace/free-text, so split() is exact.
             return (cli_str.split(), command)
 
-        def scroll(x, y, action, amount) -> Optional[Tuple[List[str], str]]:
-            argv = self.build_scroll_command(x, y, action, amount)
+        def scroll(x, y, action, amount, mods=None) -> Optional[Tuple[List[str], str]]:
+            argv = self.build_scroll_command(x, y, action, amount, mods)
             return (argv, command) if argv else None
+
+        def middle(x, y, mods) -> Tuple[List[str], str]:
+            """Build the `__middle__` sentinel.
+
+            cliclick has no middle button -- `mc:` is not one of its actions, and every
+            middle click on macOS failed with "Unrecognized action shortcut". macOS
+            supports the button natively, so the agent posts a CGEvent for it; this
+            sends the click point and the modifier names and no script text.
+            """
+            argv = ['__middle__', 'c:.' if x is None else f'c:{x},{y}']
+            if mods:
+                argv.append(','.join(mods))
+            return (argv, command)
+
+        def emit(mods: List[str], spec: str) -> Tuple[List[str], str]:
+            """Bracket a cliclick token sequence with the held modifiers.
+
+            kd:/ku: apply for the rest of the invocation, so the whole sequence — a
+            drag's press, moves and release included — runs with the modifier down.
+            Both halves are emitted here or neither is: every path that can fail does
+            so before this point and returns None, so no argv this builder produces
+            carries a kd: without its matching ku:.
+
+            The earlier version of this note claimed no argv could, full stop. That was
+            the original finding: true of the builder, false of the system, since a
+            caller with the execute scope never passes through here and `cliclick
+            kd:cmd c:770,310` left Cmd held on the guest past process exit. The
+            invariant is enforced in `check_modifier_bracket` (agent, argv_policy.rs).
+            """
+            if mods:
+                mod_str = ','.join(mods)
+                spec = f"kd:{mod_str} {spec} ku:{mod_str}"
+            return m(f"{cli} {spec}")
 
         # Position command - Returns current coordinates
         if tokens[0] == 'position':
             return m(f"{cli} p:.")
 
-        # CASE A: "here <action> [amount]"
+        # CASE A: "here [<mods>]<action> [amount]"
         if tokens[0] == 'here':
-            action = tokens[1] if len(tokens) > 1 else 'left'
+            try:
+                mods, action = self._split_mouse_modifiers(
+                    tokens[1] if len(tokens) > 1 else 'left')
+            except ValueError as e:
+                print(f"[✗] {e}")
+                return None
 
             here_map = {
                 'left': 'c:.', 'click': 'c:.', 'right': 'rc:.', 'double': 'dc:.',
-                'triple': 'tc:.', 'middle': 'mc:.', 'hold': 'dd:.', 'release': 'du:.',
+                'triple': 'tc:.', 'hold': 'dd:.', 'release': 'du:.',
             }
+            if action == 'middle':
+                return middle(None, None, mods)
             if action in here_map:
-                return m(f"{cli} {here_map[action]}")
+                return emit(mods, here_map[action])
             elif 'scroll' in action:
-                amount = int(tokens[2]) if len(tokens) > 2 else 5
-                return scroll(None, None, action, amount)
+                amount = int(tokens[2]) if len(tokens) > 2 else self.DEFAULT_SCROLL_NOTCHES
+                return scroll(None, None, action, amount, mods)
             return None
 
-        # CASE B: "x y <action> [amount]"
+        # CASE B: "x y [<mods>]<action> [amount]"
         try:
             x, y = int(tokens[0]), int(tokens[1])
             if len(tokens) == 2:
                 return m(f"{cli} m:{x},{y}")
 
-            action = tokens[2]
+            try:
+                mods, action = self._split_mouse_modifiers(tokens[2])
+            except ValueError as e:
+                # Caught here rather than by the enclosing handler, which would swallow
+                # the message and fall through to the standalone case.
+                print(f"[✗] {e}")
+                return None
+
             coord_map = {
                 'move': 'm', 'left': 'c', 'click': 'c', 'right': 'rc',
-                'double': 'dc', 'triple': 'tc', 'middle': 'mc', 'hold': 'dd', 'release': 'du',
+                'double': 'dc', 'triple': 'tc', 'hold': 'dd', 'release': 'du',
             }
+            if action == 'middle':
+                return middle(x, y, mods)
             if action in coord_map:
-                return m(f"{cli} {coord_map[action]}:{x},{y}")
+                return emit(mods, f"{coord_map[action]}:{x},{y}")
             elif action == 'drag' and len(tokens) >= 5:
                 try:
                     spec = self._build_drag_spec(x, y, tokens[3:])
                 except ValueError as e:
                     print(f"[✗] {e}")
                     return None
-                return m(f"{cli} {spec}")
+                return emit(mods, spec)
             elif 'scroll' in action:
-                amount = int(tokens[3]) if len(tokens) > 3 else 5
-                return scroll(x, y, action, amount)
+                amount = int(tokens[3]) if len(tokens) > 3 else self.DEFAULT_SCROLL_NOTCHES
+                return scroll(x, y, action, amount, mods)
         except (ValueError, IndexError):
             pass
 
-        # CASE C: Standalone actions
+        # CASE C: Standalone actions.
+        #
+        # No modifier prefix here: a bare "#left" is claimed by detect_command_type's
+        # keyboard rule and becomes "press #left". Only the coordinate and `here`
+        # forms are unambiguous, so those are the only two that take modifiers.
         action = tokens[0]
         standalone_map = {
             'left': 'c:.', 'click': 'c:.', 'right': 'rc:.', 'double': 'dc:.',
@@ -563,7 +746,7 @@ class MacOSActuation:
         if action in standalone_map:
             return m(f"{cli} {standalone_map[action]}")
         elif 'scroll' in action:
-            amount = int(tokens[1]) if len(tokens) > 1 else 5
+            amount = int(tokens[1]) if len(tokens) > 1 else self.DEFAULT_SCROLL_NOTCHES
             return scroll(None, None, action, amount)
 
         return None
@@ -785,26 +968,36 @@ class MacOSActuation:
                 action_tok = tokens[1] if is_here and len(tokens) >= 2 else (tokens[2] if len(tokens) >= 3 else None)
                 pos_str = f"X={position_after[0]}, Y={position_after[1]}" if position_after else "X=?, Y=?"
 
+                # A modifier held across the action changes what the action does, so
+                # the echo names it. Split off here so the verb branches below stay a
+                # match on the bare verb.
+                mod_prefix = ''
+                if action_tok is not None:
+                    mod_prefix, action_tok = self._describe_mouse_modifiers(action_tok)
+
                 if action_tok == 'drag' and len(tokens) >= 5:
                     # Read the endpoint from the parser that built the argv, so the
                     # reported destination cannot disagree with the actuated one.
                     dest = self._drag_destination(tokens[3:])
                     if dest:
-                        print(f"Executed: {command}, dragged from X={tokens[0]}, Y={tokens[1]} to X={dest[0]}, Y={dest[1]}, time taken: {ms}ms")
+                        print(f"Executed: {command}, {mod_prefix}dragged from X={tokens[0]}, Y={tokens[1]} to X={dest[0]}, Y={dest[1]}, time taken: {ms}ms")
                     else:
                         print(f"Executed: {command}, at {pos_str}, time taken: {ms}ms")
                 elif action_tok in ('left', 'click', 'right', 'double', 'triple', 'middle'):
                     click_label = 'double' if action_tok == 'double' else ('triple' if action_tok == 'triple' else action_tok)
-                    print(f"Executed: {command}, clicked {click_label} at {pos_str}, time taken: {ms}ms")
+                    print(f"Executed: {command}, clicked {mod_prefix}{click_label} at {pos_str}, time taken: {ms}ms")
                 elif action_tok in ('scroll_up', 'scroll_down', 'scroll_left', 'scroll_right'):
                     direction = action_tok.replace('scroll_', '')
                     count_idx = 2 if is_here else 3
                     try:
                         n = int(tokens[count_idx])
                     except (IndexError, ValueError):
-                        n = 1
+                        # The command named no count, so the backend performs the
+                        # default — say that number rather than 1, which described
+                        # neither the gesture nor the record.
+                        n = self.DEFAULT_SCROLL_NOTCHES
                     notch_str = "1 notch" if n == 1 else f"{n} notches"
-                    print(f"Executed: {command}, scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
+                    print(f"Executed: {command}, {mod_prefix}scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
                 elif action_tok == 'move':
                     print(f"Executed: {command}, moved to {pos_str}, time taken: {ms}ms")
                 else:
@@ -887,6 +1080,10 @@ class MacOSActuation:
 ║   … via <x> <y> to …   → Drag along a path (max 16)      ║
 ║ here <action>          → Action at current position      ║
 ║ position               → Get current mouse position      ║
+║                                                          ║
+║ <x> <y> <mods><action> → Hold modifiers for the action   ║
+║ here <mods><action>    → e.g. #left, +left, !drag        ║
+║   Modifiers: ^ + ! # (as in press); not on move/position ║
 ╠══════════════════════════════════════════════════════════╣
 ║ KEYBOARD COMMANDS                                        ║
 ╠══════════════════════════════════════════════════════════╣
@@ -915,6 +1112,9 @@ class MacOSActuation:
 ║ 200 200 drag 800 600   → Drag operation                  ║
 ║ 200 200 drag 800 600 dwell 150                           ║
 ║                        → Slower drag for fussy targets   ║
+║ 770 310 #left          → Cmd-click (add to selection)    ║
+║ 770 310 +left          → Shift-click (extend selection)  ║
+║ 200 300 !drag 900 640  → Opt-drag (copy, not move)       ║
 ║ 500 500 scroll_down 10 → Scroll down 10 notches          ║
 ║ position               → Get mouse coordinates           ║
 ╠══════════════════════════════════════════════════════════╣

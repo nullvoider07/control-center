@@ -88,6 +88,33 @@ class LinuxActuation:
 
     # Keyboard indicators (for detection)
     KEYBOARD_INDICATORS = set(SPECIAL_KEYS_MAP.keys())
+
+    # Modifier symbol → display name, shared by the `press` echo and the mouse echo so
+    # a Ctrl-click and a Ctrl-chord name the key identically.
+    MODIFIER_DISPLAY = {'^': 'Ctrl', '+': 'Shift', '!': 'Alt', '#': 'Super'}
+
+    # Modifier symbols accepted as a prefix on a MOUSE action, and the xdotool keysym
+    # each resolves to. The agent restricts `keydown`/`keyup` in a pointer chain to
+    # exactly these four (argv_policy::POINTER_MODIFIERS), so the two halves cannot
+    # drift into a form the guest refuses.
+    MOUSE_MODIFIER_SYMBOLS = {'^': 'ctrl', '+': 'shift', '!': 'alt', '#': 'super'}
+
+    # Notches a scroll performs when the command names no count. One constant per
+    # backend, used by both the argv builder and the console echo, because those two
+    # disagreed: the backends scrolled 5 while the echo told the operator "1 notch".
+    # test_scroll_default_count_is_the_same_on_every_backend reads this and its
+    # counterparts, and fails if any of them drifts.
+    DEFAULT_SCROLL_NOTCHES = 5
+
+
+    # Pointer verbs a modifier may be held across — the verbs this backend already
+    # has, and no others. `move` and `position` are excluded because no held modifier
+    # changes what they do, and accepting the prefix while ignoring it would record a
+    # gesture that was never performed.
+    MOUSE_MODIFIER_ACTIONS = frozenset({
+        'left', 'right', 'middle', 'double', 'drag', 'hold', 'release',
+        'scroll_up', 'scroll_down',
+    })
     
     # Class-level default so instances built without __init__ (tests, replay
     # helpers) still have a defined policy rather than raising on attribute access.
@@ -118,7 +145,7 @@ class LinuxActuation:
             "{F5}"      -> "F5"
             "{Enter}"   -> "Enter"
         """
-        modifier_display = {'^': 'Ctrl', '+': 'Shift', '!': 'Alt', '#': 'Super'}
+        modifier_display = self.MODIFIER_DISPLAY
         special_display = {
             '{LCtrl}': 'Ctrl', '{RCtrl}': 'Ctrl',
             '{LShift}': 'Shift', '{RShift}': 'Shift',
@@ -154,6 +181,69 @@ class LinuxActuation:
             else:
                 parts.append(key_part)
         return '+'.join(parts) if parts else keys
+
+    # Helper method to split a modifier prefix off a mouse action token
+    def _split_mouse_modifiers(self, token: str) -> Tuple[List[str], str]:
+        """Split "<mods><action>" into (xdotool keysyms, action).
+
+        Returns ([], token) when there is no prefix. Raises ValueError with an
+        operator-readable message when a prefix is present but the result cannot be
+        actuated — never degrading to the unmodified action, which would succeed, echo
+        plausibly and record a gesture other than the one performed.
+        """
+        mods: List[str] = []
+        i = 0
+        while i < len(token) and token[i] in self.MOUSE_MODIFIER_SYMBOLS:
+            mod = self.MOUSE_MODIFIER_SYMBOLS[token[i]]
+            if mod not in mods:
+                mods.append(mod)
+            i += 1
+
+        action = token[i:]
+        if not mods:
+            return [], action
+
+        if not action:
+            raise ValueError(f"{token!r} is a modifier prefix with no mouse action after it")
+
+        if action not in self.MOUSE_MODIFIER_ACTIONS:
+            if action in self.MOUSE_ACTIONS:
+                raise ValueError(
+                    f"{action!r} does not take a modifier prefix; modifiers apply to "
+                    f"{', '.join(sorted(self.MOUSE_MODIFIER_ACTIONS))}"
+                )
+            raise ValueError(
+                f"unknown mouse action {action!r} after the modifier prefix {token[:i]!r}"
+            )
+
+        return mods, action
+
+    # Helper method to decide whether a token names a mouse action
+    def _is_mouse_action_token(self, token: str) -> bool:
+        """Whether a token names a mouse action, with or without a modifier prefix.
+
+        Routing only. A malformed prefix is admitted so the builder can refuse it by
+        name rather than the router rejecting it as an unrecognised command.
+        """
+        if token in self.MOUSE_ACTIONS:
+            return True
+        stripped = token.lstrip(''.join(self.MOUSE_MODIFIER_SYMBOLS))
+        return bool(stripped) and stripped != token
+
+    # Helper method to name the modifiers held during a mouse action, for the echo
+    def _describe_mouse_modifiers(self, token: str) -> Tuple[str, str]:
+        """(display prefix, bare action) for the console echo, e.g. ("Ctrl+", "left").
+
+        Never raises: the command has already actuated by the time the echo runs.
+        """
+        parts: List[str] = []
+        i = 0
+        while i < len(token) and token[i] in self.MOUSE_MODIFIER_SYMBOLS:
+            name = self.MODIFIER_DISPLAY[token[i]]
+            if name not in parts:
+                parts.append(name)
+            i += 1
+        return (''.join(f"{p}+" for p in parts), token[i:])
 
     # Translate AutoHotkey modifier syntax to xdotool syntax
     def _translate_modifier_keys(self, text: str) -> str:
@@ -235,16 +325,16 @@ class LinuxActuation:
         if tokens[0] in ['here', 'position']:
             if tokens[0] == 'position':
                 return 'mouse', 'position'
-            if len(tokens) >= 2 and tokens[1] in self.MOUSE_ACTIONS:
+            if len(tokens) >= 2 and self._is_mouse_action_token(tokens[1]):
                 return 'mouse', command
             return 'invalid', command
-        
+
         # Check if starts with coordinates (numbers)
         if len(tokens) >= 2:
             try:
                 int(tokens[0])
                 int(tokens[1])
-                if len(tokens) >= 3 and tokens[2] in self.MOUSE_ACTIONS:
+                if len(tokens) >= 3 and self._is_mouse_action_token(tokens[2]):
                     return 'mouse', command
                 elif len(tokens) == 2:
                     return 'mouse', f"{command} move"
@@ -281,7 +371,26 @@ class LinuxActuation:
         """
         parts = command.strip().split()
 
-        def out(tokens: List[str]) -> Tuple[List[str], str]:
+        def out(tokens: List[str], mods: Optional[List[str]] = None) -> Tuple[List[str], str]:
+            """Wrap a pointer chain in keydown/keyup for any held modifiers.
+
+            One xdotool invocation, so the release cannot be lost between commands, and
+            one keydown per modifier so every token stays a single keysym the agent's
+            grammar accepts. Released in reverse order: last pressed, first released.
+            Every failure path returns None before reaching here, so no argv this
+            builder produces carries a keydown without its keyup.
+
+            That last sentence is about this function, not about the system: a caller
+            holding the execute scope reaches the agent without passing through here.
+            `xdotool keydown ctrl` sets the modifier on the X server, where it outlives
+            the process and reinterprets every later command. The invariant is enforced
+            in `check_pointer_modifier_bracket` (agent, argv_policy.rs); this is where
+            it is intended, not where it holds.
+            """
+            if mods:
+                down = [t for mod in mods for t in ('keydown', mod)]
+                up = [t for mod in reversed(mods) for t in ('keyup', mod)]
+                tokens = down + tokens + up
             return (['xdotool'] + tokens, command)
 
         # POSITION COMMAND - Returns current coordinates
@@ -293,7 +402,11 @@ class LinuxActuation:
             if len(parts) < 2:
                 return None
 
-            action = parts[1]
+            try:
+                mods, action = self._split_mouse_modifiers(parts[1])
+            except ValueError as e:
+                print(f"[✗] {e}")
+                return None
 
             # Scrolling requires an explicit count from the user
             if action in ['scroll_up', 'scroll_down']:
@@ -302,7 +415,7 @@ class LinuxActuation:
                     return None
                 count = parts[2]
                 button = '4' if action == 'scroll_up' else '5'
-                return out(['click', '--repeat', count, button])
+                return out(['click', '--repeat', count, button], mods)
 
             here_map = {
                 'left':    ['click', '1'],
@@ -312,7 +425,7 @@ class LinuxActuation:
                 'hold':    ['mousedown', '1'],
                 'release': ['mouseup', '1'],
             }
-            return out(here_map[action]) if action in here_map else None
+            return out(here_map[action], mods) if action in here_map else None
 
         # Handle coordinate-based commands
         try:
@@ -320,33 +433,41 @@ class LinuxActuation:
             if len(parts) == 2:
                 return out(['mousemove', str(x), str(y)])
 
-            action = parts[2]
+            try:
+                mods, action = self._split_mouse_modifiers(parts[2])
+            except ValueError as e:
+                # Caught here rather than by the enclosing handler, which would swallow
+                # the message and fall through to the standalone case.
+                print(f"[✗] {e}")
+                return None
+
             if action == 'move':
                 return out(['mousemove', str(x), str(y)])
             elif action == 'left':
-                return out(['mousemove', str(x), str(y), 'click', '1'])
+                return out(['mousemove', str(x), str(y), 'click', '1'], mods)
             elif action == 'right':
-                return out(['mousemove', str(x), str(y), 'click', '3'])
+                return out(['mousemove', str(x), str(y), 'click', '3'], mods)
             elif action == 'double':
-                return out(['mousemove', str(x), str(y), 'click', '--repeat', '2', '1'])
+                return out(['mousemove', str(x), str(y), 'click', '--repeat', '2', '1'], mods)
             elif action == 'middle':
-                return out(['mousemove', str(x), str(y), 'click', '2'])
+                return out(['mousemove', str(x), str(y), 'click', '2'], mods)
             elif action == 'hold':
                 # Coordinate-based hold/release existed on macOS but not here, so
                 # "900 700 hold" failed to build on Linux while the same line worked
                 # on the guest. The button stays down until a matching release; the
                 # agent tracks it and releases it if the session ends first.
-                return out(['mousemove', str(x), str(y), 'mousedown', '1'])
+                return out(['mousemove', str(x), str(y), 'mousedown', '1'], mods)
             elif action == 'release':
-                return out(['mousemove', str(x), str(y), 'mouseup', '1'])
+                return out(['mousemove', str(x), str(y), 'mouseup', '1'], mods)
             elif action == 'drag' and len(parts) >= 5:
                 x2, y2 = int(parts[3]), int(parts[4])
                 return out(['mousemove', str(x), str(y), 'mousedown', '1',
-                            'mousemove', str(x2), str(y2), 'mouseup', '1'])
+                            'mousemove', str(x2), str(y2), 'mouseup', '1'], mods)
             elif action in ['scroll_up', 'scroll_down']:
-                count = parts[3] if len(parts) > 3 else '5'
+                count = parts[3] if len(parts) > 3 else str(self.DEFAULT_SCROLL_NOTCHES)
                 button = '4' if action == 'scroll_up' else '5'
-                return out(['mousemove', str(x), str(y), 'click', '--repeat', count, button])
+                return out(['mousemove', str(x), str(y), 'click', '--repeat', count, button],
+                           mods)
         except (ValueError, IndexError):
             pass
 
@@ -462,19 +583,29 @@ class LinuxActuation:
                 action_tok = tokens[1] if is_here and len(tokens) >= 2 else (tokens[2] if len(tokens) >= 3 else None)
                 pos_str = f"X={position_after[0]}, Y={position_after[1]}" if position_after else "X=?, Y=?"
 
+                # A modifier held across the action changes what the action does, so
+                # the echo names it. Split off here so the verb branches below stay a
+                # match on the bare verb.
+                mod_prefix = ''
+                if action_tok is not None:
+                    mod_prefix, action_tok = self._describe_mouse_modifiers(action_tok)
+
                 if action_tok == 'drag' and len(tokens) >= 5:
-                    print(f"Executed: {command}, dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
+                    print(f"Executed: {command}, {mod_prefix}dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
                 elif action_tok in ('left', 'right', 'double', 'middle'):
-                    print(f"Executed: {command}, clicked {action_tok} at {pos_str}, time taken: {ms}ms")
+                    print(f"Executed: {command}, clicked {mod_prefix}{action_tok} at {pos_str}, time taken: {ms}ms")
                 elif action_tok in ('scroll_up', 'scroll_down'):
                     direction = 'up' if action_tok == 'scroll_up' else 'down'
                     count_idx = 2 if is_here else 3
                     try:
                         n = int(tokens[count_idx])
                     except (IndexError, ValueError):
-                        n = 1
+                        # The command named no count, so the backend performs the
+                        # default — say that number rather than 1, which described
+                        # neither the gesture nor the record.
+                        n = self.DEFAULT_SCROLL_NOTCHES
                     notch_str = "1 notch" if n == 1 else f"{n} notches"
-                    print(f"Executed: {command}, scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
+                    print(f"Executed: {command}, {mod_prefix}scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
                 elif action_tok == 'move':
                     print(f"Executed: {command}, moved to {pos_str}, time taken: {ms}ms")
                 else:
@@ -553,6 +684,10 @@ class LinuxActuation:
 ║ <x> <y> drag <x2> <y2> → Drag from (x,y) to (x2,y2)      ║
 ║ here <action>          → Action at current position      ║
 ║ position               → Get current mouse position      ║
+║                                                          ║
+║ <x> <y> <mods><action> → Hold modifiers for the action   ║
+║ here <mods><action>    → e.g. ^left, +left, ^scroll_down ║
+║   Modifiers: ^ + ! # (as in press); not on move/position ║
 ╠══════════════════════════════════════════════════════════╣
 ║ KEYBOARD COMMANDS                                        ║
 ╠══════════════════════════════════════════════════════════╣
@@ -577,6 +712,9 @@ class LinuxActuation:
 ║ press ^!{Delete}       → Ctrl+Alt+Delete                 ║
 ║ 200 200 drag 800 600   → Drag operation                  ║
 ║ here scroll_down 5     → Scroll down 5 notches           ║
+║ 770 310 ^left          → Ctrl-click (multi-select)       ║
+║ 770 310 +left          → Shift-click (extend selection)  ║
+║ 770 310 ^scroll_down 3 → Ctrl-scroll (zoom out)          ║
 ║ position               → Get mouse coordinates           ║
 ╠══════════════════════════════════════════════════════════╣
 ║ POSITION TRACKING                                        ║

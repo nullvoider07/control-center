@@ -29,6 +29,21 @@ use proto::{
 // Do NOT define a local Claims struct here.
 use control_center_common::Claims;
 
+/// Drop a pointer action's modifier prefix, leaving the bare verb: "#left" → "left".
+///
+/// The same four ASCII symbols the controllers accept as a mouse modifier prefix, and
+/// the same set the agent strips when it composes the recorded string. A token that is
+/// nothing but modifiers is returned unchanged, so it fails the verb match downstream
+/// rather than resolving to an empty subtype.
+fn strip_mouse_modifiers(token: &str) -> String {
+    let stripped = token.trim_start_matches(['^', '+', '!', '#']);
+    if stripped.is_empty() {
+        token.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
 /// Require that a validated token carries a specific scope.
 fn require_scope(claims: &Claims, scope: &str) -> Result<(), Status> {
     if claims.scopes.iter().any(|s| s == scope) {
@@ -232,6 +247,11 @@ impl ControlCenterService {
     /// ("here left", "type hello") OR a translated platform command
     /// (cliclick, osascript, xdotool, Windows cmd) — into
     /// (action_type, action_subtype, is_here_command).
+    ///
+    /// `action_subtype` names the verb only. A pointer action may carry a modifier
+    /// prefix ("770 310 #left"), which belongs in `raw_command` — where the agent
+    /// renders it as "Cmd+Left-clicked" — and not here: a consumer switching on the
+    /// subtype should see one value for a click whether or not a key was held.
     fn parse_command_meta(command: &str) -> (String, String, bool) {
         let trimmed = command.trim();
         let tokens: Vec<&str> = trimmed.splitn(4, ' ').collect();
@@ -249,12 +269,12 @@ impl ControlCenterService {
         }
         if first == "here" {
             let subtype = tokens.get(1).copied().unwrap_or("left").to_lowercase();
-            return ("mouse".to_string(), subtype, true);
+            return ("mouse".to_string(), strip_mouse_modifiers(&subtype), true);
         }
         if first.parse::<i32>().is_ok() {
             let subtype = tokens.get(2).copied().unwrap_or("left").to_lowercase();
             let subtype = subtype.split_whitespace().next().unwrap_or("left").to_string();
-            return ("mouse".to_string(), subtype, false);
+            return ("mouse".to_string(), strip_mouse_modifiers(&subtype), false);
         }
 
         // macOS: cliclick
@@ -1044,4 +1064,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(command: &str) -> (String, String, bool) {
+        ControlCenterService::parse_command_meta(command)
+    }
+
+    #[test]
+    fn a_modifier_prefix_does_not_reach_the_action_subtype() {
+        // action_subtype names the verb. The modifier belongs in raw_command, where
+        // the agent renders it as "Cmd+Left-clicked"; leaving it here gave consumers
+        // "#left" and "+left" as if they were distinct actions from "left".
+        assert_eq!(meta("770 310 #left"), ("mouse".into(), "left".into(), false));
+        assert_eq!(meta("770 310 #+left"), ("mouse".into(), "left".into(), false));
+        assert_eq!(meta("here +left"), ("mouse".into(), "left".into(), true));
+        assert_eq!(meta("here !double"), ("mouse".into(), "double".into(), true));
+        assert_eq!(
+            meta("770 310 #scroll_down 3"),
+            ("mouse".into(), "scroll_down".into(), false)
+        );
+        assert_eq!(
+            meta("200 300 !drag 900 640"),
+            ("mouse".into(), "drag".into(), false)
+        );
+    }
+
+    #[test]
+    fn an_unmodified_command_classifies_exactly_as_before() {
+        assert_eq!(meta("770 310 left"), ("mouse".into(), "left".into(), false));
+        assert_eq!(meta("here hold"), ("mouse".into(), "hold".into(), true));
+        assert_eq!(meta("type hello"), ("keyboard".into(), "type".into(), false));
+        assert_eq!(meta("press ^c"), ("keyboard".into(), "press".into(), false));
+        assert_eq!(
+            meta("position"),
+            ("position".into(), "position".into(), false)
+        );
+    }
+
+    #[test]
+    fn a_token_of_modifiers_alone_keeps_its_prefix() {
+        // Stripping to an empty subtype would classify as a click. Left whole, it
+        // fails the verb match downstream instead of resolving to a real action.
+        assert_eq!(strip_mouse_modifiers("#"), "#");
+        assert_eq!(strip_mouse_modifiers("^+"), "^+");
+        assert_eq!(strip_mouse_modifiers("left"), "left");
+        assert_eq!(strip_mouse_modifiers("#left"), "left");
+    }
 }

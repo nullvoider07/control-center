@@ -179,6 +179,180 @@ def test_macos_escapes_the_argv_payload_and_only_that(payload):
     assert unescaped == payload
 
 
+# ---- modifier-held mouse actions (macOS) -----------------------------------
+# Cmd-click (discontiguous select), Shift-click (range select) and Opt-drag (copy
+# instead of move) were not expressible at all, which is what made the Finder
+# selection takes impossible to record. The modifier is held for the whole cliclick
+# invocation, so one cc command is still one gesture and one recorded step.
+
+def test_macos_modifier_brackets_the_click():
+    argv, human = macos().build_mouse_command("770 310 #left")
+    assert argv == ["cliclick", "kd:cmd", "c:770,310", "ku:cmd"]
+    assert human == "770 310 #left", "the record must carry the command as issued"
+
+
+@pytest.mark.parametrize("symbol,name", [
+    ("^", "ctrl"), ("+", "shift"), ("!", "alt"), ("#", "cmd"),
+])
+def test_macos_every_modifier_symbol_resolves(symbol, name):
+    argv, _ = macos().build_mouse_command(f"770 310 {symbol}left")
+    assert argv == ["cliclick", f"kd:{name}", "c:770,310", f"ku:{name}"]
+
+
+@pytest.mark.parametrize("prefix,mods", [
+    ("#+", "cmd,shift"),
+    ("+#", "shift,cmd"),
+    ("!#", "alt,cmd"),
+    ("^+!#", "ctrl,shift,alt,cmd"),
+    ("##", "cmd"),          # a repeat is one key held, not two
+])
+def test_macos_modifiers_combine_in_the_order_given(prefix, mods):
+    argv, _ = macos().build_mouse_command(f"770 310 {prefix}left")
+    assert argv == ["cliclick", f"kd:{mods}", "c:770,310", f"ku:{mods}"]
+
+
+@pytest.mark.parametrize("action,token", [
+    ("left", "c:770,310"), ("click", "c:770,310"), ("right", "rc:770,310"),
+    ("double", "dc:770,310"), ("triple", "tc:770,310"),
+    ("hold", "dd:770,310"), ("release", "du:770,310"),
+])
+def test_macos_every_pointer_verb_takes_a_modifier(action, token):
+    argv, _ = macos().build_mouse_command(f"770 310 #{action}")
+    assert argv == ["cliclick", "kd:cmd", token, "ku:cmd"]
+
+
+def test_macos_middle_takes_a_modifier_without_a_cliclick_token():
+    """`middle` was in the list above, asserting `mc:770,310`.
+
+    That token is not a cliclick action — this test pinned the broken behaviour, which
+    is part of why the defect survived until a hardware matrix ran the verb. It is
+    covered here instead, on the sentinel that actually actuates.
+    """
+    argv, _ = macos().build_mouse_command("770 310 #middle")
+    assert argv == ["__middle__", "c:770,310", "cmd"]
+
+
+def test_macos_modifier_wraps_the_whole_drag_not_just_its_first_token():
+    """An Opt-drag that released the modifier after the press would be an ordinary
+    move — the copy semantics come from Opt being down at the drop."""
+    argv, _ = macos().build_mouse_command("200 300 !drag 900 640")
+    assert argv[1] == "kd:alt"
+    assert argv[-1] == "ku:alt"
+    assert argv[2:-1] == ["dd:200,300", "w:50", "dm:900,640", "w:50", "du:900,640"]
+
+
+def test_macos_modifier_wraps_a_waypoint_drag_too():
+    argv, _ = macos().build_mouse_command(
+        "200 300 +drag via 400 350 to 900 640 dwell 80")
+    assert argv[1] == "kd:shift" and argv[-1] == "ku:shift"
+    assert argv[2:-1] == ["dd:200,300", "w:80", "dm:400,350", "w:80",
+                          "dm:900,640", "w:80", "du:900,640"]
+
+
+def test_macos_here_form_takes_modifiers():
+    argv, _ = macos().build_mouse_command("here +left")
+    assert argv == ["cliclick", "kd:shift", "c:.", "ku:shift"]
+
+
+def test_macos_scroll_carries_its_modifiers_on_the_sentinel():
+    """Scroll needs two binaries, so the modifier cannot be a kd:/ku: bracket — the
+    ku: would sit in a different process from the keys it guards, and a failed repeat
+    loop would leave the modifier down globally with nothing tracking it. It rides on
+    each arrow-key event instead, appended as a fifth sentinel element the agent
+    resolves to an AppleScript `using` clause."""
+    ma = macos()
+    argv, human = ma.build_mouse_command("770 310 #scroll_down 3")
+    assert argv == ["__scroll__", "c:770,310", "125", "3", "cmd"]
+    assert human == "770 310 #scroll_down 3"
+
+    argv, _ = ma.build_mouse_command("here #+scroll_up 5")
+    assert argv == ["__scroll__", "c:.", "126", "5", "cmd,shift"]
+
+    # No modifier: the sentinel keeps its original four elements.
+    argv, _ = ma.build_mouse_command("here scroll_down 5")
+    assert argv == ["__scroll__", "c:.", "125", "5"]
+
+
+@pytest.mark.parametrize("direction,key_code", [
+    ("scroll_up", "126"), ("scroll_down", "125"),
+    ("scroll_left", "123"), ("scroll_right", "124"),
+])
+def test_macos_every_scroll_direction_takes_a_modifier(direction, key_code):
+    argv, _ = macos().build_mouse_command(f"770 310 ^{direction} 2")
+    assert argv == ["__scroll__", "c:770,310", key_code, "2", "ctrl"]
+
+
+@pytest.mark.parametrize("command", [
+    "770 310 #move",        # a held modifier changes nothing about a move
+    "here #move",
+    "770 310 #",            # prefix with no action
+    "770 310 #nosuchverb",
+    "770 310 ⌘left",        # Unicode form: valid for press, not for a mouse action
+])
+def test_macos_a_rejected_modifier_emits_nothing(command, capsys):
+    """A mis-parsed prefix must never degrade into the unmodified action: that
+    succeeds, echoes plausibly, and records a gesture nobody performed."""
+    assert macos().build_mouse_command(command) is None
+    assert "[✗]" in capsys.readouterr().out, "the refusal was silent"
+
+
+def test_macos_no_half_sequence_survives_a_rejection(capsys):
+    """Nothing may emit a kd: without its ku:. A modifier left down in the guest
+    turns every later click into a modified one, silently."""
+    for command in ["770 310 #move", "770 310 #drag", "here #scroll_up 3",
+                    "770 310 #nosuchverb", "here #"]:
+        built = macos().build_mouse_command(command)
+        assert built is None or "kd:" not in " ".join(built[0]), command
+    capsys.readouterr()
+
+
+def test_macos_unmodified_commands_are_byte_identical(capsys):
+    """The prefix parser sits in front of every mouse command, so the unmodified
+    forms have to come through it unchanged."""
+    ma = macos()
+    for command, expected in [
+        ("770 310 left", ["cliclick", "c:770,310"]),
+        ("770 310 move", ["cliclick", "m:770,310"]),
+        ("here double", ["cliclick", "dc:."]),
+        ("position", ["cliclick", "p:."]),
+        ("200 300 drag 900 640",
+         ["cliclick", "dd:200,300", "w:50", "dm:900,640", "w:50", "du:900,640"]),
+        ("here scroll_down 5", ["__scroll__", "c:.", "125", "5"]),
+    ]:
+        argv, human = ma.build_mouse_command(command)
+        assert argv == expected, command
+        assert human == command
+    assert capsys.readouterr().out == "", "an accepted command printed a diagnostic"
+
+
+@pytest.mark.parametrize("command", [
+    "770 310 #left", "here +left", "200 300 !drag 900 640", "770 310 #+triple",
+])
+def test_macos_modified_mouse_commands_route_as_mouse(command):
+    """detect_command_type gates the builder. Before the prefix was understood there,
+    "770 310 #left" was refused as an unrecognised command."""
+    kind, processed = macos().detect_command_type(command)
+    assert kind == "mouse", f"{command!r} routed as {kind}"
+    assert processed == command
+
+
+def test_macos_a_bare_modified_verb_is_still_a_keypress():
+    """"#left" on its own is claimed by the keyboard rule and must stay that way —
+    the standalone form is the one shape that cannot be told apart from a chord."""
+    kind, processed = macos().detect_command_type("#left")
+    assert (kind, processed) == ("keyboard", "press #left")
+
+
+def test_macos_modifier_names_reach_the_echo():
+    """The console echo names the modifier; the agent composes the stored record from
+    the same prefix (crates/agent/src/main.rs), so both surfaces show the gesture."""
+    ma = macos()
+    assert ma._describe_mouse_modifiers("#left") == ("Cmd+", "left")
+    assert ma._describe_mouse_modifiers("#+left") == ("Cmd+Shift+", "left")
+    assert ma._describe_mouse_modifiers("!drag") == ("Option+", "drag")
+    assert ma._describe_mouse_modifiers("left") == ("", "left")
+
+
 # ---- controller/agent grammar agreement ------------------------------------
 ARGV_POLICY = Path(__file__).resolve().parents[2] / "crates/agent/src/argv_policy.rs"
 
@@ -192,6 +366,9 @@ MACOS_CLICLICK_COMMANDS = [
     "100 100 drag 900 700",
     "100 100 drag 900 700 dwell 300",
     "100 100 drag via 400 300 via 700 500 to 900 700",
+    # Modifier-held forms: these add kd:/ku: tokens to a pointer sequence, so the
+    # agent has to accept them in that position too.
+    "770 310 #left", "770 310 #+left", "here !double", "200 300 !drag 900 640",
 ]
 
 MACOS_CLICLICK_KEYBOARD = [
@@ -240,6 +417,85 @@ def test_macos_cliclick_tokens_are_all_in_the_agent_grammar():
     )
 
 
+# ---- modifier-held mouse actions (Linux) -----------------------------------
+# xdotool holds the modifier with keydown/keyup inside the same invocation, so the
+# release cannot be lost between commands. Verified on an Xvfb display: the resulting
+# ButtonPress carries state 0x4 for ctrl, 0x5 for ctrl+shift, 0x8 for alt, and a
+# ctrl-scroll produces button-5 events at state 0x4.
+
+def test_linux_modifier_wraps_the_pointer_chain():
+    argv, human = linux()._build_mouse_command("770 310 ^left")
+    assert argv == ["xdotool", "keydown", "ctrl",
+                    "mousemove", "770", "310", "click", "1",
+                    "keyup", "ctrl"]
+    assert human == "770 310 ^left"
+
+
+def test_linux_modifiers_are_released_in_reverse_order():
+    """Last pressed, first released — the order a real keyboard produces."""
+    argv, _ = linux()._build_mouse_command("770 310 ^+left")
+    assert argv[:5] == ["xdotool", "keydown", "ctrl", "keydown", "shift"]
+    assert argv[-4:] == ["keyup", "shift", "keyup", "ctrl"]
+
+
+def test_linux_modifier_wraps_the_whole_drag():
+    argv, _ = linux()._build_mouse_command("200 300 ^drag 900 640")
+    assert argv[1:3] == ["keydown", "ctrl"]
+    assert argv[-2:] == ["keyup", "ctrl"]
+    assert argv[3:-2] == ["mousemove", "200", "300", "mousedown", "1",
+                          "mousemove", "900", "640", "mouseup", "1"]
+
+
+def test_linux_scroll_takes_modifiers():
+    """Unlike macOS, Linux scroll is the real wheel buttons, so Ctrl-scroll is the
+    zoom gesture applications expect."""
+    argv, _ = linux()._build_mouse_command("770 310 ^scroll_down 3")
+    assert argv == ["xdotool", "keydown", "ctrl", "mousemove", "770", "310",
+                    "click", "--repeat", "3", "5", "keyup", "ctrl"]
+    argv, _ = linux()._build_mouse_command("here !scroll_up 2")
+    assert argv == ["xdotool", "keydown", "alt", "click", "--repeat", "2", "4",
+                    "keyup", "alt"]
+
+
+@pytest.mark.parametrize("command", [
+    "770 310 ^move", "here ^move", "770 310 ^", "770 310 ^nosuchverb",
+    "770 310 ^triple",      # macOS has triple; this backend does not
+])
+def test_linux_a_rejected_modifier_emits_nothing(command, capsys):
+    assert linux()._build_mouse_command(command) is None
+    assert "[✗]" in capsys.readouterr().out, "the refusal was silent"
+
+
+def test_linux_no_half_sequence_survives_a_rejection(capsys):
+    for command in ["770 310 ^move", "770 310 ^", "here ^nosuchverb", "770 310 ^triple"]:
+        built = linux()._build_mouse_command(command)
+        assert built is None or "keydown" not in built[0], command
+    capsys.readouterr()
+
+
+def test_linux_unmodified_commands_are_unchanged(capsys):
+    la = linux()
+    for command, expected in [
+        ("770 310 left", ["xdotool", "mousemove", "770", "310", "click", "1"]),
+        ("770 310 move", ["xdotool", "mousemove", "770", "310"]),
+        ("here double", ["xdotool", "click", "--repeat", "2", "1"]),
+        ("position", ["xdotool", "getmouselocation", "--shell"]),
+        ("200 300 drag 900 640",
+         ["xdotool", "mousemove", "200", "300", "mousedown", "1",
+          "mousemove", "900", "640", "mouseup", "1"]),
+    ]:
+        argv, human = la._build_mouse_command(command)
+        assert argv == expected, command
+        assert human == command
+    assert capsys.readouterr().out == ""
+
+
+def test_linux_modified_mouse_commands_route_as_mouse():
+    for command in ["770 310 ^left", "here +left", "200 300 !drag 900 640"]:
+        kind, processed = linux().detect_command_type(command)
+        assert (kind, processed) == ("mouse", command)
+
+
 # ---- Windows (__write__ direct file) --------------------------------------
 def windows():
     wa = WindowsActuation.__new__(WindowsActuation)
@@ -262,3 +518,206 @@ def test_windows_type_uses_write_sentinel_no_cmd():
 def test_windows_position_command_is_write_argv():
     argv = windows()._build_position_command()
     assert argv == ["__write__", r"C:\mouse_cmd.txt", "position"]
+
+
+# ---- modifier-held mouse actions (Windows) ---------------------------------
+# Windows mouse commands are not built into argv here: the command text is written to
+# C:\mouse_cmd.txt and mouse_control.ahk parses it on the guest. So the prefix travels
+# verbatim, and the controller's job is to refuse a malformed one — the watcher's
+# `switch` has no error path, so an action it does not recognise does nothing at all
+# while the step still reports success.
+
+@pytest.mark.parametrize("command", [
+    "770 310 ^left", "770 310 ^+left", "here !double", "200 300 ^drag 900 640",
+    "770 310 ^scroll_down 3", "770 310 ^hold", "here ^release",
+])
+def test_windows_accepts_the_modifier_forms_it_can_actuate(command):
+    wa = windows()
+    assert wa._check_mouse_command(command), f"{command!r} was refused"
+    kind, processed = wa.detect_command_type(command)
+    assert (kind, processed) == ("mouse", command)
+
+
+@pytest.mark.parametrize("command", [
+    "770 310 ^move", "here ^move", "770 310 ^", "770 310 ^nosuchverb",
+    "770 310 ^triple",      # macOS has triple; this backend does not
+])
+def test_windows_refuses_what_the_watcher_would_silently_drop(command, capsys):
+    assert windows()._check_mouse_command(command) is False
+    assert "[✗]" in capsys.readouterr().out, "the refusal was silent"
+
+
+def test_windows_unmodified_commands_still_pass_the_gate(capsys):
+    wa = windows()
+    for command in ["770 310 left", "770 310 move", "here double", "position",
+                    "200 300 drag 900 640", "here scroll_down 5"]:
+        assert wa._check_mouse_command(command), command
+    assert capsys.readouterr().out == ""
+
+
+def test_windows_modifier_names_reach_the_echo():
+    wa = windows()
+    assert wa._describe_mouse_modifiers("^left") == ("Ctrl+", "left")
+    assert wa._describe_mouse_modifiers("^+left") == ("Ctrl+Shift+", "left")
+    assert wa._describe_mouse_modifiers("#left") == ("Win+", "left")
+    assert wa._describe_mouse_modifiers("left") == ("", "left")
+
+
+AHK_MOUSE = Path(__file__).resolve().parents[2] / "watcher_scripts/mouse_control.ahk"
+
+
+def test_windows_watcher_understands_every_symbol_the_controller_emits():
+    """The controller and the watcher ship separately — the watcher is copied to the
+    guest by hand — so a symbol accepted here that the script does not map would
+    actuate as an unmodified click and record as a modified one."""
+    script = AHK_MOUSE.read_text()
+    body = re.search(r"SplitModifiers\(token.*?\n\}", script, re.S)
+    assert body, "SplitModifiers not found in mouse_control.ahk"
+
+    mapped = set(re.findall(r'"(\^|\+|!|#)",\s*"\{', body.group(0)))
+    emitted = set(windows().MOUSE_MODIFIER_SYMBOLS)
+    assert emitted <= mapped, (
+        "the controller emits modifier symbols the watcher does not map: "
+        + ", ".join(sorted(emitted - mapped))
+    )
+
+
+def test_macos_middle_click_uses_the_sentinel_not_a_cliclick_token():
+    """`middle` mapped to `mc:`, which is not a cliclick action at all — cliclick's set
+    is `c rc dc tc m dd du dm kd ku kp t w p cp`. Every middle click on macOS therefore
+    failed at execution with "Unrecognized action shortcut", in both command forms and
+    with every modifier, and the coverage matrix is what surfaced it.
+
+    macOS supports the button natively, so it is posted as a CGEvent; the limitation
+    was cliclick's, not the platform's. Linux and Windows have had `middle` working all
+    along, which is why this was a per-backend gap rather than a missing feature.
+    """
+    ma = macos()
+    assert ma.build_mouse_command("960 540 middle")[0] == ["__middle__", "c:960,540"]
+    assert ma.build_mouse_command("here middle")[0] == ["__middle__", "c:."]
+    assert ma.build_mouse_command("960 540 #middle")[0] == \
+        ["__middle__", "c:960,540", "cmd"]
+    assert ma.build_mouse_command("here ^+middle")[0] == \
+        ["__middle__", "c:.", "ctrl,shift"]
+
+    # No macOS builder may emit the token that never worked.
+    for cmd in ("960 540 middle", "here middle", "960 540 !middle"):
+        argv, _ = ma.build_mouse_command(cmd)
+        assert not any(tok.startswith("mc:") for tok in argv), \
+            f"{cmd!r} still emits a cliclick middle token: {argv}"
+
+
+def test_middle_click_works_on_every_backend():
+    """It failed only on macOS, so the other two are pinned as the reference: a verb
+    advertised on all three has to be reachable on all three."""
+    assert linux()._build_mouse_command("960 540 middle")[0] == \
+        ["xdotool", "mousemove", "960", "540", "click", "2"]
+    assert macos().build_mouse_command("960 540 middle")[0][0] == "__middle__"
+    # Windows writes the command text through to the AHK watcher, which has a
+    # `case "middle"` arm.
+    assert "middle" in WindowsActuation.MOUSE_ACTIONS
+    assert 'case "middle":' in AHK_MOUSE.read_text()
+
+
+def test_scroll_default_count_is_the_same_on_every_backend():
+    """`here scroll_down` with no count has to mean the same distance everywhere. The
+    watcher defaulted to 3 while both Python backends default to 5, so the identical
+    command scrolled a different amount on Windows.
+
+    The agent now states this number in the record for a command that omitted it, so a
+    fourth source has to agree: if DEFAULT_SCROLL_NOTCHES drifts from the backends, the
+    record names a count that was never performed, and nothing downstream can detect
+    it — the command as typed is not persisted."""
+    script = AHK_MOUSE.read_text()
+    ahk_defaults = re.findall(
+        r'case "scroll_(?:up|down)":\s*\n\s*amount := \(args\.Length >= paramOffset\) '
+        r'\? args\[paramOffset\] : (\d+)',
+        script,
+    )
+    assert len(ahk_defaults) == 2, f"expected two AHK scroll defaults, found {ahk_defaults}"
+    assert set(ahk_defaults) == {"5"}, f"AHK scroll default is {set(ahk_defaults)}, not 5"
+
+    # The Python defaults, read from the builders themselves rather than a comment.
+    argv, _ = macos().build_mouse_command("here scroll_down")
+    assert argv == ["__scroll__", "c:.", "125", "5"]
+    argv, _ = linux()._build_mouse_command("770 310 scroll_down")
+    assert argv == ["xdotool", "mousemove", "770", "310", "click", "--repeat", "5", "5"]
+
+    # The agent's constant, read from the source for the same reason.
+    agent_src = (Path(__file__).resolve().parents[2] / "crates/agent/src/main.rs").read_text()
+    agent_default = re.search(r"const DEFAULT_SCROLL_NOTCHES: u32 = (\d+);", agent_src)
+    assert agent_default, "DEFAULT_SCROLL_NOTCHES is no longer declared in the agent"
+    assert agent_default.group(1) == "5", (
+        f"the agent records a default of {agent_default.group(1)} notches while the "
+        f"backends perform 5"
+    )
+
+    # Each controller's own constant. These were added because this test previously
+    # claimed to cover every site and did not: the console echo defaulted to 1 on all
+    # three backends while every backend performed 5, so an operator issuing a
+    # countless scroll was told "1 notch" for a gesture of five. The echo was a fifth
+    # site nothing here read.
+    for controller in (MacOSActuation, LinuxActuation, WindowsActuation):
+        assert controller.DEFAULT_SCROLL_NOTCHES == 5, (
+            f"{controller.__name__} defaults to "
+            f"{controller.DEFAULT_SCROLL_NOTCHES} notches, not 5"
+        )
+
+
+class _StubClient:
+    """Minimal stand-in for the gRPC client: the echo is the code under test, so the
+    transport only has to return a plausible success."""
+
+    def __init__(self):
+        self.sent = []
+
+    def execute_command(self, argv, human_command):
+        self.sent.append((argv, human_command))
+        return {
+            "success": True,
+            "execution_time_ms": 1,
+            "mouse_x": 770,
+            "mouse_y": 310,
+            "position_captured": True,
+            "metadata": None,
+        }
+
+
+@pytest.mark.parametrize("factory", [macos, linux, windows])
+def test_the_console_echo_names_the_count_the_backend_performs(factory, capsys):
+    """The echo is what the operator reads at the moment they issue the command, and
+    it disagreed with both the actuation and the record.
+
+    Measured on the Windows guest: `550 400 scroll_up` scrolled 15 lines at 3 lines
+    per notch — five notches — while the console printed "scrolled up 1 notch".
+
+    This drives the real `execute_command` and reads its stdout. An earlier version of
+    this test recomputed the count from DEFAULT_SCROLL_NOTCHES itself and passed even
+    with the defect reintroduced — it asserted its own arithmetic, not the product.
+    """
+    controller = factory()
+    controller.grpc_client = _StubClient()
+    controller.strict = True
+
+    controller.execute_command("770 310 scroll_down")
+    out = capsys.readouterr().out
+
+    assert "5 notches" in out, (
+        f"{type(controller).__name__} echoed {out.strip()!r} for a countless scroll, "
+        f"but the backend performs {controller.DEFAULT_SCROLL_NOTCHES}"
+    )
+    assert "1 notch" not in out
+
+    # An explicit count is still echoed as given, and the singular still reads "notch".
+    controller.execute_command("770 310 scroll_down 1")
+    out = capsys.readouterr().out
+    assert "1 notch" in out and "1 notches" not in out
+
+
+def test_windows_watcher_releases_modifiers_on_every_path():
+    """A modifier left physically down turns every later click in the session into a
+    modified one, with nothing in the output saying so."""
+    script = AHK_MOUSE.read_text()
+    assert "} finally {" in script, "the release is not in a finally block"
+    finally_block = script.split("} finally {", 1)[1].split("}", 1)[0]
+    assert "Send modUp" in finally_block, "the finally block does not release"
