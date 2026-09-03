@@ -14,6 +14,10 @@ SERVER_BINARY="control-center-server"
 AGENT_BINARY="control-center-agent"
 CLI_BINARY="control-center"
 TOKEN_BINARY="generate-token"
+# Linux-only, and only in releases from 2.0.0. The agent spawns it by name for
+# Wayland actuation and for the position readback, so on a Wayland session the
+# whole backend fails without it.
+WAYLAND_BINARY="cc-wayland-actuate"
 
 # Colors
 RED='\033[0;31m'
@@ -128,6 +132,15 @@ get_latest_release() {
     # the lookup stops depending on the network path.
     local auth=()
     local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    # `gh auth login` stores its token in the OS keyring, not in the environment, so
+    # a logged-in `gh` did nothing for the request below — the two never met. That
+    # produced the worst version of this failure: the operator is authenticated to
+    # GitHub, is told the quota is exhausted, logs out and back in, and nothing
+    # changes, because the only thing that would have helped is an environment
+    # variable nobody mentioned. Ask gh for the token it already holds instead.
+    if [ -z "$token" ] && command -v gh &> /dev/null; then
+        token=$(gh auth token 2>/dev/null || true)
+    fi
     if [ -n "$token" ]; then
         auth=(-H "Authorization: Bearer $token")
     fi
@@ -146,7 +159,18 @@ get_latest_release() {
         if [ -z "$token" ]; then
             echo "  The anonymous quota is 60/hour and is keyed on your public IP, which"
             echo "  a VPN or carrier NAT shares with everyone else behind it."
-            echo "  Set GITHUB_TOKEN to raise it to 5000/hour tied to your account."
+            if command -v gh &> /dev/null; then
+                echo "  gh is installed but holds no token — run 'gh auth login', or set"
+                echo "  GITHUB_TOKEN, to raise the limit to 5000/hour on your account."
+            else
+                echo "  Set GITHUB_TOKEN to raise it to 5000/hour tied to your account."
+            fi
+        else
+            # A token was sent and still refused: not the anonymous bucket, so the
+            # advice above would be wrong. This is the account's own limit or a
+            # secondary limit, and waiting is the only fix.
+            echo "  A token was used, so this is your account's own limit rather than"
+            echo "  the shared anonymous one. Retry after the reset."
         fi
         echo "  Release downloads are not rate limited, so you can also install a"
         echo "  specific version by hand: https://github.com/$REPO/releases"
@@ -317,10 +341,28 @@ install_rust_binaries() {
         xattr -d com.apple.quarantine "$INSTALL_DIR/$TOKEN_BINARY" 2>/dev/null || true
     fi
 
+    # The Wayland actuation helper, when the archive carries one. Absent from
+    # releases before 2.0.0 and from the macOS and Windows archives, so a missing
+    # file is a normal outcome rather than a failure.
+    #
+    # Removed before it is copied, unlike the binaries above. `cp` onto a path that
+    # is a symlink follows it and writes through to the target, and a developer
+    # machine may well have this name pointing into a source checkout — in which
+    # case a plain `cp` would overwrite a source file somewhere else entirely
+    # instead of installing anything here.
+    if [ -f "$TMP_DIR/bin/$WAYLAND_BINARY" ]; then
+        rm -f "$INSTALL_DIR/$WAYLAND_BINARY"
+        cp "$TMP_DIR/bin/$WAYLAND_BINARY" "$INSTALL_DIR/"
+        chmod +x "$INSTALL_DIR/$WAYLAND_BINARY"
+    fi
+
     print_success "Rust binaries installed"
     echo "  • Server:         $INSTALL_DIR/$SERVER_BINARY"
     echo "  • Agent:          $INSTALL_DIR/$AGENT_BINARY"
     echo "  • Token generator:$INSTALL_DIR/$TOKEN_BINARY"
+    if [ -f "$INSTALL_DIR/$WAYLAND_BINARY" ]; then
+        echo "  • Wayland helper: $INSTALL_DIR/$WAYLAND_BINARY"
+    fi
 }
 
 install_cli_binary() {
