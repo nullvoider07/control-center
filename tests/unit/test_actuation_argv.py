@@ -459,7 +459,6 @@ def test_linux_scroll_takes_modifiers():
 
 @pytest.mark.parametrize("command", [
     "770 310 ^move", "here ^move", "770 310 ^", "770 310 ^nosuchverb",
-    "770 310 ^triple",      # macOS has triple; this backend does not
 ])
 def test_linux_a_rejected_modifier_emits_nothing(command, capsys):
     assert linux()._build_mouse_command(command) is None
@@ -467,10 +466,109 @@ def test_linux_a_rejected_modifier_emits_nothing(command, capsys):
 
 
 def test_linux_no_half_sequence_survives_a_rejection(capsys):
-    for command in ["770 310 ^move", "770 310 ^", "here ^nosuchverb", "770 310 ^triple"]:
+    for command in ["770 310 ^move", "770 310 ^", "here ^nosuchverb"]:
         built = linux()._build_mouse_command(command)
         assert built is None or "keydown" not in built[0], command
     capsys.readouterr()
+
+
+# ---- verbs this backend gained in 2.0.0 ------------------------------------
+#
+# `triple` used to appear in the rejection list above, on the grounds that only
+# macOS had it. That is no longer true, and deleting the case would have removed
+# the coverage rather than moved it: a verb that is merely no longer refused is
+# not a verb anyone has checked. These assert the argv it actually produces.
+
+@pytest.mark.parametrize("command, expected", [
+    # `triple` — a third click on the same repeat mechanism as `double`.
+    ("770 310 triple", ["xdotool", "mousemove", "770", "310",
+                        "click", "--repeat", "3", "1"]),
+    ("here triple", ["xdotool", "click", "--repeat", "3", "1"]),
+    # `click` — macOS's spelling of `left`, so it must produce the same argv as
+    # `left` rather than a second path that could drift from it.
+    ("770 310 click", ["xdotool", "mousemove", "770", "310", "click", "1"]),
+    ("here click", ["xdotool", "click", "1"]),
+    # Horizontal scroll. xdotool spells the wheel as buttons; 4/5 are vertical
+    # and 6/7 horizontal. Verified on Xvfb with xdotool 3.20160805.1: a client
+    # selecting ButtonPressMask received 6 and 7, alongside 1 and 4 as controls.
+    ("770 310 scroll_left 3", ["xdotool", "mousemove", "770", "310",
+                               "click", "--repeat", "3", "6"]),
+    ("770 310 scroll_right 2", ["xdotool", "mousemove", "770", "310",
+                                "click", "--repeat", "2", "7"]),
+    ("here scroll_left 4", ["xdotool", "click", "--repeat", "4", "6"]),
+    ("scroll_right 2", ["xdotool", "click", "--repeat", "2", "7"]),
+])
+def test_linux_verbs_added_in_2_0_0(command, expected):
+    argv, _ = linux()._build_mouse_command(command)
+    assert argv == expected
+
+
+def test_linux_click_and_left_are_the_same_gesture():
+    """`click` is an alias, so it must not become a second code path."""
+    la = linux()
+    assert (la._build_mouse_command("770 310 click")[0]
+            == la._build_mouse_command("770 310 left")[0])
+    assert (la._build_mouse_command("here click")[0]
+            == la._build_mouse_command("here left")[0])
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("770 310 ^triple", ["xdotool", "keydown", "ctrl", "mousemove", "770", "310",
+                         "click", "--repeat", "3", "1", "keyup", "ctrl"]),
+    ("770 310 ^click", ["xdotool", "keydown", "ctrl", "mousemove", "770", "310",
+                        "click", "1", "keyup", "ctrl"]),
+    ("here ^scroll_left 2", ["xdotool", "keydown", "ctrl",
+                             "click", "--repeat", "2", "6", "keyup", "ctrl"]),
+])
+def test_linux_the_new_verbs_take_a_modifier_and_stay_bracketed(command, expected):
+    """The new verbs joined MOUSE_MODIFIER_ACTIONS, so each must still open with
+    the keydown run and close with the keyup run — the agent refuses anything
+    else, and an unbalanced one strands the modifier on the X server."""
+    argv, _ = linux()._build_mouse_command(command)
+    assert argv == expected
+    assert argv[1] == "keydown" and argv[-2] == "keyup"
+    assert argv[2] == argv[-1], "the modifier released is not the one held"
+
+
+@pytest.mark.parametrize("command, expected", [
+    # Plain form, unchanged.
+    ("100 100 drag 800 600",
+     ["xdotool", "mousemove", "100", "100", "mousedown", "1",
+      "mousemove", "800", "600", "mouseup", "1"]),
+    # Waypoints: each `via` becomes a mousemove inside the held button, and the
+    # destination is the point after `to` — not the first waypoint.
+    ("100 100 drag via 400 300 via 700 500 to 900 700",
+     ["xdotool", "mousemove", "100", "100", "mousedown", "1",
+      "mousemove", "400", "300", "mousemove", "700", "500",
+      "mousemove", "900", "700", "mouseup", "1"]),
+])
+def test_linux_drag_waypoints(command, expected):
+    argv, _ = linux()._build_mouse_command(command)
+    assert argv == expected
+
+
+def test_linux_dwell_is_accepted_range_checked_and_not_emitted():
+    """`dwell` is parsed and bounded for grammar parity with macOS, but this
+    backend emits nothing for it: xdotool would need a chained `sleep`, which the
+    agent's argv policy has no arm for, so a dwell-bearing argv would build and
+    then be refused at execution. The property to hold is that accepting the token
+    changes nothing about what is sent."""
+    la = linux()
+    with_dwell, _ = la._build_mouse_command("100 100 drag 800 600 dwell 150")
+    without, _ = la._build_mouse_command("100 100 drag 800 600")
+    assert with_dwell == without
+    assert "sleep" not in with_dwell and "150" not in with_dwell
+
+
+@pytest.mark.parametrize("command", [
+    "100 100 drag 800 600 dwell 99999",     # above MAX_DRAG_DWELL_MS
+    "100 100 drag 800 600 dwell 0",         # below MIN_DRAG_DWELL_MS
+    "100 100 drag 800 600 dwell abc",       # not a number
+    "100 100 drag via 400 300 900 700",     # waypoints without the `to`
+])
+def test_linux_a_malformed_drag_emits_nothing(command, capsys):
+    assert linux()._build_mouse_command(command) is None
+    assert "[X]" in capsys.readouterr().out, "the refusal was silent"
 
 
 def test_linux_unmodified_commands_are_unchanged(capsys):

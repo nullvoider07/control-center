@@ -65,6 +65,24 @@ def held_button_warnings(metadata: Optional[dict]) -> List[str]:
     return lines
 
 
+def hold_notice(button: str = "Left") -> str:
+    """The line printed by the command that establishes a hold.
+
+    held_button_warnings only speaks on a *later* command, and only after
+    HOLD_WARN_SECONDS. An operator who issues a hold and then reaches for the
+    mouse is told nothing at all - and what they find is that their physical
+    clicks no longer work, with no indication why. That is not a fault to fix in
+    the actuation: a held button means the display server genuinely has that
+    button down, and the pointer belongs to the drag until it is released. It is
+    a fault in not saying so at the moment it becomes true.
+    """
+    return (
+        f"[!] {button} button is now HELD. The physical mouse will behave as if "
+        f"that button is pressed - clicks and drags will not work normally - "
+        f"until you release it with `here release` (or `<x> <y> release`)."
+    )
+
+
 def print_held_button_warnings(metadata: Optional[dict]) -> None:
     for line in held_button_warnings(metadata):
         print(line)

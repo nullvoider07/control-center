@@ -94,7 +94,10 @@ ExecuteCommand(args) {
         ; by every coordinate mouse command; the agent re-reads and verifies the
         ; position afterwards, so an occasional early read is corrected rather than
         ; reported.
-        MouseMove x, y, 0
+        if (SmoothEnabled())
+            GlideTo(x, y)
+        else
+            MouseMove x, y, 0
         Sleep 25
     }
 
@@ -154,7 +157,10 @@ ExecuteCommand(args) {
             ; macos_actuation.py, so a drag dwells the same on both platforms.
             Click "Down"
             Sleep 50
-            MouseMove dest_x, dest_y, 50
+            if (SmoothEnabled())
+                GlideTo(dest_x, dest_y)
+            else
+                MouseMove dest_x, dest_y, 50
             Sleep 50
             Click "Up"
 
@@ -170,4 +176,61 @@ ExecuteCommand(args) {
     ; Trailing settle. Delays pickup of the next command, so every command in a
     ; sequence pays it.
     Sleep 20
+}
+
+
+; --- Human-like pointer travel (opt-in: CC_SMOOTH_MOVE=1) ---
+;
+; Minimum-jerk timing, 10t^3 - 15t^4 + 6t^5: the same curve the Linux portal
+; path uses, so a glide has one velocity profile across platforms rather than
+; each backend getting whatever its own toolkit happens to call smooth. AHK's
+; own `MouseMove x, y, <speed>` interpolation was the cheaper option and is not
+; used, precisely because its curve is neither documented nor shared.
+;
+; Nothing about the command grammar changes: `700 300 move` is the same command,
+; recorded the same way, whether it glides or jumps.
+SmoothEnabled() {
+    return EnvGet("CC_SMOOTH_MOVE") != ""
+}
+
+GlideTo(x1, y1) {
+    MouseGetPos(&x0, &y0)
+    dist := Sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+    if (dist <= 1) {
+        MouseMove x1, y1, 0
+        return
+    }
+
+    durMs := 120 + dist * 0.55
+    if (durMs > 900)
+        durMs := 900
+
+    ; 16ms, not the portal's 8ms. Sleep and A_TickCount both run on the ~15.6ms
+    ; system timer tick here, so asking for 8 would sleep 15 anyway and stretch
+    ; every glide to twice its intended length while reporting the shorter one.
+    steps := Round(durMs / 16)
+    if (steps < 2)
+        steps := 2
+
+    ; MouseMove otherwise pays SetMouseDelay after every step - 10ms by default,
+    ; which is most of a frame added to each of fifty steps.
+    prevDelay := A_MouseDelay
+    SetMouseDelay -1
+    try {
+        start := A_TickCount
+        Loop steps {
+            t := A_Index / steps
+            e := t * t * t * (10 + t * (-15 + 6 * t))
+            MouseMove Round(x0 + (x1 - x0) * e), Round(y0 + (y1 - y0) * e), 0
+            ; Paced against elapsed time, not a fixed sleep per step, so a slow
+            ; step costs the next one's wait instead of the movement's length.
+            remain := start + durMs * A_Index / steps - A_TickCount
+            if (remain > 0)
+                Sleep remain
+        }
+    } finally {
+        SetMouseDelay prevDelay
+    }
+    ; The curve reaches 1.0 in real arithmetic; the float need not. Land exact.
+    MouseMove x1, y1, 0
 }

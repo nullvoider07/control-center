@@ -385,15 +385,35 @@ message CommandEvent {
 
   // Spatial — populated for mouse commands only.
   //
-  // READ position_captured FIRST. These are non-optional int32, so an uncaptured
-  // position is carried as (0, 0) — which is itself a valid screen coordinate, the
-  // top-left corner. A consumer that reads mouse_x/mouse_y without checking the flag
-  // cannot tell "the cursor was at the origin" from "no position was captured".
+  // READ position_captured FIRST. It is the only thing that separates a coordinate
+  // the agent OBSERVED from one it merely REQUESTED, and the two are not
+  // distinguishable by inspecting mouse_x/mouse_y.
   //
-  // The agent reports position_captured=false whenever the cursor readback does not
-  // match the coordinate the command asked for, rather than emitting a value it
-  // could not verify. Expect false for every keyboard step, and for mouse steps
-  // whose position could not be confirmed.
+  //   position_captured=true   the cursor was read back and matched what the command
+  //                            asked for. This is a measurement.
+  //   position_captured=false  mouse_x/mouse_y is the coordinate the command asked
+  //                            for, carried so the step is not left with no position
+  //                            at all. NOT a measurement. It says where the pointer
+  //                            was sent, not where it went.
+  //
+  // This changed in agent 2.0.0. Before it, a step whose readback did not settle
+  // carried (0, 0) — itself a valid screen coordinate, the top-left corner — so a
+  // consumer that ignored the flag saw the origin. Now such a step carries the
+  // requested point, so a consumer that ignores the flag sees a plausible coordinate
+  // that was never observed, which is the worse failure of the two. The field is
+  // narrower than it looks and always was; 2.0.0 removed the accident that made
+  // ignoring the flag look survivable. agent_version identifies which regime a
+  // record was written under.
+  //
+  // A step that produced no coordinate at all — every keyboard step, and any command
+  // the agent refused — still carries (0, 0) with the flag false.
+  //
+  // Why a requested coordinate is carried rather than withheld: on a Wayland session
+  // nothing can read the pointer while it is over a native-Wayland surface — not
+  // xdotool, not the portal helper — so withholding meant `position` and every move
+  // reported no coordinate whatever on the most common kind of window. The choice is
+  // this value labelled unverified, or nothing. It is labelled, never silently
+  // promoted.
   //
   // A drag reports its DESTINATION on every platform. This changed on Windows in agent
   // 1.3.0: before it, "500 400 drag 900 700" reported the origin (500, 400) and

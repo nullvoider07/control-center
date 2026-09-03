@@ -18,3 +18,4 @@ logs/
 target/
 cc-scripts.txt
 cc-upgrades-handoff.md
+AUDIT-*.md

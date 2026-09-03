@@ -16,6 +16,13 @@ pub enum Bin {
     Xdotool,
     Cliclick,
     Osascript,
+    /// The Wayland actuation helper. A Wayland compositor refuses to let one
+    /// client synthesise input into another, so xdotool reaches XWayland clients
+    /// only; the helper speaks the same sub-command language over the
+    /// RemoteDesktop portal. The token stream is identical, which is why it
+    /// shares `validate_xdotool` rather than carrying a grammar of its own - two
+    /// grammars for one language is how the two drift apart.
+    CcWayland,
 }
 
 /// A validated action, ready to execute. Construction is only possible via
@@ -194,8 +201,9 @@ impl Plan {
             }
             Plan::Run { bin, args } => match bin {
                 // The last `mousemove X Y` wins, so "mousemove X Y click 1" predicts
-                // the click point.
-                Bin::Xdotool => args
+                // the click point. The Wayland helper takes the same argv, so it
+                // predicts identically - the backend differs, the grammar does not.
+                Bin::Xdotool | Bin::CcWayland => args
                     .windows(3)
                     .rev()
                     .find(|w| w[0] == "mousemove")
@@ -237,7 +245,20 @@ impl Plan {
                     return false;
                 }
                 let tokens: Vec<&str> = content.split_whitespace().collect();
-                parse_watcher_payload(&tokens).is_some_and(|p| p.verb == "drag")
+                // `drag` always paces the pointer either side of the gesture, and
+                // `move` paces it when CC_SMOOTH_MOVE glides it - in both cases the
+                // Windows watcher is still moving the cursor after the agent has
+                // written the command file and returned, so the readback must wait
+                // for it. `move` is included unconditionally rather than gated on the
+                // env var: a non-smooth move arrives in ~35ms and the readback loop
+                // exits on the first match, paying none of the extra budget, so the
+                // only cost of naming it here is a longer wait on a move that never
+                // actually lands - which is the case that most needs the honest
+                // answer anyway. This is Windows-only by construction: macOS and
+                // Linux moves are `Plan::Run`, and their glide is synchronous - the
+                // agent blocks until the pointer has arrived before it reads back.
+                parse_watcher_payload(&tokens)
+                    .is_some_and(|p| p.verb == "drag" || p.verb == "move")
             }
             _ => false,
         }
@@ -275,7 +296,7 @@ impl Plan {
             // tracker believing a button is down, which would produce a spurious
             // console warning and, worse, a spurious uncommanded release at shutdown.
             Plan::Run { bin, args } => match bin {
-                Bin::Xdotool => {
+                Bin::Xdotool | Bin::CcWayland => {
                     let idx = args.iter().rposition(|a| a == "mousedown" || a == "mouseup")?;
                     let down = args[idx] == "mousedown";
                     // xdotool button numbers: 1 left, 2 middle, 3 right.
@@ -372,6 +393,10 @@ pub fn validate(argv: &[String]) -> Result<Plan, String> {
         "__middle__" => validate_middle(args),
         "xdotool" => validate_xdotool(args).map(|args| Plan::Run {
             bin: Bin::Xdotool,
+            args,
+        }),
+        "cc-wayland-actuate" => validate_xdotool(args).map(|args| Plan::Run {
+            bin: Bin::CcWayland,
             args,
         }),
         "cliclick" => validate_cliclick(args).map(|args| Plan::Run {
@@ -940,6 +965,106 @@ fn is_keysym(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // The Wayland helper shares xdotool's grammar, so the property worth pinning is
+    // agreement, not a second copy of the rules: whatever one accepts the other
+    // accepts, and both refuse the same argv.
+    // A drag with waypoints is a longer pointer chain than any command produced
+    // before it. The policy has to accept it, `expected_pos` has to name the
+    // destination rather than the first waypoint, and the tracker has to see the
+    // release - a drag that reads as still-held would provoke a spurious
+    // uncommanded release when the session ends.
+    #[test]
+    fn a_waypoint_drag_is_accepted_and_reads_as_its_destination() {
+        let argv: Vec<String> = [
+            "cc-wayland-actuate", "mousemove", "400", "300", "mousedown", "1",
+            "mousemove", "500", "400", "mousemove", "650", "500",
+            "mousemove", "800", "600", "mouseup", "1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let plan = validate(&argv).expect("waypoint drag must be accepted");
+        assert_eq!(
+            plan.expected_pos(),
+            Some(ExpectedPos { x: 800, y: 600 }),
+            "the destination is the last mousemove, not the first waypoint"
+        );
+        let t = plan.button_transition().expect("a drag names a button transition");
+        assert!(!t.down, "a drag must not read as leaving a button held");
+        assert_eq!(t.button, MouseButton::Left);
+
+        // The same chain under xdotool, since the two share one grammar.
+        let mut x = argv.clone();
+        x[0] = "xdotool".to_string();
+        assert!(validate(&x).is_ok());
+    }
+
+    #[test]
+    fn a_modifier_held_waypoint_drag_is_still_bracketed() {
+        let argv: Vec<String> = [
+            "cc-wayland-actuate", "keydown", "ctrl", "mousemove", "400", "300",
+            "mousedown", "1", "mousemove", "500", "400", "mousemove", "800", "600",
+            "mouseup", "1", "keyup", "ctrl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(validate(&argv).is_ok(), "a bracketed modifier must survive waypoints");
+    }
+
+    #[test]
+    fn cc_wayland_accepts_exactly_what_xdotool_accepts() {
+        let cases: &[&[&str]] = &[
+            &["mousemove", "400", "300"],
+            &["mousemove", "400", "300", "click", "1"],
+            &["keydown", "ctrl", "mousemove", "1", "2", "click", "1", "keyup", "ctrl"],
+            &["click", "--repeat", "5", "5"],
+            &["mousedown", "1"],
+            &["mouseup", "1"],
+            &["getmouselocation", "--shell"],
+            &["key", "ctrl+c"],
+            &["type", "hello  world"],
+            // refused on both
+            &["exec", "/bin/sh"],
+            &["spawn", "xterm"],
+            &["behave", "1", "mouse-enter", "exec", "sh"],
+            &["key"],
+            &["type"],
+        ];
+        for case in cases {
+            let x: Vec<String> = std::iter::once("xdotool".to_string())
+                .chain(case.iter().map(|s| s.to_string()))
+                .collect();
+            let w: Vec<String> = std::iter::once("cc-wayland-actuate".to_string())
+                .chain(case.iter().map(|s| s.to_string()))
+                .collect();
+            let xr = validate(&x);
+            let wr = validate(&w);
+            assert_eq!(
+                xr.is_ok(),
+                wr.is_ok(),
+                "disagreement on {:?}: xdotool={:?} cc-wayland={:?}",
+                case,
+                xr,
+                wr
+            );
+            if let (Ok(Plan::Run { bin: xb, args: xa }), Ok(Plan::Run { bin: wb, args: wa })) =
+                (&xr, &wr)
+            {
+                assert_eq!(xa, wa, "validated args differ for {:?}", case);
+                assert_eq!(*xb, Bin::Xdotool);
+                assert_eq!(*wb, Bin::CcWayland);
+            }
+        }
+    }
+
+    #[test]
+    fn an_unlisted_binary_is_still_refused() {
+        let argv = vec!["cc-wayland".to_string(), "mousemove".to_string()];
+        assert!(validate(&argv).is_err(), "a near-miss name must not be accepted");
+    }
+
     use super::*;
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -1016,20 +1141,29 @@ mod tests {
 
     #[test]
     fn only_the_windows_drag_waits_longer_for_the_cursor_to_arrive() {
-        // The longer re-read budget exists for one case: the watcher performs a drag
-        // asynchronously and its slow MouseMove lands 110-166ms after the write. Every
-        // other command is in place well inside the default budget, and widening it for
-        // them would charge a wait they do not need.
+        // The longer re-read budget exists for the two verbs the Windows watcher
+        // paces the pointer through asynchronously: a `drag` always, and a `move`
+        // when CC_SMOOTH_MOVE glides it. In both, the slow MouseMove lands well after
+        // the write - up to the ~900ms glide cap. Every other command is in place
+        // inside the default budget, and widening it for them would charge a wait
+        // they do not need.
         assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "500 400 drag 900 700"]));
         assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "here drag 700 500"]));
         assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "500 400 #drag 900 700"]));
+        // A move: a smooth one glides asynchronously, and the readback must wait for
+        // it. A non-smooth move lands in ~35ms and the loop exits on the first match,
+        // so naming it here costs nothing on that path.
+        assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "770 310 move"]));
+        assert!(deferred(&["__write__", r"C:\mouse_cmd.txt", "770 310 #move"]));
 
         assert!(!deferred(&["__write__", r"C:\mouse_cmd.txt", "770 310 left"]));
         assert!(!deferred(&["__write__", r"C:\mouse_cmd.txt", "here left"]));
         assert!(!deferred(&["__write__", r"C:\mouse_cmd.txt", "position"]));
         assert!(!deferred(&["__write__", r"C:\keyboard_cmd.txt", "type hello"]));
-        // The other backends run their binary to completion before returning.
+        // The other backends run their binary to completion before returning: their
+        // glide is synchronous, so the pointer has already arrived by the readback.
         assert!(!deferred(&["cliclick", "dd:100,100", "w:50", "du:900,700"]));
+        assert!(!deferred(&["cliclick", "m:900,700"]));
         assert!(!deferred(&["xdotool", "mousemove", "900", "700", "click", "1"]));
     }
 

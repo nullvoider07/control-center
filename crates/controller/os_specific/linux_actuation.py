@@ -12,13 +12,15 @@ class LinuxActuation:
     
     # Mouse action keywords
     MOUSE_ACTIONS = {
-        'move', 'left', 'right', 'middle', 'double', 
-        'scroll_up', 'scroll_down', 'drag', 'here',
-        'hold', 'release', 'position'
+        'move', 'left', 'click', 'right', 'middle', 'double', 'triple',
+        'scroll_up', 'scroll_down', 'scroll_left', 'scroll_right',
+        'drag', 'here', 'hold', 'release', 'position'
     }
     
     # Keyboard action keywords
-    KEYBOARD_ACTIONS = {'type', 'press'}
+    # `key` is macOS's second spelling of `press`; it is an alias there
+    # (`elif action in ['press', 'key']`), and an alias here.
+    KEYBOARD_ACTIONS = {'type', 'press', 'key'}
     
     # Special keys mapping (AutoHotkey syntax → xdotool syntax)
     SPECIAL_KEYS_MAP = {
@@ -106,19 +108,50 @@ class LinuxActuation:
     # counterparts, and fails if any of them drifts.
     DEFAULT_SCROLL_NOTCHES = 5
 
+    # Drag bounds, matching the macOS backend so one grammar means one thing on
+    # every platform. `dwell` is accepted and range-checked but not emitted here:
+    # xdotool would need a chained `sleep`, which the agent's argv policy has no
+    # arm for, so a dwell-bearing command would build and then be refused at
+    # runtime. It would also buy nothing - a dwell-less drag was measured to
+    # select exactly the same text as a dwelled one on this backend.
+    DEFAULT_DRAG_DWELL_MS = 50
+    MIN_DRAG_DWELL_MS = 1
+    MAX_DRAG_DWELL_MS = 5000
+    MAX_DRAG_WAYPOINTS = 16
+
+    # xdotool spells scroll as a button click. 4/5 are vertical, 6/7 horizontal.
+    SCROLL_BUTTONS = {
+        'scroll_up': '4', 'scroll_down': '5',
+        'scroll_left': '6', 'scroll_right': '7',
+    }
+
 
     # Pointer verbs a modifier may be held across — the verbs this backend already
     # has, and no others. `move` and `position` are excluded because no held modifier
     # changes what they do, and accepting the prefix while ignoring it would record a
     # gesture that was never performed.
     MOUSE_MODIFIER_ACTIONS = frozenset({
-        'left', 'right', 'middle', 'double', 'drag', 'hold', 'release',
-        'scroll_up', 'scroll_down',
+        'left', 'click', 'right', 'middle', 'double', 'triple', 'drag',
+        'hold', 'release',
+        'scroll_up', 'scroll_down', 'scroll_left', 'scroll_right',
     })
     
+    # Executable that receives the argv this builder produces.
+    #
+    # X11 is driven by xdotool. Wayland compositors refuse to let one client
+    # synthesise input into another, so xdotool reaches XWayland clients only and
+    # cannot touch a native-Wayland window at all; there the argv goes to a helper
+    # that speaks the same sub-command language over the RemoteDesktop portal
+    # (see wayland_portal.py). The token stream is identical either way - only
+    # argv[0] differs - so the grammar, the console echo and the recorded
+    # human_command are unchanged by which backend is in use.
+    X11_BACKEND = 'xdotool'
+    WAYLAND_BACKEND = 'cc-wayland-actuate'
+
     # Class-level default so instances built without __init__ (tests, replay
     # helpers) still have a defined policy rather than raising on attribute access.
     strict = True
+    backend = X11_BACKEND
 
     def __init__(self, grpc_client, strict: bool = True):
         """Initialize controller with gRPC client.
@@ -128,7 +161,35 @@ class LinuxActuation:
         self.grpc_client = grpc_client
         self.display = os.environ.get('DISPLAY', ':0')
         self.strict = strict
-    
+        self.backend = self.detect_backend()
+
+    @classmethod
+    def detect_backend(cls) -> str:
+        """Pick the executable for this session's display server.
+
+        CC_LINUX_BACKEND overrides, taking 'xdotool' or 'wayland'; an unknown
+        value is an error rather than a silent fallback, because falling back to
+        xdotool on Wayland produces the failure this detection exists to avoid -
+        commands that exit 0 and actuate nothing outside XWayland.
+
+        DISPLAY is not a usable signal on its own: a Wayland session almost
+        always runs XWayland and sets it too, so a DISPLAY test would select
+        xdotool on exactly the sessions that need the portal.
+        """
+        override = os.environ.get('CC_LINUX_BACKEND', '').strip().lower()
+        if override:
+            if override in ('xdotool', 'x11'):
+                return cls.X11_BACKEND
+            if override == 'wayland':
+                return os.environ.get('CC_WAYLAND_HELPER') or cls.WAYLAND_BACKEND
+            raise ValueError(
+                f"CC_LINUX_BACKEND={override!r} is not one of 'xdotool', 'wayland'")
+
+        session_type = os.environ.get('XDG_SESSION_TYPE', '').strip().lower()
+        if session_type == 'wayland' or os.environ.get('WAYLAND_DISPLAY'):
+            return os.environ.get('CC_WAYLAND_HELPER') or cls.WAYLAND_BACKEND
+        return cls.X11_BACKEND
+
     # Helper method to format key combinations for display in CLI output
     def _format_press_for_display(self, keys: str) -> str:
         """Convert modifier-prefixed key notation to human-readable string for CLI output.
@@ -217,6 +278,68 @@ class LinuxActuation:
             )
 
         return mods, action
+
+    # Helper method to parse the tokens following "drag"
+    def _parse_drag(self, rest: List[str]) -> Tuple[List[Tuple[int, int]], Tuple[int, int], int]:
+        """Parse the tokens after "drag" into (waypoints, destination, dwell_ms).
+
+        Accepted forms, matching the macOS backend:
+            <x2> <y2> [dwell <ms>]
+            via <ax> <ay> [via ...] to <x2> <y2> [dwell <ms>]
+
+        One deliberate difference from macOS: in the plain form, tokens after the
+        destination are ignored rather than refused. This backend has always read
+        the destination from fixed positions and ignored the rest, so refusing
+        them now would reject commands that work today. The waypoint form is
+        strict, because there "to" is what separates a waypoint from the
+        destination and a stray token is genuinely ambiguous.
+
+        The destination is returned rather than re-derived by the caller. The
+        console echo used to read it from the two tokens after "drag", which is
+        the destination in the plain form and the literal "via" in the waypoint
+        form - the same defect the macOS backend records having fixed.
+        """
+        tokens = list(rest)
+
+        dwell = self.DEFAULT_DRAG_DWELL_MS
+        if len(tokens) >= 2 and tokens[-2] == 'dwell':
+            try:
+                dwell = int(tokens[-1])
+            except ValueError:
+                raise ValueError(f"drag dwell must be a number, got {tokens[-1]!r}")
+            if not self.MIN_DRAG_DWELL_MS <= dwell <= self.MAX_DRAG_DWELL_MS:
+                raise ValueError(
+                    f"drag dwell {dwell} out of range "
+                    f"{self.MIN_DRAG_DWELL_MS}-{self.MAX_DRAG_DWELL_MS} ms"
+                )
+            tokens = tokens[:-2]
+
+        def point(pair: List[str]) -> Tuple[int, int]:
+            try:
+                return (int(pair[0]), int(pair[1]))
+            except (ValueError, IndexError):
+                raise ValueError(f"drag needs a pair of integer coordinates, got {pair!r}")
+
+        waypoints: List[Tuple[int, int]] = []
+        if tokens and tokens[0] == 'via':
+            while tokens and tokens[0] == 'via':
+                waypoints.append(point(tokens[1:3]))
+                tokens = tokens[3:]
+            if len(waypoints) > self.MAX_DRAG_WAYPOINTS:
+                raise ValueError(
+                    f"drag accepts at most {self.MAX_DRAG_WAYPOINTS} waypoints, "
+                    f"got {len(waypoints)}"
+                )
+            if not tokens or tokens[0] != 'to':
+                raise ValueError("drag with 'via' waypoints must end with 'to <x> <y>'")
+            tokens = tokens[1:]
+            destination = point(tokens[0:2])
+            if len(tokens) > 2:
+                raise ValueError(f"unexpected tokens after drag destination: {tokens[2:]}")
+        else:
+            destination = point(tokens[0:2])
+
+        return waypoints, destination, dwell
 
     # Helper method to decide whether a token names a mouse action
     def _is_mouse_action_token(self, token: str) -> bool:
@@ -391,7 +514,7 @@ class LinuxActuation:
                 down = [t for mod in mods for t in ('keydown', mod)]
                 up = [t for mod in reversed(mods) for t in ('keyup', mod)]
                 tokens = down + tokens + up
-            return (['xdotool'] + tokens, command)
+            return ([self.backend] + tokens, command)
 
         # POSITION COMMAND - Returns current coordinates
         if parts[0] == 'position':
@@ -408,20 +531,23 @@ class LinuxActuation:
                 print(f"[✗] {e}")
                 return None
 
-            # Scrolling requires an explicit count from the user
-            if action in ['scroll_up', 'scroll_down']:
+            # Scrolling requires an explicit count from the user. That rule is
+            # this backend's own and applies to the horizontal directions for the
+            # same reason it applies to the vertical ones.
+            if action in self.SCROLL_BUTTONS:
                 if len(parts) < 3:
                     print("[!] Error: You must specify a scroll count (e.g., 'here scroll_down 5')")
                     return None
                 count = parts[2]
-                button = '4' if action == 'scroll_up' else '5'
-                return out(['click', '--repeat', count, button], mods)
+                return out(['click', '--repeat', count, self.SCROLL_BUTTONS[action]], mods)
 
             here_map = {
                 'left':    ['click', '1'],
+                'click':   ['click', '1'],
                 'right':   ['click', '3'],
                 'middle':  ['click', '2'],
                 'double':  ['click', '--repeat', '2', '1'],
+                'triple':  ['click', '--repeat', '3', '1'],
                 'hold':    ['mousedown', '1'],
                 'release': ['mouseup', '1'],
             }
@@ -443,12 +569,16 @@ class LinuxActuation:
 
             if action == 'move':
                 return out(['mousemove', str(x), str(y)])
-            elif action == 'left':
+            elif action in ('left', 'click'):
+                # `click` is macOS's spelling of `left`; same gesture, so the same
+                # argv rather than a second code path that could drift from it.
                 return out(['mousemove', str(x), str(y), 'click', '1'], mods)
             elif action == 'right':
                 return out(['mousemove', str(x), str(y), 'click', '3'], mods)
             elif action == 'double':
                 return out(['mousemove', str(x), str(y), 'click', '--repeat', '2', '1'], mods)
+            elif action == 'triple':
+                return out(['mousemove', str(x), str(y), 'click', '--repeat', '3', '1'], mods)
             elif action == 'middle':
                 return out(['mousemove', str(x), str(y), 'click', '2'], mods)
             elif action == 'hold':
@@ -459,25 +589,33 @@ class LinuxActuation:
                 return out(['mousemove', str(x), str(y), 'mousedown', '1'], mods)
             elif action == 'release':
                 return out(['mousemove', str(x), str(y), 'mouseup', '1'], mods)
-            elif action == 'drag' and len(parts) >= 5:
-                x2, y2 = int(parts[3]), int(parts[4])
-                return out(['mousemove', str(x), str(y), 'mousedown', '1',
-                            'mousemove', str(x2), str(y2), 'mouseup', '1'], mods)
-            elif action in ['scroll_up', 'scroll_down']:
+            elif action == 'drag':
+                try:
+                    waypoints, (x2, y2), _dwell = self._parse_drag(parts[3:])
+                except ValueError as e:
+                    # Caught here rather than by the enclosing handler, which
+                    # swallows ValueError and would fall through to the standalone
+                    # case, refusing the command without saying why.
+                    print(f"[X] {e}")
+                    return None
+                chain = ['mousemove', str(x), str(y), 'mousedown', '1']
+                for wx, wy in waypoints:
+                    chain += ['mousemove', str(wx), str(wy)]
+                chain += ['mousemove', str(x2), str(y2), 'mouseup', '1']
+                return out(chain, mods)
+            elif action in self.SCROLL_BUTTONS:
                 count = parts[3] if len(parts) > 3 else str(self.DEFAULT_SCROLL_NOTCHES)
-                button = '4' if action == 'scroll_up' else '5'
-                return out(['mousemove', str(x), str(y), 'click', '--repeat', count, button],
-                           mods)
+                return out(['mousemove', str(x), str(y), 'click', '--repeat', count,
+                            self.SCROLL_BUTTONS[action]], mods)
         except (ValueError, IndexError):
             pass
 
         # Standalone scroll (must include count)
-        if parts[0] in ['scroll_up', 'scroll_down']:
+        if parts[0] in self.SCROLL_BUTTONS:
             if len(parts) < 2:
                 print(f"[!] Error: {parts[0]} requires a count.")
                 return None
-            button = '4' if parts[0] == 'scroll_up' else '5'
-            return out(['click', '--repeat', parts[1], button])
+            return out(['click', '--repeat', parts[1], self.SCROLL_BUTTONS[parts[0]]])
 
         return None
 
@@ -500,14 +638,14 @@ class LinuxActuation:
             if len(parts) < 2:
                 return None
             text = parts[1]
-            return (['xdotool', 'type', text], command)
+            return ([self.backend, 'type', text], command)
 
-        # Handle "press" action
-        elif action == 'press':
+        # Handle "press" / "key" action
+        elif action in ('press', 'key'):
             if len(parts) < 2:
                 return None
             translated = self._translate_modifier_keys(parts[1])
-            return (['xdotool', 'key'] + translated.split(), command)
+            return ([self.backend, 'key'] + translated.split(), command)
 
         return None
     
@@ -545,11 +683,23 @@ class LinuxActuation:
         # Send to server via gRPC (structured argv — executed without a shell)
         result = self.grpc_client.execute_command(argv=argv, human_command=human_command)
 
+        position_verified = False
         if cmd_type == 'mouse' and result['success'] and processed_cmd != 'position':
             mx = result.get('mouse_x')
             my = result.get('mouse_y')
             captured = result.get('position_captured', False)
-            position_after = (mx, my) if captured and mx is not None and my is not None else None
+            if mx is not None and my is not None:
+                # The agent sends the requested point with position_captured=false
+                # when it could not read the pointer back. Over a native-Wayland
+                # surface nothing can read it - not xdotool, not the portal helper -
+                # so the choice is this coordinate labelled as unverified, or no
+                # coordinate at all. It is labelled, never silently promoted: a
+                # requested point recorded as an observed one is the failure this
+                # whole layer exists to prevent.
+                position_after = (mx, my)
+                position_verified = bool(captured)
+            else:
+                position_after = None
         
         # Handle position query result separately. The warning goes here too because
         # this branch returns before the shared result-printing block below, and a
@@ -559,8 +709,16 @@ class LinuxActuation:
             mx = result.get('mouse_x')
             my = result.get('mouse_y')
             captured = result.get('position_captured', False)
-            if captured and mx is not None and my is not None:
-                print(f"[POSITION] X={mx}, Y={my}")
+            if mx is not None and my is not None:
+                if captured:
+                    print(f"[POSITION] X={mx}, Y={my}")
+                else:
+                    # Derived from the motion this backend emitted, because the
+                    # display could not be read. Exact for a pointer only cc has
+                    # moved; blind to the physical mouse. Labelled rather than
+                    # withheld, and never presented as measured.
+                    print(f"[POSITION] X={mx}, Y={my} (derived, unverified — the "
+                          f"display cannot report the pointer here)")
                 return True
         
         # Display result with position info for mouse actions
@@ -571,7 +729,7 @@ class LinuxActuation:
             command_hints.print_held_button_warnings(result.get('metadata'))
             if cmd_type == 'keyboard':
                 kb_action, _, kb_content = processed_cmd.partition(' ')
-                if kb_action == 'press':
+                if kb_action in ('press', 'key'):
                     human = self._format_press_for_display(kb_content)
                     print(f"Pressed: {human}, time taken: {ms}ms")
                 else:
@@ -581,7 +739,13 @@ class LinuxActuation:
                 tokens = command.strip().split()
                 is_here = tokens[0] == 'here'
                 action_tok = tokens[1] if is_here and len(tokens) >= 2 else (tokens[2] if len(tokens) >= 3 else None)
-                pos_str = f"X={position_after[0]}, Y={position_after[1]}" if position_after else "X=?, Y=?"
+                if position_after and position_verified:
+                    pos_str = f"X={position_after[0]}, Y={position_after[1]}"
+                elif position_after:
+                    pos_str = (f"X={position_after[0]}, Y={position_after[1]}"
+                               " (requested, unverified)")
+                else:
+                    pos_str = "X=?, Y=?"
 
                 # A modifier held across the action changes what the action does, so
                 # the echo names it. Split off here so the verb branches below stay a
@@ -591,11 +755,19 @@ class LinuxActuation:
                     mod_prefix, action_tok = self._describe_mouse_modifiers(action_tok)
 
                 if action_tok == 'drag' and len(tokens) >= 5:
-                    print(f"Executed: {command}, {mod_prefix}dragged from X={tokens[0]}, Y={tokens[1]} to X={tokens[3]}, Y={tokens[4]}, time taken: {ms}ms")
-                elif action_tok in ('left', 'right', 'double', 'middle'):
+                    # The destination comes from the same parser the argv did.
+                    # Reading tokens[3:5] names the first waypoint, not the
+                    # endpoint, once "via" is in play.
+                    try:
+                        way, (dx2, dy2), _ = self._parse_drag(tokens[3:])
+                    except ValueError:
+                        way, dx2, dy2 = [], tokens[3], tokens[4]
+                    via_note = f" via {len(way)} waypoint(s)" if way else ""
+                    print(f"Executed: {command}, {mod_prefix}dragged from X={tokens[0]}, Y={tokens[1]} to X={dx2}, Y={dy2}{via_note}, time taken: {ms}ms")
+                elif action_tok in ('left', 'click', 'right', 'double', 'triple', 'middle'):
                     print(f"Executed: {command}, clicked {mod_prefix}{action_tok} at {pos_str}, time taken: {ms}ms")
-                elif action_tok in ('scroll_up', 'scroll_down'):
-                    direction = 'up' if action_tok == 'scroll_up' else 'down'
+                elif action_tok in self.SCROLL_BUTTONS:
+                    direction = action_tok.split('_', 1)[1]
                     count_idx = 2 if is_here else 3
                     try:
                         n = int(tokens[count_idx])
@@ -608,6 +780,11 @@ class LinuxActuation:
                     print(f"Executed: {command}, {mod_prefix}scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
                 elif action_tok == 'move':
                     print(f"Executed: {command}, moved to {pos_str}, time taken: {ms}ms")
+                elif action_tok == 'hold':
+                    # Said here, not by the delayed warning: the operator reaches for
+                    # the mouse straight after this command, not after the next one.
+                    print(f"Executed: {command}, held at {pos_str}, time taken: {ms}ms")
+                    print(command_hints.hold_notice())
                 else:
                     print(f"Executed: {command}, at {pos_str}, time taken: {ms}ms")
             return True

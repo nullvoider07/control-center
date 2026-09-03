@@ -128,6 +128,20 @@ jobs:
             --hidden-import=keyring.backends \
             crates/controller/management/cli.py
 
+          # The Wayland actuation helper. The agent spawns `cc-wayland-actuate` by
+          # name for actuation and for the position readback, so this install path
+          # must carry it: the console_scripts entry added to setup.py only reaches
+          # a pip install, and this one is a tarball of prebuilt binaries.
+          # wayland_cursor.c rides along because CursorTracker compiles it on first
+          # use and looks for it beside the module.
+          pyinstaller --onefile \
+            --name cc-wayland-actuate \
+            --paths crates \
+            --add-data "crates/controller/os_specific/wayland_cursor.c:controller/os_specific" \
+            --hidden-import=jeepney \
+            --hidden-import=jeepney.io.blocking \
+            crates/controller/os_specific/wayland_portal.py
+
       - name: Get Version
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
@@ -140,6 +154,7 @@ jobs:
           cp target/release/control-center-agent package/bin/
           cp target/release/generate-token package/bin/
           cp dist/control-center package/bin/
+          cp dist/cc-wayland-actuate package/bin/
           chmod +x package/bin/*
           
           cat > package/install.sh << 'EOF'
@@ -156,6 +171,8 @@ jobs:
           cp bin/control-center-agent "$HOME/.local/bin/"
           cp bin/generate-token "$HOME/.local/bin/"
           cp bin/control-center "$HOME/.local/bin/"
+          cp bin/cc-wayland-actuate "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/cc-wayland-actuate"
           chmod +x "$HOME/.local/bin/control-center-server"
           chmod +x "$HOME/.local/bin/control-center-agent"
           chmod +x "$HOME/.local/bin/generate-token"
@@ -164,6 +181,7 @@ jobs:
           echo "  ✓ Agent:           $HOME/.local/bin/control-center-agent"
           echo "  ✓ Token generator: $HOME/.local/bin/generate-token"
           echo "  ✓ CLI:             $HOME/.local/bin/control-center"
+          echo "  ✓ Wayland helper:  $HOME/.local/bin/cc-wayland-actuate"
           echo ""
           
           if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
@@ -249,6 +267,20 @@ jobs:
             --hidden-import=keyring.backends \
             crates/controller/management/cli.py
 
+          # The Wayland actuation helper. The agent spawns `cc-wayland-actuate` by
+          # name for actuation and for the position readback, so this install path
+          # must carry it: the console_scripts entry added to setup.py only reaches
+          # a pip install, and this one is a tarball of prebuilt binaries.
+          # wayland_cursor.c rides along because CursorTracker compiles it on first
+          # use and looks for it beside the module.
+          pyinstaller --onefile \
+            --name cc-wayland-actuate \
+            --paths crates \
+            --add-data "crates/controller/os_specific/wayland_cursor.c:controller/os_specific" \
+            --hidden-import=jeepney \
+            --hidden-import=jeepney.io.blocking \
+            crates/controller/os_specific/wayland_portal.py
+
       - name: Get Version
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
@@ -261,6 +293,7 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/control-center-agent package/bin/
           cp target/aarch64-unknown-linux-gnu/release/generate-token package/bin/
           cp dist/control-center package/bin/
+          cp dist/cc-wayland-actuate package/bin/
           chmod +x package/bin/*
           
           cat > package/install.sh << 'EOF'
@@ -277,6 +310,8 @@ jobs:
           cp bin/control-center-agent "$HOME/.local/bin/"
           cp bin/generate-token "$HOME/.local/bin/"
           cp bin/control-center "$HOME/.local/bin/"
+          cp bin/cc-wayland-actuate "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/cc-wayland-actuate"
           chmod +x "$HOME/.local/bin/control-center-server"
           chmod +x "$HOME/.local/bin/control-center-agent"
           chmod +x "$HOME/.local/bin/generate-token"
@@ -285,6 +320,7 @@ jobs:
           echo "  ✓ Agent:           $HOME/.local/bin/control-center-agent"
           echo "  ✓ Token generator: $HOME/.local/bin/generate-token"
           echo "  ✓ CLI:             $HOME/.local/bin/control-center"
+          echo "  ✓ Wayland helper:  $HOME/.local/bin/cc-wayland-actuate"
           echo ""
           
           if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then

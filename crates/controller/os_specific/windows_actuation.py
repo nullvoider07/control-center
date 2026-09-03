@@ -571,6 +571,13 @@ class WindowsActuation:
                     print(f"Executed: {command}, {mod_prefix}scrolled {direction} {notch_str} at {pos_str}, time taken: {ms}ms")
                 elif action_tok == 'move':
                     print(f"Executed: {command}, moved to {pos_str}, time taken: {ms}ms")
+                elif action_tok == 'hold':
+                    # Announced by the command that creates the hold. The delayed
+                    # warning only speaks on a later command, so an operator who
+                    # holds and then reaches for the mouse is told nothing, and
+                    # finds their physical clicks dead with no explanation.
+                    print(f"Executed: {command}, held at {pos_str}, time taken: {ms}ms")
+                    print(command_hints.hold_notice())
                 else:
                     print(f"Executed: {command}, at {pos_str}, time taken: {ms}ms")
             

@@ -1,13 +1,97 @@
 # Control Center - Desktop Actuation Tool
 
-**Version:** 1.3.0  
-**Last Updated:** August 2026  
+**Version:** 2.0.0  
+**Last Updated:** September 2026  
 **Developer:** Kartik A (NullVoider)
+
+---
+
+## What's New in v2.0
+
+Version 2.0 is a major release centered on two capabilities that were absent in
+the 1.x line — **human-like pointer movement** and a **Wayland actuation
+backend** — plus correctness fixes that follow from them. Nothing in the command
+grammar changed: every 1.x command runs unaltered and records identically. The
+new behavior is opt-in or auto-detected, never a breaking change to an existing
+caller.
+
+### Human-like cursor movement (opt-in)
+
+By default the pointer still jumps straight to its target, exactly as in 1.x. Set
+the environment variable **`CC_SMOOTH_MOVE=1`** on the machine performing the
+actuation and a `move` or the travel leg of a `drag` instead *glides* to the
+target along a paced, curved path — the way a hand moves rather than a teleport.
+
+**How it works.** The motion follows a **minimum-jerk velocity profile**
+(`10t³ − 15t⁴ + 6t⁵`), the curve human reaching movement actually traces: slow at
+both ends, fastest in the middle. It is not a constant-speed slide — the
+acceleration is what reads as human. The duration scales with distance: a floor of
+120 ms, plus 0.55 ms per pixel travelled, capped at 900 ms, sampled at ~120 steps
+per second. A short nudge takes ~150 ms; a full-screen traverse ~900 ms. The last
+point emitted is always the exact integer target, so **a glide lands precisely
+where a jump landed**.
+
+The same curve and constants are used on all three platforms, so a glide looks the
+same everywhere — but each platform reaches it through its own backend, because
+each needs the pointer's *current* position as the path's starting point:
+
+| Platform | Mechanism |
+|----------|-----------|
+| **Windows** | The AutoHotkey watcher paces the pointer itself (`GlideTo` in `mouse_control.ahk`), reading the origin with `MouseGetPos`. |
+| **macOS** | The agent composes a CoreGraphics loop and posts `kCGEventMouseMoved` events through JXA, reading the origin with `CGEventGetLocation` — the same bounded-parameters, no-script-text path the `__middle__` action already uses. |
+| **Linux (Wayland)** | The portal daemon emits paced absolute-motion events, reading the origin from the compositor's cursor metadata. |
+
+**Grammar is unchanged and the corpus stays consistent.** `700 300 move` is the
+same command, validated and recorded the same way, whether it glides or jumps —
+only the frames *between* two steps differ. Because the switch is a per-machine
+environment variable, it is set once on a capture box and every command it runs
+inherits it; existing recordings are untouched.
+
+A gliding `move` still reports its final coordinate. On Windows the glide runs
+asynchronously in the watcher, so the agent's position read-back now waits for the
+glide to finish before reporting (previously a long glide could report an
+unverified position); on macOS and Linux the glide is synchronous and the pointer
+has already arrived by the time the position is read.
+
+### Wayland actuation backend (Linux)
+
+Linux actuation is no longer X11-only. On a Wayland session the agent drives the
+pointer and keyboard through the **XDG desktop portal** instead of `xdotool`,
+which cannot reach a native-Wayland client at all. The backend is selected
+automatically: if `WAYLAND_DISPLAY` is set or `XDG_SESSION_TYPE=wayland`, the
+Wayland path is used; otherwise the X11 `xdotool` path runs exactly as before.
+
+**How it works.** A single portal session combines the **RemoteDesktop**
+(input-synthesis) and **ScreenCast** (screen-access) interfaces, so the operator
+sees **one** consent dialog rather than two. Input is synthesized through the
+portal's `NotifyPointerMotionAbsolute` / button / key calls. Absolute placement is
+exact because the coordinates are stream-relative and the compositor applies no
+pointer acceleration to them. The pointer's position — which Wayland does not
+otherwise let a client observe — is read from the compositor's **PipeWire cursor
+metadata** via a small C helper (`wayland_cursor.c`), the only self-reporting
+signal available on Wayland. A **restore token** lets the daemon re-establish the
+session on later runs without prompting again, and the daemon **self-heals** a
+session that stops accepting input by silently re-negotiating it from that token.
+
+Two operational notes: the portal requires a one-time consent grant (the daemon
+prints how to complete it), and while the daemon holds the screencast stream the
+desktop shows the standard GNOME screen-sharing indicator for the life of the
+session — this is the cost of being able to read the pointer position on Wayland.
+
+### Standalone Wayland coordinate picker
+
+`crates/controller/os_specific/pointer_picker.py` is a small standalone utility for
+a **human operator** who needs to read a pixel coordinate on Wayland during
+discovery. It opens a full-screen window of its own — the one surface a Wayland
+client is allowed to observe the pointer over — and reports the coordinate of the
+operator's click, then closes. It is not part of the agent path (the agent locates
+targets from an image) and is not wired as a command; it is run directly.
 
 ---
 
 ## Table of Contents
 
+- [What's New in v2.0](#whats-new-in-v20)
 1. [Overview](#overview)
 2. [Key Features](#key-features)
 3. [Capability Summary](#capability-summary)
@@ -89,7 +173,9 @@ Control Center consists of three components:
 
 ## Key Features
 
-- ✅ **Cross-Platform Actuation**: Windows, macOS, and Linux (X11) support from a single command interface
+- ✅ **Cross-Platform Actuation**: Windows, macOS, and Linux — both X11 and Wayland — from a single command interface
+- ✅ **Human-Like Cursor Movement** *(new in 2.0)*: Opt-in `CC_SMOOTH_MOVE` glides `move` and `drag` along a minimum-jerk curve instead of teleporting, on all three platforms, without changing the command grammar or recorded form
+- ✅ **Wayland Actuation** *(new in 2.0)*: On a Wayland session the agent drives input through the XDG desktop portal (`xdotool` cannot reach native-Wayland clients); the backend is auto-selected and falls back to X11 when appropriate
 - ✅ **Three Usage Modes**: Interactive shell, single-command execution, and batch file execution
 - ✅ **Line Editing & History**: The interactive console supports readline line editing (arrow-key cursor movement) and up/down command history that persists across `connect` sessions, is cleared when the server restarts, and is encrypted at rest (key in the OS keyring)
 - ✅ **Live Command Streaming**: WatchCommands gRPC stream for real-time event observation by external tools
@@ -253,9 +339,17 @@ Scrolling is the one action needing two binaries (a `cliclick` focus click follo
 
 Middle click is the one action `cliclick` cannot perform at all — it has no middle-button command — so it is sent as a bounded `__middle__` instruction and the agent posts the event itself through JXA (`osascript -l JavaScript`), which reaches CoreGraphics' `CGEventCreateMouseEvent`. macOS supports the button natively; the gap was in the tool, not the platform. Modifiers ride on the event via `CGEventSetFlags` rather than a held key, so a failed script cannot leave one stuck down. As with `__scroll__`, the client sends only a click point and a list of modifier names — never script text.
 
-**Linux — xdotool**
+**Linux (X11) — xdotool**
 
-Both mouse and keyboard commands are executed by spawning `xdotool` directly with a validated argument list. The `DISPLAY` environment variable is supplied by the agent. On headless systems, Xvfb can provide a virtual display.
+On an X11 session both mouse and keyboard commands are executed by spawning `xdotool` directly with a validated argument list. The `DISPLAY` environment variable is supplied by the agent. On headless systems, Xvfb can provide a virtual display. Coordinates must be non-negative: the argv policy accepts a coordinate token only as unsigned digits, so a monitor placed left of or above the primary — which occupies negative screen space — cannot currently be addressed.
+
+**Linux (Wayland) — XDG desktop portal** *(new in 2.0)*
+
+`xdotool` cannot reach a native-Wayland client, so on a Wayland session actuation goes through the XDG desktop portal instead. The agent selects this path automatically when `WAYLAND_DISPLAY` is set or `XDG_SESSION_TYPE=wayland`. A single portal session combines the **RemoteDesktop** interface (input synthesis) and the **ScreenCast** interface (screen access), so the operator grants **one** consent dialog. Input is synthesized with the portal's absolute-motion, button, and key calls; absolute placement is exact because the coordinates are stream-relative. The pointer position — which Wayland does not otherwise expose to a client — is read from the compositor's PipeWire cursor metadata via a small C helper (`wayland_cursor.c`). A restore token re-establishes the session on later runs without a fresh prompt, and the daemon re-negotiates a session that stops accepting input. While the daemon holds the screencast stream, the desktop shows the standard screen-sharing indicator for the life of the session.
+
+**Human-like movement (all platforms)** *(new in 2.0)*
+
+With `CC_SMOOTH_MOVE=1` set on the actuation machine, a `move` and the travel leg of a `drag` glide to the target along a minimum-jerk curve instead of teleporting. Each backend reaches the same curve through its own mechanism — the Windows watcher's `GlideTo`, a JXA CoreGraphics loop on macOS, and paced absolute-motion on Wayland — because each needs the pointer's current position as the path's start. The grammar and recorded form are unchanged. See [What's New in v2.0](#whats-new-in-v20) for the full description.
 
 ---
 
@@ -526,6 +620,10 @@ issue it only to consumers that are entitled to see keystroke content.
 | `CC_REVOKED_SUBJECTS` | Server binary | Comma-separated JWT subjects to refuse, whatever their signature or expiry. Read at startup |
 | `CC_ALLOW_AGENT_TAKEOVER` | Server binary | `true` lets a different principal displace a connected, responding agent. Off by default |
 | `RUST_LOG` | Agent + Server | Log level for Rust binaries (e.g., `info`, `debug`) |
+| `CC_SMOOTH_MOVE` | Agent + watcher | *(new in 2.0)* Set to any non-empty value to glide `move`/`drag` along a minimum-jerk curve instead of teleporting. Off by default. Set on the machine performing the actuation (the agent, and on Windows the AutoHotkey watcher process) |
+| `AGENT_TLS_CA` | Agent binary | CA certificate the agent uses to verify the server (the agent-side counterpart of `CC_TLS_CA`) |
+| `CC_WAYLAND_DEBUG` | Wayland daemon | Set to any non-empty value for verbose portal/glide diagnostics on stderr |
+| `CC_WAYLAND_IDLE_TIMEOUT` | Wayland daemon | Seconds the portal daemon stays alive while idle before shutting down (default 1800) |
 
 **Token lifetime and revocation.** A signed token cannot be withdrawn, so
 `generate-token` caps `duration_hours` at 8760 (365 days) — issue a short one and
@@ -722,14 +820,14 @@ The actuation command language is the same across all three platforms. The contr
 | `<x> <y> right` | Move to coordinates and right-click |
 | `<x> <y> double` | Move to coordinates and double-click |
 | `<x> <y> middle` | Move to coordinates and middle-click (macOS: working since 1.3.0) |
-| `<x> <y> click` | Alias for `left` (macOS only) |
-| `<x> <y> triple` | Move to coordinates and triple-click (macOS only) |
+| `<x> <y> click` | Alias for `left` (macOS, Linux) |
+| `<x> <y> triple` | Move to coordinates and triple-click (macOS, Linux) |
 | `<x> <y> scroll_up [n]` | Move to coordinates and scroll up (n notches, default 5) |
 | `<x> <y> scroll_down [n]` | Move to coordinates and scroll down (n notches, default 5) |
-| `<x> <y> scroll_left [n]` / `scroll_right [n]` | Horizontal scroll (macOS only) |
+| `<x> <y> scroll_left [n]` / `scroll_right [n]` | Horizontal scroll (macOS, Linux) |
 | `<x> <y> drag <x2> <y2>` | Click and drag from (x,y) to (x2,y2) |
-| `<x> <y> drag <x2> <y2> dwell <ms>` | macOS: same, with a custom pause after the press and each move (1–5000 ms, default 50) |
-| `<x> <y> drag via <ax> <ay> [via …] to <x2> <y2>` | macOS: drag along a path (up to 16 waypoints) |
+| `<x> <y> drag <x2> <y2> dwell <ms>` | macOS: same, with a custom pause after the press and each move (1–5000 ms, default 50). Linux accepts and range-checks the token but performs no dwell — see below |
+| `<x> <y> drag via <ax> <ay> [via …] to <x2> <y2>` | macOS, Linux: drag along a path (up to 16 waypoints) |
 | `<x> <y> hold` / `<x> <y> release` | Press and hold a button, then release it — see [Held Mouse Buttons](#held-mouse-buttons) |
 | `here <action>` | Perform action at the current cursor position |
 | `here drag <x2> <y2>` | Drag from the current position (Windows only) |
@@ -778,8 +876,8 @@ Constraints worth knowing:
   Unicode glyphs. The agent composes the recorded string from the same prefix and
   reads the ASCII forms, so a glyph accepted here would actuate the gesture and record
   it as typed text.
-- **Modifiers apply to the verbs each backend already has.** macOS adds `triple` and
-  the horizontal scroll directions; Linux and Windows have neither.
+- **Modifiers apply to the verbs each backend already has.** macOS and Linux have
+  `triple`, `click` and the horizontal scroll directions; Windows has none of them.
 - **macOS scroll is an arrow-key repeat, not a wheel event.** `#scroll_down` there is
   Cmd+Down — a real gesture, but not the wheel-zoom that Cmd+scroll performs in
   applications that zoom. Linux and Windows drive the real wheel buttons and do zoom.
@@ -800,8 +898,19 @@ controller and the agent have to be upgraded together.**
 
 The default single-hop drag with its 50 ms dwells is enough for a selection drag,
 but drag-and-drop targets and some overlay UIs only track a slower or multi-step
-movement. Both extended forms stay **one recorded step**. They are implemented for
-the macOS backend; Linux and Windows accept the plain `drag <x2> <y2>` form only.
+movement. Both extended forms stay **one recorded step**.
+
+`via` waypoints work on macOS and Linux. Windows accepts the plain
+`drag <x2> <y2>` form only.
+
+`dwell` is performed on macOS. **Linux parses and range-checks it but performs no
+pause**, and the token is accepted rather than refused so that one grammar means
+one thing on every backend. Two reasons it is not emitted there: `xdotool` would
+need a chained `sleep`, which the agent's argv policy has no arm for — so a
+dwell-bearing command would build and then be refused at execution — and a
+dwell-less drag was measured to select exactly the same text as a dwelled one on
+that backend, so it would buy nothing even if it were expressible. If a Linux drag
+ever does need pacing, `CC_SMOOTH_MOVE` is the mechanism, not `dwell`.
 
 On macOS the moves between the press and the release are emitted as `cliclick dm:`
 (drag-continuation), not `m:`. `m:` posts `mouseMoved` and only `dm:` posts
@@ -1030,11 +1139,12 @@ a recording.
 | Keyboard backend | AHK v2 | osascript | xdotool |
 | Middle click | ✅ | ✅ (since 1.3.0) | ✅ |
 | Modifier-held mouse actions | ✅ | ✅ | ✅ |
-| Triple-click | ❌ | ✅ | ❌ |
-| `click` (alias for `left`) | ❌ | ✅ | ❌ |
-| Horizontal scroll (`scroll_left` / `scroll_right`) | ❌ | ✅ | ❌ |
+| Triple-click | ❌ | ✅ | ✅ |
+| `click` (alias for `left`) | ❌ | ✅ | ✅ |
+| Horizontal scroll (`scroll_left` / `scroll_right`) | ❌ | ✅ | ✅ (xdotool buttons 6/7) |
 | `here drag` | ✅ | ❌ | ❌ |
-| Drag waypoints (`via …`) and `dwell` | ❌ | ✅ | ❌ |
+| Drag waypoints (`via …`) | ❌ | ✅ | ✅ |
+| Drag `dwell` | ❌ | ✅ | accepted, not performed |
 | Scroll mechanism | real wheel | arrow-key repeat | real wheel |
 | Media keys | ✅ | ✅ | ❌ |
 | Super key (`#`) | Win key | Cmd | Super |
@@ -2039,7 +2149,7 @@ rollout during a pause in any recording or capture activity rather than mid-sess
 
 ---
 
-**Last Updated:** August 2026  
+**Last Updated:** September 2026  
 **Developer:** Kartik A (NullVoider)
 
 ---

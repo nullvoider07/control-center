@@ -42,17 +42,30 @@ const MAX_POSITION_REREADS: u32 = 3;
 const POSITION_REREAD_INTERVAL_MS: u64 = 50;
 
 /// Re-reads allowed for a command whose cursor arrives asynchronously — see
-/// `Plan::pointer_arrival_is_deferred`, which today means a Windows drag.
+/// `Plan::pointer_arrival_is_deferred`, which means a Windows `drag` or `move`.
 ///
-/// Measured on the guest, a drag's cursor reaches its destination 110-166ms after the
-/// command file is written. The default budget's last read falls at 170ms, clearing the
-/// worst observed case by 4ms — close enough that an ordinarily busy VM would report a
-/// false negative on a drag that actually landed. This carries the window to ~620ms.
+/// Two arrival profiles share this budget, and the larger one sets it. A non-smooth
+/// drag's cursor reaches its destination 110-166ms after the command file is written.
+/// But with `CC_SMOOTH_MOVE` set, `mouse_control.ahk`'s `GlideTo` paces the pointer
+/// along a minimum-jerk curve whose duration is capped at 900ms (`SMOOTH_MAX_MS` there),
+/// and the agent writes the file and returns while the watcher is still gliding — so a
+/// smooth `move` or `drag` does not finish arriving until ~900ms plus one 10ms watcher
+/// poll after the write. The last re-read must fall past that, or a glide that landed
+/// perfectly reports `X=?`.
+///
+/// 20 re-reads at 50ms put the last read at ~1s (plus the 20ms settle already elapsed),
+/// clearing the 910ms worst case with margin. If the glide cap in the `.ahk` ever rises,
+/// this must rise with it; the two are pinned together by `glide_budget_covers_ahk_cap`.
 ///
 /// It costs nothing on the common path: re-reads happen only while the position still
 /// disagrees, so a command that verifies immediately pays none of them, and only a
 /// command that would otherwise have reported an unverified coordinate waits longer.
-const DEFERRED_POSITION_REREADS: u32 = 12;
+const DEFERRED_POSITION_REREADS: u32 = 20;
+
+/// The glide-duration ceiling in `assets`/`watcher_scripts` `mouse_control.ahk`
+/// (`SMOOTH_MAX_MS`). Named here so the readback budget above can be checked against it.
+#[cfg(test)]
+const AHK_GLIDE_MAX_MS: u64 = 900;
 
 /// Notches a scroll command performs when it names no count. Every backend applies
 /// this same number — macos_actuation.py and linux_actuation.py resolve it when they
@@ -69,7 +82,15 @@ const DEFAULT_SCROLL_NOTCHES: u32 = 5;
 struct MousePosition {
     x: i32,
     y: i32,
+    /// The coordinate was read back from the display and matched what was asked.
     captured: bool,
+    /// `x`/`y` mean something. A requested-but-unverified point sets this with
+    /// `captured` false; a command that produced no coordinate at all sets
+    /// neither. Without the distinction the two collapse into `(0, 0)`, and the
+    /// wire could not tell "the pointer was asked to go here and could not be
+    /// read back" from "there is no position", which is why a move over a
+    /// native-Wayland surface reported nothing at all.
+    known: bool,
 }
 
 /// A mouse button the agent has pressed and not yet released.
@@ -483,12 +504,63 @@ impl AgentServiceImpl {
         }
     }
     
+    /// The actuation binary for this session's display server.
+    ///
+    /// Every Linux path that names a binary goes through here: the readback in
+    /// `capture_position_linux` and the uncommanded release in `release_argv`.
+    /// That is the point of it being one function. The readback used to name
+    /// xdotool unconditionally, so on Wayland the agent actuated through the
+    /// portal helper and then read the position with a different program - one
+    /// that reports nothing at all while the pointer is over a native-Wayland
+    /// surface, making every move report an uncaptured position.
+    ///
+    /// `release_argv` had the same defect and outlived the first fix, which is
+    /// why the selection is now a single function rather than a rule applied
+    /// twice: a button pressed by the portal cannot be released by xdotool, so
+    /// the shutdown release did nothing while reporting that it had, and the
+    /// portal daemon does not expire while a button is held. A button left down
+    /// corrupts every step of whatever runs next.
+    ///
+    /// The signals are the same ones LinuxActuation.detect_backend reads, and they
+    /// have to stay the same: two independent detectors would disagree exactly
+    /// when it mattered.
+    /// Whether the position reader can tell a live reading from a stale one.
+    ///
+    /// Only the Wayland helper can. It emits `POSITION_VERIFIED=0` when XWayland is
+    /// stuck over a native-Wayland surface, which `capture_position_linux` turns
+    /// into `captured: false` — so for that reader a captured read is already known
+    /// to be live. Every other reader here — xdotool, cliclick, the Windows
+    /// registry — reports `captured: true` whenever a value parsed at all, which
+    /// says the read succeeded and nothing about whether it is current.
+    ///
+    /// Takes the backend rather than reading the environment so the decision is a
+    /// pure function of it: the caller passes `linux_backend()`, keeping one
+    /// detector, and this stays testable without mutating process environment in a
+    /// parallel test runner.
+    fn reader_reports_staleness(backend: &str) -> bool {
+        backend == "cc-wayland-actuate"
+    }
+
+    fn linux_backend() -> &'static str {
+        #[cfg(target_os = "linux")]
+        {
+            let wayland = std::env::var("XDG_SESSION_TYPE")
+                .map(|t| t.eq_ignore_ascii_case("wayland"))
+                .unwrap_or(false)
+                || std::env::var("WAYLAND_DISPLAY").is_ok();
+            if wayland {
+                return "cc-wayland-actuate";
+            }
+        }
+        "xdotool"
+    }
+
     #[cfg(target_os = "linux")]
     async fn capture_position_linux(&self) -> MousePosition {
         // Direct spawn with DISPLAY supplied via the environment. The agent invokes no
         // shell anywhere, so there is no interpreter for any input to reach.
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-        match ProcessCommand::new("xdotool")
+        match ProcessCommand::new(Self::linux_backend())
             .args(["getmouselocation", "--shell"])
             .env("DISPLAY", display)
             .output()
@@ -500,14 +572,21 @@ impl AgentServiceImpl {
                 
                 if let (Some(x_cap), Some(y_cap)) = (x_regex.captures(&stdout), y_regex.captures(&stdout)) {
                     if let (Ok(x), Ok(y)) = (x_cap[1].parse::<i32>(), y_cap[1].parse::<i32>()) {
-                        debug!("Position captured: ({}, {})", x, y);
-                        return MousePosition { x, y, captured: true };
+                        // POSITION_VERIFIED is emitted only by the Wayland helper,
+                        // which can hand back a coordinate derived from its own
+                        // motion when the X reader is stuck over a native-Wayland
+                        // window. Absent (xdotool, and every older reader) means
+                        // the value was measured, so the default is verified and
+                        // nothing that existed before changes behaviour.
+                        let verified = !stdout.contains("POSITION_VERIFIED=0");
+                        debug!("Position read: ({}, {}) verified={}", x, y, verified);
+                        return MousePosition { x, y, captured: verified, known: true };
                     }
                 }
             }
             _ => {}
         }
-        MousePosition { x: 0, y: 0, captured: false }
+        MousePosition { x: 0, y: 0, captured: false, known: false }
     }
     
     #[cfg(target_os = "windows")]
@@ -523,12 +602,12 @@ impl AgentServiceImpl {
             ) {
                 if let (Ok(x), Ok(y)) = (x_str.parse::<i32>(), y_str.parse::<i32>()) {
                     debug!("Position captured from registry: ({}, {})", x, y);
-                    return MousePosition { x, y, captured: true };
+                    return MousePosition { x, y, captured: true, known: true };
                 }
             }
         }
 
-        MousePosition { x: 0, y: 0, captured: false }
+        MousePosition { x: 0, y: 0, captured: false, known: false }
     }
     
     #[cfg(target_os = "macos")]
@@ -544,29 +623,29 @@ impl AgentServiceImpl {
                     if parts.len() == 2 {
                         if let (Ok(x), Ok(y)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
                             debug!("Position captured: ({}, {})", x, y);
-                            return MousePosition { x, y, captured: true };
+                            return MousePosition { x, y, captured: true, known: true };
                         }
                     }
                 }
             }
         }
-        MousePosition { x: 0, y: 0, captured: false }
+        MousePosition { x: 0, y: 0, captured: false, known: false }
     }
     
     // Cross-compilation stubs
     #[cfg(not(target_os = "linux"))]
     async fn capture_position_linux(&self) -> MousePosition {
-        MousePosition { x: 0, y: 0, captured: false }
+        MousePosition { x: 0, y: 0, captured: false, known: false }
     }
     
     #[cfg(not(target_os = "windows"))]
     async fn capture_position_windows(&self) -> MousePosition {
-        MousePosition { x: 0, y: 0, captured: false }
+        MousePosition { x: 0, y: 0, captured: false, known: false }
     }
     
     #[cfg(not(target_os = "macos"))]
     async fn capture_position_macos(&self) -> MousePosition {
-        MousePosition { x: 0, y: 0, captured: false }
+        MousePosition { x: 0, y: 0, captured: false, known: false }
     }
     
     // Build detailed message with action and position
@@ -796,7 +875,7 @@ impl AgentServiceImpl {
         deferred_arrival: bool,
     ) -> MousePosition {
         if !(action.is_mouse && ok) {
-            return MousePosition { x: 0, y: 0, captured: false };
+            return MousePosition { x: 0, y: 0, captured: false, known: false };
         }
 
         // A short pause before the first readback so the common case is a single
@@ -831,10 +910,48 @@ impl AgentServiceImpl {
         // coordinate path was fixed for, and `position` is exactly the command an
         // operator runs to obtain coordinates for the next step.
         let Some(want) = expected else {
+            // `position` is a query, not an action: it reports where the pointer is
+            // and changes nothing. The before/after equality check below exists
+            // because a stale reader returns a plausible wrong value that a single
+            // read cannot tell from a still mouse. Where the reader says so itself,
+            // that check adds nothing and costs the answer: moving the mouse while
+            // asking where it is returned "X=?, Y=?". Measured against the
+            // compositor's cursor metadata, which updates about eleven times a
+            // second, so a moving pointer makes the two samples differ nearly every
+            // time.
+            //
+            // The exemption is gated on the reader, not on the verb, because the
+            // premise is a property of the reader. It first shipped ungated, which
+            // was wrong on X11: xdotool never emits POSITION_VERIFIED, so
+            // `captured` is unconditionally true there and the check being skipped
+            // was the only staleness signal `position` had - it names no coordinate,
+            // so there is nothing else to compare a reading against. Measured with
+            // the cursor moved 15229 times/sec: every `position` still claimed a
+            // captured coordinate, while `here left` on the same run correctly
+            // reported none.
+            //
+            // `here left`, `here hold` and the rest keep the check on every backend.
+            // They act at whatever point the pointer occupies, so two disagreeing
+            // samples mean the action landed somewhere neither of them names.
+            if action.action_type == "position"
+                && position.captured
+                && Self::reader_reports_staleness(Self::linux_backend())
+            {
+                return position;
+            }
             let Some(before) = before.filter(|p| p.captured) else {
-                // No usable pre-read (the readback tool itself is failing). Nothing
-                // to verify against, so do not claim a capture.
-                return MousePosition { x: 0, y: 0, captured: false };
+                // No verified pre-read, so the "it must not have moved" check
+                // cannot run. That rules out claiming a capture - it does not rule
+                // out reporting anything at all. The backend may still know where
+                // the pointer is from the motion it emitted, and `position` is the
+                // command an operator runs precisely to obtain a coordinate.
+                // Report it unverified; discarding it produced "X=?, Y=?" on the
+                // one command whose entire purpose is to answer that question.
+                return if position.known {
+                    MousePosition { captured: false, ..position }
+                } else {
+                    MousePosition { x: 0, y: 0, captured: false, known: false }
+                };
             };
             for _ in 0..MAX_POSITION_REREADS {
                 if position.captured && position.x == before.x && position.y == before.y {
@@ -861,7 +978,7 @@ impl AgentServiceImpl {
                     "no read".to_string()
                 }
             );
-            return MousePosition { x: 0, y: 0, captured: false };
+            return MousePosition { x: 0, y: 0, captured: false, known: false };
         };
 
         let rereads = if deferred_arrival {
@@ -890,7 +1007,9 @@ impl AgentServiceImpl {
 
         warn!(
             "Position readback did not settle: requested ({}, {}), last read {}. \
-             Reporting position_captured=false rather than a coordinate that was not verified.",
+             Reporting the requested coordinate with position_captured=false; over a \
+             native-Wayland surface nothing can read the pointer, so this is the \
+             requested point, not an observed one.",
             want.x,
             want.y,
             if position.captured {
@@ -899,7 +1018,13 @@ impl AgentServiceImpl {
                 "none".to_string()
             }
         );
-        MousePosition { x: 0, y: 0, captured: false }
+        // The requested point travels with captured=false. Discarding it as (0,0)
+        // threw away the only thing known about where the pointer was asked to go,
+        // and left the operator with "X=?, Y=?" on a command that had in fact
+        // landed. The flag is what keeps the distinction: this is the requested
+        // coordinate, not an observed one, and no consumer may treat it as
+        // measured.
+        MousePosition { x: want.x, y: want.y, captured: false, known: true }
     }
 
     // Execute a structured argv command directly — no shell, so typed text can never
@@ -921,7 +1046,7 @@ impl AgentServiceImpl {
                 warn!("Blocked command {:?}: {}", argv, e);
                 return (
                     Err(e),
-                    MousePosition { x: 0, y: 0, captured: false },
+                    MousePosition { x: 0, y: 0, captured: false, known: false },
                     action,
                 );
             }
@@ -1016,7 +1141,11 @@ impl AgentServiceImpl {
                 argv_policy::MouseButton::Middle => "2",
                 argv_policy::MouseButton::Right => "3",
             };
-            vec!["xdotool".to_string(), "mouseup".to_string(), n.to_string()]
+            vec![
+                Self::linux_backend().to_string(),
+                "mouseup".to_string(),
+                n.to_string(),
+            ]
         }
     }
 
@@ -1084,6 +1213,10 @@ impl AgentServiceImpl {
                 Ok(format!("Executed: {}", content))
             }
             argv_policy::Plan::Run { bin, args } => {
+                #[cfg(target_os = "macos")]
+                if let Some(dest) = Self::glide_destination(bin, &args) {
+                    return self.glide_macos(dest.0, dest.1);
+                }
                 self.spawn_actuation(bin, &args)?;
                 Ok("ok".to_string())
             }
@@ -1175,10 +1308,89 @@ impl AgentServiceImpl {
         }
     }
 
+    /// The destination of a plain pointer move, when smoothing should replace it.
+    ///
+    /// Only a cliclick invocation whose entire argument list is one `m:X,Y` token
+    /// qualifies. That is exactly what the macOS builder emits for `<x> <y> move`,
+    /// and restricting it to that shape is what keeps this from touching a chain:
+    /// `kd:ctrl c:400,400 ku:ctrl` holds a modifier across the click, and replacing
+    /// its middle token with a glide would drop the bracket and leave the modifier
+    /// down. A click still jumps; only a move glides.
+    ///
+    /// Reading the switch here rather than in the controller is deliberate. The
+    /// builder is stateless argv construction and cannot know where the pointer is,
+    /// so it cannot compute a path; the agent runs on the machine holding the
+    /// pointer and can. It also puts the setting in the same place Windows keeps
+    /// it - an environment variable on the box being driven - so one switch means
+    /// the same thing on both platforms, and the command grammar is untouched:
+    /// `700 300 move` is recorded identically whether it glides or jumps.
+    #[cfg(target_os = "macos")]
+    fn glide_destination(bin: argv_policy::Bin, args: &[String]) -> Option<(i32, i32)> {
+        if !matches!(bin, argv_policy::Bin::Cliclick) || args.len() != 1 {
+            return None;
+        }
+        if std::env::var_os("CC_SMOOTH_MOVE").is_none() {
+            return None;
+        }
+        let (x, y) = args[0].strip_prefix("m:")?.split_once(',')?;
+        Some((x.parse().ok()?, y.parse().ok()?))
+    }
+
+    /// Travel to (x, y) as a paced sequence of posted mouse-moved events.
+    ///
+    /// The timing curve is minimum-jerk, 10t^3 - 15t^4 + 6t^5, and the constants
+    /// match the Linux portal path exactly, so a glide has one velocity profile
+    /// across platforms rather than each backend getting whatever its own toolkit
+    /// calls smooth.
+    ///
+    /// Posted through JXA for the same reason the middle click is: cliclick has no
+    /// way to pace a chain finely enough, and osascript is already installed. Every
+    /// value interpolated into the script is an integer parsed here - the
+    /// destination from a validated cliclick token - so no client-supplied text
+    /// reaches it. The origin is read inside the script rather than passed in,
+    /// which is what makes a stateless builder sufficient.
+    ///
+    /// Numeric constants, matching the middle-click path's reasoning that a gap in
+    /// the bridge's metadata must not silently resolve to undefined:
+    ///   5 kCGEventMouseMoved   0 kCGHIDEventTap   0 kCGMouseButtonLeft
+    #[cfg(target_os = "macos")]
+    fn glide_macos(&self, x: i32, y: i32) -> Result<String, String> {
+        const STEP_HZ: f64 = 120.0;
+        const MIN_MS: f64 = 120.0;
+        const MAX_MS: f64 = 900.0;
+        const MS_PER_PX: f64 = 0.55;
+
+        let script = format!(
+            "ObjC.import('CoreGraphics');\
+             ObjC.import('Foundation');\
+             var s = $.CGEventGetLocation($.CGEventCreate($()));\
+             var x0 = s.x, y0 = s.y, x1 = {x}, y1 = {y};\
+             var d = Math.sqrt((x1-x0)*(x1-x0) + (y1-y0)*(y1-y0));\
+             if (d <= 1) {{ d = 0; }}\
+             var dur = Math.min({MAX_MS}, {MIN_MS} + d * {MS_PER_PX});\
+             var n = Math.max(2, Math.round(dur / (1000 / {STEP_HZ})));\
+             var gap = dur / n / 1000;\
+             for (var i = 1; i <= n; i++) {{\
+               var t = i / n;\
+               var e = t*t*t*(10 + t*(-15 + 6*t));\
+               var px = (i === n) ? x1 : x0 + (x1-x0)*e;\
+               var py = (i === n) ? y1 : y0 + (y1-y0)*e;\
+               $.CGEventPost(0, $.CGEventCreateMouseEvent($(), 5, $.CGPointMake(px, py), 0));\
+               $.NSThread.sleepForTimeInterval(gap);\
+             }}"
+        );
+        self.spawn_actuation(
+            argv_policy::Bin::Osascript,
+            &["-l".to_string(), "JavaScript".to_string(), "-e".to_string(), script],
+        )?;
+        Ok("ok".to_string())
+    }
+
     // Spawn a validated actuation binary. Never goes through a shell.
     fn spawn_actuation(&self, bin: argv_policy::Bin, args: &[String]) -> Result<(), String> {
         let program: String = match bin {
             argv_policy::Bin::Xdotool => "xdotool".to_string(),
+            argv_policy::Bin::CcWayland => "cc-wayland-actuate".to_string(),
             argv_policy::Bin::Osascript => "osascript".to_string(),
             // Resolve cliclick to the path probed at startup (macOS-only field).
             argv_policy::Bin::Cliclick => {
@@ -1493,7 +1705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 warn!("Rejected command {}: {}", command_id, reason);
                                                 (
                                                     Err(reason.to_string()),
-                                                    MousePosition { x: 0, y: 0, captured: false },
+                                                    MousePosition { x: 0, y: 0, captured: false, known: false },
                                                     service.parse_action_details(&human_cmd),
                                                 )
                                             }
@@ -1541,8 +1753,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     success: true,
                                                     message,
                                                     execution_time_ms: execution_time.as_millis() as i64,
-                                                    mouse_x: if position.captured { Some(position.x) } else { None },
-                                                    mouse_y: if position.captured { Some(position.y) } else { None },
+                                                    mouse_x: if position.known { Some(position.x) } else { None },
+                                                    mouse_y: if position.known { Some(position.y) } else { None },
                                                     position_captured: Some(position.captured),
                                                     metadata: executed_meta,
                                                 }
@@ -1661,12 +1873,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    #[test]
+    fn only_the_wayland_reader_reports_its_own_staleness() {
+        // The `position` exemption from the before/after agreement check is gated on
+        // this, and getting it wrong is not visible in a passing suite: an
+        // over-broad answer silently removes the only staleness signal `position`
+        // has on X11, which is what shipped in 2.0.0 and was caught by measurement
+        // rather than by a test.
+        //
+        // The Wayland helper is the only reader that distinguishes "I read a value"
+        // from "the value I read is current" — it emits POSITION_VERIFIED=0 when
+        // XWayland is stuck over a native-Wayland surface.
+        assert!(AgentServiceImpl::reader_reports_staleness("cc-wayland-actuate"));
+
+        // Everything else reports captured=true whenever a value parsed at all.
+        for reader in ["xdotool", "cliclick", "", "cc-wayland", "CC-WAYLAND-ACTUATE"] {
+            assert!(
+                !AgentServiceImpl::reader_reports_staleness(reader),
+                "{reader:?} does not self-report staleness and must keep the \
+                 before/after check"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exemption_follows_the_one_backend_selector() {
+        // Not a second detector: whatever `linux_backend` picks is what decides the
+        // exemption. On a non-Linux target the fallback is xdotool, so macOS and
+        // Windows keep the check — neither cliclick nor the registry reports
+        // staleness either.
+        let live = AgentServiceImpl::reader_reports_staleness(AgentServiceImpl::linux_backend());
+        assert_eq!(live, AgentServiceImpl::linux_backend() == "cc-wayland-actuate");
+        if !cfg!(target_os = "linux") {
+            assert!(!live, "only the Linux Wayland path may take the exemption");
+        }
+    }
+
     #[test]
     fn test_os_detection() {
         let (_os_type, version) = AgentServiceImpl::detect_os_version();
         assert!(!version.is_empty());
         assert!(!version.contains("Unknown") || cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn glide_budget_covers_ahk_cap() {
+        // The deferred budget must let its last re-read fall past the moment a Windows
+        // smooth move/drag finishes gliding, or a glide that landed perfectly reports
+        // X=?. Arrival is the glide cap plus one watcher poll after the write; the last
+        // read is settle + budget*interval. This pins the two together so raising the
+        // .ahk SMOOTH_MAX_MS without raising the budget fails the build rather than
+        // silently reintroducing the X=? readback.
+        let settle_ms: u64 = 20; // Windows non-here settle
+        let last_read_ms =
+            settle_ms + DEFERRED_POSITION_REREADS as u64 * POSITION_REREAD_INTERVAL_MS;
+        let worst_arrival_ms = AHK_GLIDE_MAX_MS + 10; // + one 10ms watcher poll
+        assert!(
+            last_read_ms >= worst_arrival_ms,
+            "deferred budget's last read is {last_read_ms}ms but a glide can still be \
+             arriving at {worst_arrival_ms}ms; raise DEFERRED_POSITION_REREADS"
+        );
     }
 
     fn service(os_type: OsType) -> AgentServiceImpl {
@@ -1728,7 +1995,7 @@ mod tests {
 
     fn typed(svc: &AgentServiceImpl, command: &str) -> String {
         let action = svc.parse_action_details(command);
-        let position = MousePosition { x: 0, y: 0, captured: false };
+        let position = MousePosition { x: 0, y: 0, captured: false, known: false };
         svc.build_detailed_message(&action, &position, command)
     }
 
@@ -1778,7 +2045,7 @@ mod tests {
 
     fn recorded(svc: &AgentServiceImpl, command: &str, x: i32, y: i32) -> String {
         let action = svc.parse_action_details(command);
-        let position = MousePosition { x, y, captured: true };
+        let position = MousePosition { x, y, captured: true, known: true };
         svc.build_detailed_message(&action, &position, command)
     }
 

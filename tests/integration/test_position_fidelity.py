@@ -207,10 +207,20 @@ def test_the_recorded_coordinate_matches_the_echo(stack):
                 f"recorded {recorded} for a step echoed as {echo}"
             )
         else:
-            # Uncaptured records as (0, 0) with the flag false — see the contract
-            # test below.
-            assert recorded == (0, 0, False), (
-                f"echo reported no position but the record kept {recorded}"
+            # An uncaptured mouse step records the REQUESTED coordinate with the
+            # flag false (agent 2.0.0; before it, (0, 0)). The property that has
+            # to hold is not the value but the labelling: whatever is recorded
+            # must carry position_captured=false, and must be the point the
+            # command asked for rather than some third coordinate the agent
+            # invented. A record that disagreed with the request would mean the
+            # agent published a reading it could not verify, which is the whole
+            # failure this file exists to catch.
+            assert recorded == (x, y, False), (
+                f"echo reported no position for ({x}, {y}) but the record kept "
+                f"{recorded}"
+            )
+            assert echo[:2] == (x, y), (
+                f"echo for an uncaptured ({x}, {y}) was {echo[:2]}"
             )
 
 
@@ -239,9 +249,22 @@ def test_commands_that_name_no_coordinate_are_still_verified(stack, command):
 
 
 @pytest.mark.skipif(not _tk_available(), reason="tkinter not installed")
-def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path):
-    """If something moves the cursor across a `here` command, neither sample
-    describes it, so the agent must report no position rather than pick one.
+@pytest.mark.parametrize("command", ["here left", "position"])
+def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path, command):
+    """If something moves the cursor across a command that names no coordinate,
+    neither sample describes it, so the agent must report no position rather than
+    pick one.
+
+    `position` is parametrised here deliberately. Agent 2.0.0 exempted it from the
+    before/after agreement check (`action.action_type == "position" && captured`
+    returns early), on the reasoning that a stale reader now reports
+    captured=false so a captured read is already known to be live. That holds for
+    the Wayland helper, which emits POSITION_VERIFIED=0. It does not obviously
+    hold for xdotool, where `verified` is unconditionally true. Until this
+    parameter existed the suite could not tell either way: the only other test
+    naming `position` runs against a stationary cursor, where the check passes
+    whether or not it runs. Deciding whether the exemption is safe without this
+    was guessing.
 
     Needs a mapped window: on a bare X display the warp silently no-ops, so the
     interference would not actually move anything and the test would pass without
@@ -305,7 +328,7 @@ def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path):
         uncaptured = 0
         try:
             for _ in range(COMMANDS):
-                argv, human = la._build_mouse_command("here left")
+                argv, human = la._build_mouse_command(command)
                 result = client.execute_command(argv=argv, human_command=human)
                 assert result["success"], result
                 if not result.get("position_captured"):
@@ -327,8 +350,9 @@ def test_a_moving_cursor_defeats_the_here_readback(stack, tmp_path):
                     f"race (need {MIN_MOVES_PER_SECOND}/sec)")
 
     assert uncaptured > 0, (
-        f"the cursor was moved {rate:.0f} times/sec throughout, yet every `here left` "
-        "still claimed a captured position — the before/after check is not running"
+        f"the cursor was moved {rate:.0f} times/sec throughout, yet every "
+        f"`{command}` still claimed a captured position — the before/after check "
+        "is not running for this verb"
     )
 
 
