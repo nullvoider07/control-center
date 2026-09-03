@@ -125,40 +125,82 @@ weakest rows.
 
 **Verified on a real session.**
 
-| Compositor | Path | Distributions |
+| Compositor | Path | Ships it by default on |
 |---|---|---|
-| Mutter (GNOME) | portal | Ubuntu, Fedora, Debian, RHEL, Zorin, Rocky, AlmaLinux |
-| KWin (KDE Plasma Wayland) | portal **and** XTEST | Kubuntu, KDE neon, Fedora KDE, SteamOS Desktop Mode |
+| Mutter (GNOME) | portal | Ubuntu, Fedora Workstation, Debian, RHEL, Rocky, AlmaLinux, Zorin OS |
+| KWin (KDE Plasma) | portal **and** XTEST | openSUSE Leap and Tumbleweed, Fedora KDE, Kubuntu, Debian (KDE task), Manjaro KDE, Garuda, Nobara KDE, SteamOS |
+
+**What was verified is the compositor, not the operating system.** Mutter was
+exercised on the development host and KWin in an Ubuntu-based Plasma Wayland VM.
+No Fedora, openSUSE, Debian, Manjaro or SteamOS machine was ever started. The
+third column says which systems *ship* that compositor by default — general
+knowledge about each system, the same kind of claim as the Xubuntu and Mint
+mapping below, and not a measurement. It sits in a column here only because the
+compositor beside it was measured; the distinction is the same one the X11 tier
+makes, and it is no weaker one table up.
 
 On KWin both routes work; cc takes the portal, since that is what `XDG_SESSION_TYPE`
 selects. Verified 2026-09-03 on a Plasma Wayland VM, confirmed by the receiving
 application's own selection state rather than by exit codes.
 
+**SteamOS appears in two tiers, and that is the finding rather than a duplication.**
+Its two sessions run different compositors: Desktop Mode is KWin and takes the
+portal, Gaming Mode is gamescope and takes `xdotool`. Which session is running
+decides the path, so the same operating system answers differently depending on
+how it was booted. KDE neon is absent from the column deliberately — by KDE's own
+description it is Ubuntu LTS carrying KDE's repositories rather than a separate
+operating system, so it is covered by the Ubuntu entries.
+
 **X11 desktops — the path is verified, these desktops were not individually
-exercised.** XFCE (Xfwm4), Cinnamon (Muffin) and MATE (Marco) are X11 window
-managers rather than Wayland compositors, so they take the `xdotool` path. That
-path itself is measured extensively — end to end through the controller, agent and
-argv policy, including against the XWayland servers inside KWin and gamescope — but
-no session of these three desktops was opened. "X11 is X11" is a strong inference
-and it is still an inference, which is why this is not in the tier above.
+exercised.** XFCE (Xfwm4), Cinnamon (Muffin), MATE (Marco) and LXQt run X11 by
+default, so they take the `xdotool` path. That path itself is measured extensively
+— end to end through the controller, agent and argv policy, including against the
+XWayland servers inside KWin and gamescope — but no session of these four desktops
+was opened. "X11 is X11" is a strong inference and it is still an inference, which
+is why this is not in the tier above.
+
+These desktops ship by default on **Xubuntu, Linux Mint (all editions), Manjaro
+XFCE, Ubuntu MATE and Lubuntu** — the same kind of claim as the column above, and
+equally not a measurement. They are named in a sentence rather than a column
+because there is no exercised compositor beside them to anchor one to: the tier
+above pairs its systems with a compositor that was measured, and this tier pairs
+its systems with an inference.
+
+**Their Wayland sessions are a different answer, and the answer is no.** Cinnamon
+and XFCE now ship experimental Wayland sessions. `xdg-desktop-portal-xapp` — the
+backend for exactly these desktops, `UseIn=X-Cinnamon;MATE;XFCE;` — implements
+`Wallpaper`, `Inhibit`, `Screenshot`, `Lockdown`, `Settings` and `Background`, and
+neither `RemoteDesktop` nor `ScreenCast`. On such a session cc has neither route:
+no portal interface to call, and `xdotool` reaching only XWayland clients. Use the
+X11 session, which remains the default on all of them.
 
 **Verified on a nested rig, positive result only.**
 
 | Compositor | Path | Note |
 |---|---|---|
-| gamescope (SteamOS Gaming Mode) | `xdotool` | Ships no portal backend at all — it links wlroots and offers no RemoteDesktop interface — but stands up its own nested XWayland, which `xdotool` drives. Press, drag and release confirmed by the application. Tested on gamescope's nested SDL backend rather than the DRM backend a Steam Deck runs in Gaming Mode; the XWayland comes from the same code path, so this is strong evidence rather than proof. |
+| gamescope (SteamOS, Gaming Mode session) | `xdotool` | Ships no portal backend at all — it links wlroots and offers no RemoteDesktop interface — but stands up its own nested XWayland, which `xdotool` drives. Press, drag and release confirmed by the application. Tested on gamescope's nested SDL backend rather than the DRM backend a Steam Deck runs in Gaming Mode; the XWayland comes from the same code path, so this is strong evidence rather than proof. |
 
 **Not supported, for an upstream reason.**
 
 | Compositor | Why |
 |---|---|
-| Hyprland, Sway and other wlroots compositors | Their portal backends declare `ScreenCast` but not `RemoteDesktop`, so there is no input-synthesis interface to call. Read from each package's own `.portal` file, so this does not depend on a test rig. There is nothing cc can do about it from this side. |
+| Hyprland, Sway and other wlroots compositors | `xdg-desktop-portal-wlr` implements `Screenshot` and `ScreenCast`; `xdg-desktop-portal-hyprland` adds `GlobalShortcuts`. Neither implements `RemoteDesktop`, so there is no input-synthesis interface to call and nothing cc can do about it from this side. |
+| LXQt (`xdg-desktop-portal-lxqt`) | Its backend implements `FileChooser` and nothing else. That is not the whole story for LXQt, though: it is X11 by default, where the `xdotool` path applies as above, and its Wayland sessions run on an *external* compositor (labwc, KWin, wayfire) — so on Wayland the answer follows from whichever compositor is in use, not from this backend. "LXQt does not work" would be wrong; "LXQt's own portal offers no input injection, and its X11 session works" is right. |
+
+> **How the portal rows were determined, and why they need no test rig.** A
+> `.portal` file is an allow-list of the interfaces a backend implements — there is
+> no "unsupported" key, so a missing `RemoteDesktop` *is* the finding. These rows
+> were read from the Ubuntu packages themselves
+> (`xdg-desktop-portal-{gnome,kde,wlr,hyprland,xapp,lxqt}`), which is why they hold
+> regardless of what any rig reports. Two backends packaged for Ubuntu are
+> deliberately absent from this section because they were not examined: `phosh` and
+> `wlcom`.
 
 **Expected to work, not yet verified.**
 
 | Compositor | Basis |
 |---|---|
-| cosmic-comp (Pop!_OS) | Its `cosmic.portal` declares both `RemoteDesktop` and `ScreenCast`, which is the same basis on which Mutter and KWin work. Not packaged for Ubuntu, so it has not been exercised here. Treat as unverified. |
+| cosmic-comp (Pop!_OS) | Its `cosmic.portal` declares both `RemoteDesktop` and `ScreenCast`, which is the same basis on which Mutter and KWin work. Unlike the rows above, that is taken from upstream rather than read from a package here — cosmic-comp is not in Ubuntu's archive, so it could be neither read nor run. Treat as unverified. |
 
 > **A note on method, because it produced a wrong answer once.** An earlier
 > measurement of KWin used a *nested* KWin on Xvfb and concluded XTEST was dead
