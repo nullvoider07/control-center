@@ -73,6 +73,16 @@ signal available on Wayland. A **restore token** lets the daemon re-establish th
 session on later runs without prompting again, and the daemon **self-heals** a
 session that stops accepting input by silently re-negotiating it from that token.
 
+**The installers check all of this for you.** `install.sh` and `install.ps1`
+detect what is missing before downloading anything, say what each missing piece
+costs, and offer to install it with the platform's package manager — `apt`, `dnf`,
+`pacman`, `zypper`, Homebrew, `winget` or Chocolatey. Nothing is installed without
+consent and nothing is forced: declining, having no package manager, or a failed
+package install all leave cc installed with a note of what is still outstanding.
+`CC_INSTALL_DEPS=yes` consents in advance for unattended runs, `CC_INSTALL_DEPS=no`
+declines; with no terminal to ask at (a CI runner, `curl … | bash` under
+automation) the answer is no rather than a silent yes.
+
 **Build prerequisites for the cursor helper.** `wayland_cursor.c` is compiled on
 first use, not shipped as a binary, so the machine needs a C compiler,
 `pkg-config`, and the PipeWire development headers:

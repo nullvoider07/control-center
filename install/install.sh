@@ -121,6 +121,251 @@ check_dependencies() {
 }
 
 # ============================================================================
+# Runtime Dependencies
+#
+# These are what cc needs to actuate once installed, as opposed to what this
+# script needs to run. They are checked before anything is downloaded, offered
+# for installation, and never forced: a refusal, a missing package manager or a
+# failed install all leave cc installed and print what is still outstanding.
+# Nothing here can abort the installation.
+# ============================================================================
+
+# Prompt on the terminal rather than on stdin.
+#
+# The documented install is `curl ... | bash`, where stdin is the SCRIPT, not the
+# operator - a plain `read` there consumes the script's own remaining bytes and
+# returns garbage without anyone typing. /dev/tty is the controlling terminal
+# whatever stdin happens to be. With no terminal at all (CI, a Dockerfile) there
+# is nobody to ask, so the answer is no and the packages are printed instead.
+ask_yes_no() {
+    local prompt="$1" reply=""
+
+    case "${CC_INSTALL_DEPS:-}" in
+        yes|YES|1|true) print_info "$prompt -> yes (CC_INSTALL_DEPS)"; return 0 ;;
+        no|NO|0|false)  print_info "$prompt -> no (CC_INSTALL_DEPS)"; return 1 ;;
+    esac
+
+    # `[ -r /dev/tty ]` is not sufficient and testing it was a real defect: with no
+    # controlling terminal the device node still exists and still tests readable,
+    # and only the open fails, with ENXIO. The read then failed silently, left the
+    # reply empty, and empty means "yes" here - so a `curl | bash` in CI answered
+    # its own prompt and went on to run sudo unattended. Open it instead of
+    # predicting that the open would work.
+    # The redirect is on a group, not on the exec: redirections apply left to
+    # right, so `exec 3< /dev/tty 2>/dev/null` attempts the open before the
+    # silencing takes effect and leaks "No such device or address" to the
+    # operator's terminal. Redirecting the group covers the open itself, and the
+    # descriptor still belongs to this shell afterwards because `{ }` does not fork.
+    if ! { exec 3< /dev/tty; } 2>/dev/null; then
+        print_warning "No terminal available to ask; skipping."
+        echo "    Set CC_INSTALL_DEPS=yes to install them without being asked."
+        return 1
+    fi
+
+    printf '%s [Y/n] ' "$prompt" > /dev/tty
+    # A failed read is not an empty answer. Only a reply that was actually typed
+    # may be defaulted to yes.
+    if ! read -r reply <&3; then
+        exec 3<&-
+        print_warning "Could not read a reply; skipping."
+        return 1
+    fi
+    exec 3<&-
+
+    case "$reply" in
+        ""|y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_package_manager() {
+    PKG_MGR=""
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        command -v brew &> /dev/null && PKG_MGR="brew"
+        return 0
+    fi
+    if command -v apt-get &> /dev/null; then PKG_MGR="apt"
+    elif command -v dnf &> /dev/null; then PKG_MGR="dnf"
+    elif command -v pacman &> /dev/null; then PKG_MGR="pacman"
+    elif command -v zypper &> /dev/null; then PKG_MGR="zypper"
+    fi
+    return 0
+}
+
+# The same dependency is packaged under different names, so the mapping is per
+# manager rather than one list of "the" package names.
+pkg_name_for() {
+    local dep="$1"
+    case "$PKG_MGR:$dep" in
+        apt:xdotool|dnf:xdotool|pacman:xdotool|zypper:xdotool) echo "xdotool" ;;
+        brew:cliclick)      echo "cliclick" ;;
+        apt:compiler)       echo "build-essential" ;;
+        dnf:compiler)       echo "gcc" ;;
+        pacman:compiler)    echo "base-devel" ;;
+        zypper:compiler)    echo "gcc" ;;
+        apt:pkgconfig)      echo "pkg-config" ;;
+        dnf:pkgconfig)      echo "pkgconf-pkg-config" ;;
+        pacman:pkgconfig)   echo "pkgconf" ;;
+        zypper:pkgconfig)   echo "pkg-config" ;;
+        apt:pipewire)       echo "libpipewire-0.3-dev" ;;
+        dnf:pipewire)       echo "pipewire-devel" ;;
+        pacman:pipewire)    echo "libpipewire" ;;
+        zypper:pipewire)    echo "pipewire-devel" ;;
+        *) echo "" ;;
+    esac
+}
+
+install_cmd_prefix() {
+    case "$PKG_MGR" in
+        apt)    echo "sudo apt-get install -y" ;;
+        dnf)    echo "sudo dnf install -y" ;;
+        pacman) echo "sudo pacman -S --needed --noconfirm" ;;
+        zypper) echo "sudo zypper install -y" ;;
+        brew)   echo "brew install" ;;
+        *)      echo "" ;;
+    esac
+}
+
+# A portal offering RemoteDesktop is what makes Wayland actuation possible at
+# all, and it is not something this script can install sensibly: the right
+# backend depends on the desktop, and installing the wrong one does nothing.
+# So it is reported, never offered.
+report_portal_backend() {
+    local found=""
+    for f in /usr/share/xdg-desktop-portal/portals/*.portal; do
+        [ -e "$f" ] || continue
+        if grep -qi "RemoteDesktop" "$f" 2>/dev/null; then
+            found="$found $(basename "$f" .portal)"
+        fi
+    done
+    if [ -n "$found" ]; then
+        print_success "Portal backend with RemoteDesktop:$found"
+    else
+        print_warning "No installed portal backend declares RemoteDesktop."
+        echo "    Wayland actuation needs one. GNOME uses xdg-desktop-portal-gnome,"
+        echo "    KDE uses xdg-desktop-portal-kde. wlroots compositors (Hyprland, Sway)"
+        echo "    ship no RemoteDesktop interface at all and cannot be driven this way."
+    fi
+}
+
+check_runtime_dependencies() {
+    print_info "Checking actuation dependencies..."
+
+    MISSING_REQUIRED=()   # cc cannot actuate without these
+    MISSING_OPTIONAL=()   # cc runs in a documented degraded mode without these
+    detect_package_manager
+
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        if command -v cliclick &> /dev/null; then
+            print_success "cliclick found"
+        else
+            MISSING_REQUIRED+=("cliclick")
+        fi
+    else
+        local session="x11"
+        if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
+            session="wayland"
+        fi
+        print_info "Session type: $session"
+
+        if command -v xdotool &> /dev/null; then
+            print_success "xdotool found"
+        elif [ "$session" = "x11" ]; then
+            MISSING_REQUIRED+=("xdotool")
+        else
+            # On Wayland the portal drives actuation, but xdotool still reaches
+            # XWayland clients and is the fallback position reader.
+            MISSING_OPTIONAL+=("xdotool")
+        fi
+
+        if [ "$session" = "wayland" ]; then
+            report_portal_backend
+            # The cursor helper is compiled on first use. Without these cc still
+            # actuates; only compositor-sourced position readback is lost, and it
+            # says so through `cc-wayland-actuate --status`.
+            command -v cc &> /dev/null || command -v gcc &> /dev/null \
+                || MISSING_OPTIONAL+=("compiler")
+            command -v pkg-config &> /dev/null || MISSING_OPTIONAL+=("pkgconfig")
+            if command -v pkg-config &> /dev/null; then
+                pkg-config --exists libpipewire-0.3 2>/dev/null \
+                    || MISSING_OPTIONAL+=("pipewire")
+            else
+                MISSING_OPTIONAL+=("pipewire")
+            fi
+        fi
+    fi
+
+    if [ ${#MISSING_REQUIRED[@]} -eq 0 ] && [ ${#MISSING_OPTIONAL[@]} -eq 0 ]; then
+        print_success "All actuation dependencies present"
+        return 0
+    fi
+
+    echo ""
+    if [ ${#MISSING_REQUIRED[@]} -ne 0 ]; then
+        print_warning "Required for actuation, not installed: ${MISSING_REQUIRED[*]}"
+        echo "    Without these cc installs but cannot move the pointer or type."
+    fi
+    if [ ${#MISSING_OPTIONAL[@]} -ne 0 ]; then
+        print_warning "Optional, not installed: ${MISSING_OPTIONAL[*]}"
+        echo "    cc works without them. What is lost: compositor-sourced pointer"
+        echo "    position on Wayland, which falls back to XWayland and reports"
+        echo "    position_captured=false over native-Wayland windows."
+    fi
+
+    offer_dependency_install
+}
+
+offer_dependency_install() {
+    local to_install=("${MISSING_REQUIRED[@]}" "${MISSING_OPTIONAL[@]}")
+    local pkgs=() dep pkg
+
+    if [ -z "$PKG_MGR" ]; then
+        echo ""
+        if [[ "$OS_TYPE" == "macos" ]]; then
+            print_warning "Homebrew not found, so these cannot be installed automatically."
+            echo "    Install Homebrew (https://brew.sh), then: brew install cliclick"
+        else
+            print_warning "No supported package manager found (apt, dnf, pacman, zypper)."
+            echo "    Install the packages above with your distribution's tools."
+        fi
+        return 0
+    fi
+
+    for dep in "${to_install[@]}"; do
+        pkg="$(pkg_name_for "$dep")"
+        [ -n "$pkg" ] && pkgs+=("$pkg")
+    done
+
+    if [ ${#pkgs[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    local cmd
+    cmd="$(install_cmd_prefix)"
+    echo ""
+    echo "  Would run: $cmd ${pkgs[*]}"
+    echo ""
+
+    if ! ask_yes_no "Install these now?"; then
+        print_info "Skipping. Install them later with:"
+        echo "    $cmd ${pkgs[*]}"
+        return 0
+    fi
+
+    # Deliberately not guarded by `set -e`: a failed dependency install must not
+    # abort an installation that is otherwise fine. cc is still usable, and the
+    # operator is told exactly what is still missing.
+    if $cmd "${pkgs[@]}"; then
+        print_success "Dependencies installed"
+    else
+        print_warning "Dependency installation did not complete."
+        echo "    cc is still being installed. Finish the dependencies with:"
+        echo "    $cmd ${pkgs[*]}"
+    fi
+    return 0
+}
+
+# ============================================================================
 # Get Latest Release
 # ============================================================================
 get_latest_release() {
@@ -496,6 +741,7 @@ main() {
     check_existing_installation
     detect_platform
     check_dependencies
+    check_runtime_dependencies
     get_latest_release
     download_package
     extract_package

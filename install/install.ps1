@@ -106,6 +106,131 @@ function Test-Dependencies {
 }
 
 # ============================================================================
+# Runtime Dependencies
+#
+# What cc needs to actuate once installed, as opposed to what this script needs
+# to run. Checked before anything is downloaded, offered for installation, and
+# never forced: a refusal, a missing package manager or a failed install all
+# leave cc installed and print what is still outstanding.
+# ============================================================================
+function Test-Interactive {
+    # A prompt is only meaningful with a real console. Under
+    # `irm ... | iex` in a CI runner there is nobody to answer, and defaulting a
+    # silent non-answer to "yes" would install packages nobody approved.
+    if (-not [Environment]::UserInteractive) { return $false }
+    try   { return -not [Console]::IsInputRedirected }
+    catch { return $false }
+}
+
+function Get-Consent {
+    param([string]$Prompt)
+
+    switch ("$env:CC_INSTALL_DEPS".ToLower()) {
+        { $_ -in 'yes', '1', 'true' } { Write-Info "$Prompt -> yes (CC_INSTALL_DEPS)"; return $true }
+        { $_ -in 'no', '0', 'false' } { Write-Info "$Prompt -> no (CC_INSTALL_DEPS)";  return $false }
+    }
+
+    if (-not (Test-Interactive)) {
+        Write-Warning "No console available to ask; skipping."
+        Write-Host "    Set CC_INSTALL_DEPS=yes to install without being asked."
+        return $false
+    }
+
+    $reply = Read-Host "$Prompt [Y/n]"
+    return ($reply -eq '' -or $reply -match '^(y|yes)$')
+}
+
+function Get-AutoHotkeyV2 {
+    # v2 specifically. The watcher scripts are v2 syntax, so a v1 install is not a
+    # substitute — it would load them and fail on the first line. So this looks for
+    # the versioned path rather than for the name.
+    #
+    # Roots are filtered before use: Join-Path throws on a null Path, and
+    # ProgramFiles(x86) is absent on a 32-bit host. Registry first, because an
+    # install to a non-default location is invisible to a path guess.
+    $roots = @()
+    try {
+        $reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\AutoHotkey' -ErrorAction Stop
+        if ($reg.InstallDir) { $roots += $reg.InstallDir }
+    } catch { }
+    $roots += @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+        Where-Object { $_ } |
+        ForEach-Object { Join-Path $_ 'AutoHotkey' }
+
+    foreach ($root in ($roots | Where-Object { $_ })) {
+        foreach ($exe in 'AutoHotkey64.exe', 'AutoHotkey32.exe', 'AutoHotkey.exe') {
+            $p = Join-Path $root (Join-Path 'v2' $exe)
+            if (Test-Path $p) { return $p }
+        }
+    }
+    return $null
+}
+
+function Get-WindowsPackageManager {
+    if (Get-Command winget -ErrorAction SilentlyContinue) { return 'winget' }
+    if (Get-Command choco  -ErrorAction SilentlyContinue) { return 'choco' }
+    return $null
+}
+
+function Test-RuntimeDependencies {
+    Write-Info "Checking actuation dependencies..."
+
+    $ahk = Get-AutoHotkeyV2
+    if ($ahk) {
+        Write-Success "AutoHotkey v2 found: $ahk"
+        return
+    }
+
+    Write-Host ""
+    Write-Warning "AutoHotkey v2 is required for actuation and was not found."
+    Write-Host "    The agent drives the mouse and keyboard through the v2 watcher"
+    Write-Host "    scripts, so without it cc installs but cannot click or type."
+    Write-Host "    A v1 installation does not substitute: the watchers are v2 syntax."
+
+    $mgr = Get-WindowsPackageManager
+    if (-not $mgr) {
+        Write-Host ""
+        Write-Warning "Neither winget nor choco found, so it cannot be installed automatically."
+        Write-Host "    Install it from https://www.autohotkey.com/ (choose v2)."
+        return
+    }
+
+    $cmd = if ($mgr -eq 'winget') {
+        'winget install --id AutoHotkey.AutoHotkey --accept-source-agreements --accept-package-agreements'
+    } else {
+        'choco install autohotkey -y'
+    }
+
+    Write-Host ""
+    Write-Host "  Would run: $cmd"
+    Write-Host ""
+
+    if (-not (Get-Consent "Install AutoHotkey v2 now?")) {
+        Write-Info "Skipping. Install it later with:"
+        Write-Host "    $cmd"
+        return
+    }
+
+    # A failed dependency install must not abort an installation that is otherwise
+    # fine, so this does not throw — cc still installs and the operator is told
+    # what is outstanding.
+    try {
+        Invoke-Expression $cmd
+        if (Get-AutoHotkeyV2) {
+            Write-Success "AutoHotkey v2 installed"
+        } else {
+            Write-Warning "Install reported success but AutoHotkey v2 was still not found."
+            Write-Host "    A new shell may be needed for PATH changes, or install it by hand:"
+            Write-Host "    https://www.autohotkey.com/"
+        }
+    } catch {
+        Write-Warning "Dependency installation did not complete: $_"
+        Write-Host "    cc is still being installed. Finish it with:"
+        Write-Host "    $cmd"
+    }
+}
+
+# ============================================================================
 # Get Latest Release
 # ============================================================================
 function Get-LatestRelease {
@@ -431,6 +556,7 @@ function Main {
     Write-Success "Detected: Windows-$arch"
     
     Test-Dependencies
+    Test-RuntimeDependencies
     Get-LatestRelease
     
     $zipFile = Get-Package -Arch $arch
