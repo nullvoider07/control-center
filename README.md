@@ -73,10 +73,88 @@ signal available on Wayland. A **restore token** lets the daemon re-establish th
 session on later runs without prompting again, and the daemon **self-heals** a
 session that stops accepting input by silently re-negotiating it from that token.
 
+**Build prerequisites for the cursor helper.** `wayland_cursor.c` is compiled on
+first use, not shipped as a binary, so the machine needs a C compiler,
+`pkg-config`, and the PipeWire development headers:
+
+```bash
+sudo apt install build-essential pkg-config libpipewire-0.3-dev   # Debian/Ubuntu
+sudo dnf install gcc pkgconf-pkg-config pipewire-devel            # Fedora/RHEL
+```
+
+**Without them cc still works, in a documented degraded mode.** A failed compile
+is not a failed install: actuation goes through the portal exactly as before, and
+only the *position readback* falls back from the compositor to XWayland.
+`cc-wayland-actuate --status` names which one is live:
+
+```json
+{"position_source": "compositor"}   // helper built: the compositor's own reading
+{"position_source": "xwayland",     // helper unavailable: the fallback
+ "cursor_error": "libpipewire-0.3 development files are needed to read the cursor position (install libpipewire-0.3-dev)"}
+```
+
+What the fallback costs is real and worth knowing: XWayland observes the pointer
+only while it is over one of its own surfaces, so over a native-Wayland window it
+repeats the last position it saw. cc detects that and reports the coordinate as
+unverified (`position_captured: false`) rather than passing it off as measured —
+which is honest, but it means position readback over native-Wayland windows stops
+being useful. `cursor_error` also reports the two neighbouring failures, `no C
+compiler available` and a compile error, in the same field.
+
 Two operational notes: the portal requires a one-time consent grant (the daemon
 prints how to complete it), and while the daemon holds the screencast stream the
 desktop shows the standard GNOME screen-sharing indicator for the life of the
 session — this is the cost of being able to read the pointer position on Wayland.
+
+### Linux compositor support
+
+Which path a session takes is decided by the compositor, not by the distribution.
+The tiers below are kept apart on purpose: they differ in how much evidence sits
+behind them, and collapsing them into one list of ticks would overstate the
+weakest rows.
+
+**Verified on a real session.**
+
+| Compositor | Path | Distributions |
+|---|---|---|
+| Mutter (GNOME) | portal | Ubuntu, Fedora, Debian, RHEL, Zorin, Rocky, AlmaLinux |
+| KWin (KDE Plasma Wayland) | portal **and** XTEST | Kubuntu, KDE neon, Fedora KDE, SteamOS Desktop Mode |
+
+On KWin both routes work; cc takes the portal, since that is what `XDG_SESSION_TYPE`
+selects. Verified 2026-09-03 on a Plasma Wayland VM, confirmed by the receiving
+application's own selection state rather than by exit codes.
+
+**X11 desktops — the path is verified, these desktops were not individually
+exercised.** XFCE (Xfwm4), Cinnamon (Muffin) and MATE (Marco) are X11 window
+managers rather than Wayland compositors, so they take the `xdotool` path. That
+path itself is measured extensively — end to end through the controller, agent and
+argv policy, including against the XWayland servers inside KWin and gamescope — but
+no session of these three desktops was opened. "X11 is X11" is a strong inference
+and it is still an inference, which is why this is not in the tier above.
+
+**Verified on a nested rig, positive result only.**
+
+| Compositor | Path | Note |
+|---|---|---|
+| gamescope (SteamOS Gaming Mode) | `xdotool` | Ships no portal backend at all — it links wlroots and offers no RemoteDesktop interface — but stands up its own nested XWayland, which `xdotool` drives. Press, drag and release confirmed by the application. Tested on gamescope's nested SDL backend rather than the DRM backend a Steam Deck runs in Gaming Mode; the XWayland comes from the same code path, so this is strong evidence rather than proof. |
+
+**Not supported, for an upstream reason.**
+
+| Compositor | Why |
+|---|---|
+| Hyprland, Sway and other wlroots compositors | Their portal backends declare `ScreenCast` but not `RemoteDesktop`, so there is no input-synthesis interface to call. Read from each package's own `.portal` file, so this does not depend on a test rig. There is nothing cc can do about it from this side. |
+
+**Expected to work, not yet verified.**
+
+| Compositor | Basis |
+|---|---|
+| cosmic-comp (Pop!_OS) | Its `cosmic.portal` declares both `RemoteDesktop` and `ScreenCast`, which is the same basis on which Mutter and KWin work. Not packaged for Ubuntu, so it has not been exercised here. Treat as unverified. |
+
+> **A note on method, because it produced a wrong answer once.** An earlier
+> measurement of KWin used a *nested* KWin on Xvfb and concluded XTEST was dead
+> there. A real Plasma VM overturned that: XTEST works on KDE. A nested compositor
+> gives false negatives for input delivery, so it is not a valid rig for deciding
+> that a path does not work — only for confirming that one does.
 
 ### Standalone Wayland coordinate picker
 
@@ -294,7 +372,14 @@ The Python controller provides the CLI and `GRPCClient` class used to interact w
 - **Dependencies**:
   - Windows: AutoHotkey v2 must be installed
   - macOS: `cliclick` must be installed (`brew install cliclick`)
-  - Linux: `xdotool` must be installed (`apt install xdotool`), `DISPLAY` must be set
+  - Linux (X11): `xdotool` must be installed (`apt install xdotool`), `DISPLAY` must be set
+  - Linux (Wayland): the `cc-wayland-actuate` helper on `PATH` (installed by the
+    release archive and by `pip install .`), a portal implementation offering
+    `RemoteDesktop` — see [Linux compositor support](#linux-compositor-support) —
+    and, for compositor-sourced position readback, a C compiler, `pkg-config` and
+    `libpipewire-0.3-dev`. `xdotool` is still worth installing on a Wayland
+    session: it reaches XWayland clients and is what the fallback position
+    readback uses
 
 #### Controller (CLI)
 
